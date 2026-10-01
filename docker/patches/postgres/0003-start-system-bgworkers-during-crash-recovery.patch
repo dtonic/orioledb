@@ -1,0 +1,77 @@
+From 0a6c0ecbd2fe71472ef101857a8079c45d10f804 Mon Sep 17 00:00:00 2001
+From: haruband <haruband@gmail.com>
+Date: Fri, 2 Oct 2026 02:12:17 +0900
+Subject: [PATCH] Start system background workers during crash recovery
+
+maybe_start_bgworkers() starts nothing while FatalError is set, so after a
+crash reinitialisation a BGWORKER_CLASS_SYSTEM worker started at
+BgWorkerStart_PostmasterStart stayed down until recovery had finished. The
+end-of-recovery checkpoint of an orioledb cluster in S3 mode waits on its S3
+workers (s3_queue_wait_for_location), so recovery never finished and the
+server stayed in 'not yet accepting connections' indefinitely. Once shared
+memory has been reinitialised (PM_STARTUP) system workers now start as they
+did at the first boot; every other worker still waits for the end of
+recovery.
+---
+ src/backend/postmaster/postmaster.c | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/src/backend/postmaster/postmaster.c b/src/backend/postmaster/postmaster.c
+index 3c653be..758434c 100644
+--- a/src/backend/postmaster/postmaster.c
++++ b/src/backend/postmaster/postmaster.c
+@@ -3182,6 +3182,9 @@ PostmasterStateMachine(void)
+ 		/* Make sure we can perform I/O while starting up. */
+ 		maybe_adjust_io_workers();
+ 
++		/* system background workers start during crash recovery */
++		StartWorkerNeeded = true;
++
+ 		StartupPMChild = StartChildProcess(B_STARTUP);
+ 		Assert(StartupPMChild != NULL);
+ 		StartupStatus = STARTUP_RUNNING;
+@@ -4184,15 +4187,26 @@ maybe_start_bgworkers(void)
+ 	TimestampTz now = 0;
+ 	dlist_mutable_iter iter;
+ 
++	bool		system_only = false;
++
+ 	/*
+ 	 * During crash recovery, we have no need to be called until the state
+-	 * transition out of recovery.
++	 * transition out of recovery -- except for BGWORKER_CLASS_SYSTEM workers
++	 * once shared memory has been reinitialised (PM_STARTUP).  The startup
++	 * process may wait on them: orioledb's S3 workers serve the
++	 * end-of-recovery checkpoint, which never completed after a crash
++	 * because they were only started once recovery had finished.  They start
++	 * here as they did at the first boot; every other worker still waits.
+ 	 */
+ 	if (FatalError)
+ 	{
+-		StartWorkerNeeded = false;
+-		HaveCrashedWorker = false;
+-		return;
++		if (pmState != PM_STARTUP)
++		{
++			StartWorkerNeeded = false;
++			HaveCrashedWorker = false;
++			return;
++		}
++		system_only = true;
+ 	}
+ 
+ 	/* Don't need to be called again unless we find a reason for it below */
+@@ -4209,6 +4223,10 @@ maybe_start_bgworkers(void)
+ 		if (rw->rw_pid != 0)
+ 			continue;
+ 
++		/* in crash recovery only system workers start; see above */
++		if (system_only && !(rw->rw_worker.bgw_flags & BGWORKER_CLASS_SYSTEM))
++			continue;
++
+ 		/* if marked for death, clean up and remove from list */
+ 		if (rw->rw_terminate)
+ 		{
+-- 
+2.54.0 (Apple Git-157)
+
