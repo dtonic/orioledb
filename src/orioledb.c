@@ -104,7 +104,7 @@ Page	   *local_ppool_pages = NULL;
 OrioleDBPageDesc *local_ppool_page_descs = NULL;
 
 /* Custom GUC variables */
-int			orioledb_serializable_mode = O_SERIALIZABLE_TABLE_LOCK;
+int			orioledb_serializable_mode = O_SERIALIZABLE_ERROR;
 bool		orioledb_debug_disable_multi_insert = false;
 bool		orioledb_debug_disable_downlink_fastpath = false;
 
@@ -691,11 +691,12 @@ _PG_init(void)
 
 	DefineCustomEnumVariable("orioledb.serializable",
 							 "How OrioleDB handles SERIALIZABLE isolation.",
-							 "table_lock acquires a coarse ExclusiveLock per touched relation; "
-							 "error rejects SERIALIZABLE transactions; "
+							 "error (default) rejects SERIALIZABLE transactions; "
+							 "table_lock acquires a coarse ExclusiveLock per touched relation, "
+							 "which does not prevent write skew; "
 							 "repeatable_read silently downgrades them to REPEATABLE READ.",
 							 &orioledb_serializable_mode,
-							 O_SERIALIZABLE_TABLE_LOCK,
+							 O_SERIALIZABLE_ERROR,
 							 serializable_mode_options,
 							 PGC_USERSET,
 							 0,
@@ -1630,6 +1631,7 @@ o_proc_shmem_init(Pointer ptr, bool found)
 			}
 			pg_atomic_init_u64(&oProcData[i].commitInProgressXlogLocation, OWalInvalidCommitPos);
 			pg_atomic_init_u64(&oProcData[i].xmin, InvalidOXid);
+			pg_atomic_init_u64(&oProcData[i].logicalWalRetainXmin, InvalidOXid);
 			pg_atomic_init_u64(&oProcData[i].pendingSkUndoHead, InvalidUndoLocation);
 			pg_atomic_init_u64(&oProcData[i].pendingSkUndoTail, InvalidUndoLocation);
 			pg_atomic_init_u32(&oProcData[i].pinnedMetaPageBlkno,

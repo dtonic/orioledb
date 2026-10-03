@@ -145,6 +145,32 @@ static List *prevLogicalXids = NIL; /* stack of PrevLogicalXidEntry for all
 									 * restore and release */
 
 /*
+ * Logical xid of a released (committed) subtransaction, held until the
+ * transaction can no longer need it.
+ *
+ * The decoder keeps a released subtransaction's changes in the reorder buffer
+ * under its logical xid until the top-level commit.  Returning that xid to the
+ * shared bitmap at RELEASE lets the next savepoint -- of this transaction or
+ * of any other -- acquire the same number, and the decoder then mixes both
+ * subtransactions under one reorder buffer entry: a later ROLLBACK TO the
+ * new savepoint discards the released changes too, and another transaction
+ * reusing it gets its changes attributed to this one.
+ *
+ * 'owner' is the subtransaction the released one now belongs to.  It moves up
+ * as enclosing subtransactions are released, and when the owner itself rolls
+ * back, its rollback record has already told the decoder to discard the held
+ * xids (see the WAL_REC_ROLLBACK_TO_SAVEPOINT decoder), so they are given back
+ * then.  Everything left is given back with the top-level transaction.
+ */
+typedef struct
+{
+	TransactionId xid;
+	SubTransactionId owner;
+} ReleasedLogicalXidEntry;
+
+static List *releasedLogicalXids = NIL;
+
+/*
  * Check whether the top of prevLogicalXids was pushed by the subtransaction
  * identified by subid.
  */
@@ -589,24 +615,25 @@ acquire_logical_xid_wrapper(bool *isValidHeapXid)
  * savepoint makes the reorder buffer keep a known subtransaction among the
  * top-level ones.
  *
- * Asking GetTopTransactionId() for that name *assigns* a heap xid to the
- * whole transaction, which is a far bigger step than naming it: it puts the
- * transaction's CSN under the heap's control, and the heap assigns that CSN
- * outside OrioleDB's precommit/commit pair.  So the heap xid is used only if
- * the transaction already has one.  Otherwise the top-level transaction is
- * named by its own logical xid: the one saved by the outermost pushed
- * subtransaction, or the current one if nothing is pushed.  The current
- * transaction is given a logical xid if it has none.
+ * The name is the transaction's own top-level logical xid: the one saved by
+ * the outermost pushed subtransaction, or the current one if nothing is
+ * pushed.  The current transaction is given a logical xid if it has none.
  *
- * acquire_logical_xid_wrapper() records the heap -> oriole switch itself when a
- * heap xid does happen to exist already, so recovery keeps following the same
- * chain as before in that case.
+ * It is never the heap xid, even when the transaction has one.  The decoder
+ * tells the subtransactions that roll back with a savepoint by their start
+ * order within one transaction, so all of them must be found under one
+ * top-level name.  A transaction that wrote OrioleDB before it got a heap xid
+ * has its earlier savepoints named by its logical xid; naming the later ones
+ * by the heap xid split them between two entries.  The decoder finds the heap
+ * xid itself: acquire_logical_xid_wrapper() records the heap -> oriole switch
+ * whenever a heap xid exists, and the decoder then moves the logical xid and
+ * its subtransactions under it.  (Asking GetTopTransactionId() would also
+ * *assign* a heap xid, putting the transaction's CSN under the heap's
+ * control outside OrioleDB's precommit/commit pair.)
  */
 TransactionId
 get_savepoint_parent_xid(void)
 {
-	TransactionId heapXid;
-
 	if (!TransactionIdIsValid(logicalXidContext.xid))
 	{
 		bool		isValidHeapXid = false;
@@ -616,10 +643,6 @@ get_savepoint_parent_xid(void)
 		elog(DEBUG4, "ENSURE logical xid %u useHeap %d",
 			 logicalXidContext.xid, logicalXidContext.useHeap);
 	}
-
-	heapXid = GetTopTransactionIdIfAny();
-	if (TransactionIdIsValid(heapXid))
-		return heapXid;
 
 	if (prevLogicalXids != NIL)
 	{
@@ -660,6 +683,55 @@ assign_subtransaction_logical_xid(SubTransactionId mySubid)
 
 	logicalXidContext.xid = nextLogicalXid;
 	logicalXidContext.useHeap = isValidHeapXid;
+}
+
+static void
+hold_released_logical_xid(TransactionId xid, SubTransactionId owner)
+{
+	ReleasedLogicalXidEntry *entry;
+	MemoryContext mcxt;
+
+	mcxt = MemoryContextSwitchTo(TopMemoryContext);
+	entry = (ReleasedLogicalXidEntry *) palloc(sizeof(ReleasedLogicalXidEntry));
+	entry->xid = xid;
+	entry->owner = owner;
+	releasedLogicalXids = lappend(releasedLogicalXids, entry);
+	MemoryContextSwitchTo(mcxt);
+	elog(DEBUG4, "HOLD released logical xid %u owner subid %u", xid, owner);
+}
+
+/*
+ * The subtransaction 'subid' ended.  On release, the xids it held now belong
+ * to its parent.  On rollback, they are given back if 'giveBack' (the
+ * rollback record that makes the decoder discard them is in the WAL),
+ * otherwise kept up to the top-level end.
+ */
+static void
+pass_released_logical_xids(SubTransactionId subid, SubTransactionId parentSubid,
+						   bool giveBack)
+{
+	ListCell   *lc;
+
+	foreach(lc, releasedLogicalXids)
+	{
+		ReleasedLogicalXidEntry *entry = (ReleasedLogicalXidEntry *) lfirst(lc);
+
+		if (entry->owner != subid)
+			continue;
+
+		if (giveBack)
+		{
+			LogicalXidCtx ctx = {entry->xid, false};
+
+			elog(DEBUG4, "GIVE BACK released logical xid %u owner subid %u",
+				 entry->xid, subid);
+			release_logical_xid(&ctx);
+			pfree(entry);
+			releasedLogicalXids = foreach_delete_current(releasedLogicalXids, lc);
+		}
+		else
+			entry->owner = parentSubid;
+	}
 }
 
 static void
@@ -706,10 +778,22 @@ oxid_subxact_callback(
 					 * belongs to the whole transaction and must survive up to
 					 * the top-level commit record.
 					 */
+					/* What this subtransaction held now belongs to its parent */
+					pass_released_logical_xids(mySubid, parentSubid, false);
+
 					if (TransactionIdIsValid(logicalXidContext.xid) &&
 						prev_logical_xid_pushed_by(mySubid))
 					{
-						release_logical_xid(&logicalXidContext);
+						/*
+						 * The decoder still holds this subtransaction's
+						 * changes under its logical xid, so it may not be
+						 * acquired again before the transaction ends.
+						 */
+						if (RecoveryInProgress())
+							release_logical_xid(&logicalXidContext);
+						else
+							hold_released_logical_xid(logicalXidContext.xid,
+													  parentSubid);
 
 						heapXid = GetTopTransactionIdIfAny();
 						if (TransactionIdIsValid(heapXid))
@@ -786,10 +870,22 @@ oxid_subxact_callback(
 							if (prev_logical_xid_pushed_by(mySubid))
 								release_logical_xid(&logicalXidContext);
 
+							/*
+							 * undo_subxact_callback() has written the
+							 * rollback record, which makes the decoder
+							 * discard the released subtransactions under this
+							 * one as well, so their xids can be given back.
+							 */
+							pass_released_logical_xids(mySubid, parentSubid, true);
+
 							setup_prev_logical_xid_ctx(mySubid);
+							break;
 						}
 					}
 				}
+
+				/* No rollback record: keep them up to the top-level end */
+				pass_released_logical_xids(mySubid, parentSubid, false);
 
 				break;
 			}
@@ -1513,6 +1609,20 @@ advance_global_xmin(OXid newXid)
 			globalXmin = rewindRunXmin;
 	}
 
+	/*
+	 * Logical decoding judges a record's tuples against the CommitSeqNos of
+	 * oxids from the record's xmin on, possibly long after the record's
+	 * transaction ended.  Freezing them would show a later change -- a table
+	 * version committed after the record -- as committed before it.
+	 */
+	if (wal_level >= WAL_LEVEL_LOGICAL)
+	{
+		OXid		logicalXmin = logical_wal_retain_xmin();
+
+		if (OXidIsValid(logicalXmin) && logicalXmin < globalXmin)
+			globalXmin = logicalXmin;
+	}
+
 	prevGlobalXmin = pg_atomic_read_u64(&xid_meta->globalXmin);
 
 	/*
@@ -1961,6 +2071,17 @@ release_assigned_logical_xids(void)
 	{
 		ListCell   *lc = NULL;
 		PrevLogicalXidEntry *entry = NULL;
+
+		foreach(lc, releasedLogicalXids)
+		{
+			ReleasedLogicalXidEntry *released = lfirst(lc);
+			LogicalXidCtx ctx = {released->xid, false};
+
+			release_logical_xid(&ctx);
+			pfree(released);
+		}
+		list_free(releasedLogicalXids);
+		releasedLogicalXids = NIL;
 
 		foreach(lc, prevLogicalXids)
 		{

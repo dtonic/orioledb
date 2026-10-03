@@ -266,6 +266,14 @@ typedef struct
 	pg_atomic_uint64 xmin;
 
 	/*
+	 * The least run xmin stamped into this transaction's logical WAL records.
+	 * Logical decoding judges those records against oxids from there on, so
+	 * their CommitSeqNos must not be frozen while the records may still be
+	 * decoded -- see logicalWalRetainUndoLocation.
+	 */
+	pg_atomic_uint64 logicalWalRetainXmin;
+
+	/*
 	 * Undo locations of the PK modifications whose secondary-index
 	 * counterparts are still pending: the first and the last of the run.
 	 * Single-row DML puts the same location in both.  A multi-insert applies

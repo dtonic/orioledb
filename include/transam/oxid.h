@@ -116,8 +116,9 @@ extern OSnapshot o_non_deleted_snapshot;
  */
 typedef enum OSerializableMode
 {
-	O_SERIALIZABLE_TABLE_LOCK,	/* coarse ExclusiveLock per table (default) */
-	O_SERIALIZABLE_ERROR,		/* reject with ERRCODE_FEATURE_NOT_SUPPORTED */
+	O_SERIALIZABLE_TABLE_LOCK,	/* coarse ExclusiveLock per table */
+	O_SERIALIZABLE_ERROR,		/* reject with ERRCODE_FEATURE_NOT_SUPPORTED
+								 * (default) */
 	O_SERIALIZABLE_REPEATABLE_READ	/* treat OrioleDB tables as REPEATABLE
 									 * READ */
 } OSerializableMode;
@@ -140,7 +141,7 @@ o_check_isolation_level(void)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("orioledb does not support SERIALIZABLE isolation level"),
 					 errdetail("orioledb.serializable is set to \"error\"."),
-					 errhint("Set orioledb.serializable to 'table_lock' or 'repeatable_read' to enable SERIALIZABLE for OrioleDB tables.")));
+					 errhint("Use REPEATABLE READ, or set orioledb.serializable to 'table_lock' or 'repeatable_read' to accept SERIALIZABLE with weaker guarantees: neither prevents write skew.")));
 			break;
 		case O_SERIALIZABLE_REPEATABLE_READ:
 
@@ -174,6 +175,12 @@ o_check_isolation_level(void)
  *
  * Called from scan/insert/update/delete entry points; the lock is
  * released at xact end through PG's normal lock-release machinery.
+ * Not serializable: the lock is taken when a statement first touches the
+ * relation, after the transaction's snapshot was taken, so a transaction
+ * that waited on it still reads what was there before the holder committed
+ * and two transactions can each write on what the other changed (write
+ * skew).  That is why 'error' is the default.
+ *
  * Inlined so the fast path (not SERIALIZABLE) is a single branch.
  */
 static inline void

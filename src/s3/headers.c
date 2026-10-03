@@ -358,7 +358,33 @@ change_buffer(S3HeadersBuffersGroup *group, int index, S3HeaderTag tag)
 			haveLoadedPart = true;
 	}
 
-	if (checkUnlink && !haveLoadedPart)
+	if (checkUnlink && !haveLoadedPart &&
+		prevTag.checkpointNum > checkpoint_state->lastCheckpointNumber)
+	{
+		char	   *filename;
+		int			fd;
+
+		/*
+		 * A file of the checkpoint in progress keeps its header.  Without
+		 * one, read_from_file() takes the file for a new one -- created since
+		 * the last checkpoint, every part local -- and its evicted parts
+		 * would be read as the empty file left on disk instead of being
+		 * loaded back from S3.  Only the header block is kept, so the space
+		 * of the evicted parts is given back all the same.
+		 */
+		write_to_file(prevTag, oldValues);
+		filename = btree_filename(prevTag.key, prevTag.segNum,
+								  prevTag.checkpointNum);
+		fd = BasicOpenFile(filename, O_RDWR | PG_BINARY);
+		if (fd < 0 || ftruncate(fd, ORIOLEDB_BLCKSZ) != 0)
+			ereport(LOG,
+					(errcode_for_file_access(),
+					 errmsg("could not truncate file \"%s\": %m", filename)));
+		if (fd >= 0)
+			close(fd);
+		pfree(filename);
+	}
+	else if (checkUnlink && !haveLoadedPart)
 	{
 		char	   *filename;
 
@@ -1246,6 +1272,13 @@ eviction_callback(S3HeaderTag tag)
 		return;
 
 	fileSize = lseek(fd, 0, SEEK_END);
+
+	/* Only the header is left: everything was evicted already */
+	if (fileSize <= ORIOLEDB_BLCKSZ)
+	{
+		close(fd);
+		return;
+	}
 
 	numParts = (fileSize + ORIOLEDB_S3_PART_SIZE - 1) / ORIOLEDB_S3_PART_SIZE;
 	for (i = 0; i < numParts; i++)

@@ -7,13 +7,18 @@ CREATE TABLE o_ser (
 	PRIMARY KEY (id)
 ) USING orioledb;
 INSERT INTO o_ser SELECT i, i FROM generate_series(1, 3) i;
--- 'error' mode rejects SERIALIZABLE access to OrioleDB tables.
-SET orioledb.serializable = 'error';
+-- 'error' mode, the default, rejects SERIALIZABLE access to OrioleDB tables.
+SHOW orioledb.serializable;
+ orioledb.serializable 
+-----------------------
+ error
+(1 row)
+
 BEGIN ISOLATION LEVEL SERIALIZABLE;
 SELECT id, v FROM o_ser ORDER BY id;
 ERROR:  orioledb does not support SERIALIZABLE isolation level
 DETAIL:  orioledb.serializable is set to "error".
-HINT:  Set orioledb.serializable to 'table_lock' or 'repeatable_read' to enable SERIALIZABLE for OrioleDB tables.
+HINT:  Use REPEATABLE READ, or set orioledb.serializable to 'table_lock' or 'repeatable_read' to accept SERIALIZABLE with weaker guarantees: neither prevents write skew.
 ROLLBACK;
 -- 'repeatable_read' mode silently treats SERIALIZABLE as REPEATABLE READ for
 -- OrioleDB tables: no error, no extra heavyweight lock on the relation.
@@ -37,7 +42,7 @@ WHERE relation = 'o_ser'::regclass
 (0 rows)
 
 COMMIT;
--- 'table_lock' mode (default) acquires an ExclusiveLock on every OrioleDB
+-- 'table_lock' mode acquires an ExclusiveLock on every OrioleDB
 -- relation a SERIALIZABLE transaction touches.
 SET orioledb.serializable = 'table_lock';
 BEGIN ISOLATION LEVEL SERIALIZABLE;

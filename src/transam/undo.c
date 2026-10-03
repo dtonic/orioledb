@@ -292,6 +292,56 @@ undo_page_dirty(UndoLogType undoType, uint32 page)
 
 PendingTruncatesMeta *pending_truncates_meta;
 
+/*
+ * System undo that logical decoding may still read for transactions that
+ * have ended.
+ *
+ * A transaction's logical WAL records carry the CommitSeqNo the decoder reads
+ * the system trees at, and logicalWalRetainUndoLocation retains the undo that
+ * takes for as long as the transaction runs.  A slot is decoded again from
+ * its restart_lsn every time it is read through the SQL functions, and a
+ * walsender reads records written while it was catching up, so a record can
+ * be decoded well after its transaction ended -- and a slot's retain location,
+ * asked when it caught up, only looks at transactions running at that moment.
+ * So when a transaction ends, its retain location stays here with the WAL
+ * position its records end before, until no logical slot restarts that far
+ * back.
+ *
+ * Entries are in end order.  A full ring folds its oldest entry into
+ * 'overflow', which retains the least of what it folded until every slot is
+ * past the latest of their positions.
+ */
+#define LOGICAL_RETAIN_RING_SIZE	4096
+
+typedef struct
+{
+	XLogRecPtr	lsn;
+	UndoLocation retain;
+	OXid		xmin;
+} LogicalRetainEntry;
+
+typedef struct
+{
+	int			trancheId;
+	LWLock		lock;
+	uint32		head;
+	uint32		count;
+	XLogRecPtr	overflowLsn;
+	UndoLocation overflowRetain;
+	OXid		overflowXmin;
+
+	/*
+	 * The least xmin of the entries, read by advance_global_xmin() without
+	 * the lock: lowered on every push, recomputed when entries are dropped.
+	 */
+	pg_atomic_uint64 retainXmin;
+	LogicalRetainEntry entries[LOGICAL_RETAIN_RING_SIZE];
+} LogicalRetainRing;
+
+static LogicalRetainRing *logical_retain_ring;
+
+static UndoLocation logical_retain_ring_floor(void);
+
 UndoLocation curRetainUndoLocations[(int) UndoLogsCount] =
 {
 	InvalidUndoLocation
@@ -398,6 +448,7 @@ undo_shmem_needs(void)
 
 	size = CACHELINEALIGN(sizeof(UndoMeta) * (int) UndoLogsCount);
 	size = add_size(size, CACHELINEALIGN(sizeof(PendingTruncatesMeta)));
+	size = add_size(size, CACHELINEALIGN(sizeof(LogicalRetainRing)));
 	size = add_size(size, o_undo_circular_sizes[UndoLogRegular]);
 	size = add_size(size, o_undo_circular_sizes[UndoLogRegularPageLevel]);
 	size = add_size(size, o_undo_circular_sizes[UndoLogSystem]);
@@ -436,6 +487,8 @@ undo_shmem_init(Pointer buf, bool found)
 
 	pending_truncates_meta = (PendingTruncatesMeta *) ptr;
 	ptr += CACHELINEALIGN(sizeof(PendingTruncatesMeta));
+	logical_retain_ring = (LogicalRetainRing *) ptr;
+	ptr += CACHELINEALIGN(sizeof(LogicalRetainRing));
 
 	o_undo_buffers[UndoLogRegular] = ptr;
 	ptr += o_undo_circular_sizes[UndoLogRegular];
@@ -474,9 +527,21 @@ undo_shmem_init(Pointer buf, bool found)
 		pending_truncates_meta->pendingTruncatesTrancheId = LWLockNewTrancheId();
 		LWLockInitialize(&pending_truncates_meta->pendingTruncatesLock,
 						 pending_truncates_meta->pendingTruncatesTrancheId);
+
+		logical_retain_ring->trancheId = LWLockNewTrancheId();
+		LWLockInitialize(&logical_retain_ring->lock,
+						 logical_retain_ring->trancheId);
+		logical_retain_ring->head = 0;
+		logical_retain_ring->count = 0;
+		logical_retain_ring->overflowLsn = InvalidXLogRecPtr;
+		logical_retain_ring->overflowRetain = InvalidUndoLocation;
+		logical_retain_ring->overflowXmin = InvalidOXid;
+		pg_atomic_init_u64(&logical_retain_ring->retainXmin, InvalidOXid);
 	}
 	LWLockRegisterTranche(pending_truncates_meta->pendingTruncatesTrancheId,
 						  "OPendingTruncatesTranche");
+	LWLockRegisterTranche(logical_retain_ring->trancheId,
+						  "OLogicalRetainRingTranche");
 }
 
 static void
@@ -910,6 +975,14 @@ o_slot_retain_location(ReplicationSlot *slot)
 		result = Min(result, tmp);
 	}
 
+	/* ... and for transactions that ended but may be decoded again */
+	{
+		UndoLocation ended = logical_retain_ring_floor();
+
+		if (UndoLocationIsValid(ended))
+			result = Min(result, ended);
+	}
+
 	if (!UndoLocationIsValid(result))
 		return 0;
 
@@ -1113,12 +1186,22 @@ set_my_snapshot_retain_location(UndoLogType undoType)
  * newer than the CSN itself.
  */
 void
-set_my_logical_wal_retain_location(void)
+set_my_logical_wal_retain_location(OXid xmin)
 {
 	ODBProcData *curProcData = GET_CUR_PROCDATA();
 	UndoMeta   *meta = get_undo_meta_by_type(UndoLogSystem);
 	UndoLocation curRetainLocation,
 				retainUndoLocation;
+	OXid		curRetainXmin;
+
+	/*
+	 * The record is judged against oxids from 'xmin' on, so keep their
+	 * CommitSeqNos.  'xmin' is the run xmin the caller stamps, read while its
+	 * own snapshot held the global xmin at or below it.
+	 */
+	curRetainXmin = pg_atomic_read_u64(&curProcData->logicalWalRetainXmin);
+	if (!OXidIsValid(curRetainXmin) || xmin < curRetainXmin)
+		pg_atomic_write_u64(&curProcData->logicalWalRetainXmin, xmin);
 
 	while (true)
 	{
@@ -1156,9 +1239,157 @@ void
 clear_my_logical_wal_retain_location(void)
 {
 	ODBProcData *curProcData = GET_CUR_PROCDATA();
+	UndoLocation retain;
+	OXid		xmin;
+
+	retain = pg_atomic_read_u64(&curProcData->undoRetainLocations[UndoLogSystem].logicalWalRetainUndoLocation);
+	xmin = pg_atomic_read_u64(&curProcData->logicalWalRetainXmin);
+
+	/*
+	 * The transaction ends, but its records may be decoded later: hand what
+	 * it retains over to logical_retain_ring before giving it up, so that
+	 * there is no moment nobody holds it.  Every record of the transaction is
+	 * inserted by now, so the insert position bounds them.
+	 */
+	if ((UndoLocationIsValid(retain) || OXidIsValid(xmin)) &&
+		!RecoveryInProgress())
+	{
+		LogicalRetainRing *ring = logical_retain_ring;
+		XLogRecPtr	lsn = GetXLogInsertRecPtr();
+		bool		anySlot = !XLogRecPtrIsInvalid(ReplicationSlotsComputeLogicalRestartLSN());
+		uint32		slot;
+
+		LWLockAcquire(&ring->lock, LW_EXCLUSIVE);
+		if (!anySlot)
+		{
+			/*
+			 * No logical slot will decode anything written so far, and
+			 * nothing else drops entries while there is none: start over.
+			 */
+			ring->count = 0;
+			ring->overflowLsn = InvalidXLogRecPtr;
+			ring->overflowRetain = InvalidUndoLocation;
+			ring->overflowXmin = InvalidOXid;
+			pg_atomic_write_u64(&ring->retainXmin, InvalidOXid);
+		}
+		else
+		{
+			OXid		ringXmin;
+
+			if (ring->count == LOGICAL_RETAIN_RING_SIZE)
+			{
+				LogicalRetainEntry *oldest = &ring->entries[ring->head];
+
+				if (UndoLocationIsValid(oldest->retain) &&
+					(!UndoLocationIsValid(ring->overflowRetain) ||
+					 oldest->retain < ring->overflowRetain))
+					ring->overflowRetain = oldest->retain;
+				if (OXidIsValid(oldest->xmin) &&
+					(!OXidIsValid(ring->overflowXmin) ||
+					 oldest->xmin < ring->overflowXmin))
+					ring->overflowXmin = oldest->xmin;
+				ring->overflowLsn = Max(ring->overflowLsn, oldest->lsn);
+				ring->head = (ring->head + 1) % LOGICAL_RETAIN_RING_SIZE;
+				ring->count--;
+			}
+			slot = (ring->head + ring->count) % LOGICAL_RETAIN_RING_SIZE;
+			ring->entries[slot].lsn = lsn;
+			ring->entries[slot].retain = retain;
+			ring->entries[slot].xmin = xmin;
+			ring->count++;
+
+			ringXmin = pg_atomic_read_u64(&ring->retainXmin);
+			if (OXidIsValid(xmin) &&
+				(!OXidIsValid(ringXmin) || xmin < ringXmin))
+				pg_atomic_write_u64(&ring->retainXmin, xmin);
+		}
+		LWLockRelease(&ring->lock);
+	}
 
 	pg_atomic_write_u64(&curProcData->undoRetainLocations[UndoLogSystem].logicalWalRetainUndoLocation,
 						InvalidUndoLocation);
+	pg_atomic_write_u64(&curProcData->logicalWalRetainXmin, InvalidOXid);
+}
+
+/*
+ * The least oxid whose CommitSeqNo logical decoding may still need: what the
+ * running transactions stamped into their records, and what ended ones left
+ * in logical_retain_ring.  InvalidOXid when nothing is held.
+ */
+OXid
+logical_wal_retain_xmin(void)
+{
+	OXid		result = pg_atomic_read_u64(&logical_retain_ring->retainXmin);
+	int			i;
+
+	for (i = 0; i < max_procs; i++)
+	{
+		OXid		xmin = pg_atomic_read_u64(&oProcData[i].logicalWalRetainXmin);
+
+		if (OXidIsValid(xmin) && (!OXidIsValid(result) || xmin < result))
+			result = xmin;
+	}
+	return result;
+}
+
+/*
+ * The least retain location in logical_retain_ring that some logical slot may
+ * still decode records for, or InvalidUndoLocation.  Entries every slot
+ * restarts past are dropped on the way, and the ring's xmin follows.
+ */
+static UndoLocation
+logical_retain_ring_floor(void)
+{
+	LogicalRetainRing *ring = logical_retain_ring;
+	XLogRecPtr	minRestart = ReplicationSlotsComputeLogicalRestartLSN();
+	UndoLocation result;
+	OXid		xmin;
+	uint32		i;
+
+	LWLockAcquire(&ring->lock, LW_EXCLUSIVE);
+
+	/* No logical slot restarts anywhere: nothing is decoded again */
+	if (XLogRecPtrIsInvalid(minRestart))
+	{
+		ring->count = 0;
+		ring->overflowLsn = InvalidXLogRecPtr;
+		ring->overflowRetain = InvalidUndoLocation;
+		ring->overflowXmin = InvalidOXid;
+		pg_atomic_write_u64(&ring->retainXmin, InvalidOXid);
+		LWLockRelease(&ring->lock);
+		return InvalidUndoLocation;
+	}
+
+	while (ring->count > 0 && ring->entries[ring->head].lsn < minRestart)
+	{
+		ring->head = (ring->head + 1) % LOGICAL_RETAIN_RING_SIZE;
+		ring->count--;
+	}
+	if (!XLogRecPtrIsInvalid(ring->overflowLsn) &&
+		ring->overflowLsn < minRestart)
+	{
+		ring->overflowLsn = InvalidXLogRecPtr;
+		ring->overflowRetain = InvalidUndoLocation;
+		ring->overflowXmin = InvalidOXid;
+	}
+
+	result = ring->overflowRetain;
+	xmin = ring->overflowXmin;
+	for (i = 0; i < ring->count; i++)
+	{
+		LogicalRetainEntry *entry = &ring->entries[(ring->head + i) % LOGICAL_RETAIN_RING_SIZE];
+
+		if (UndoLocationIsValid(entry->retain) &&
+			(!UndoLocationIsValid(result) || entry->retain < result))
+			result = entry->retain;
+		if (OXidIsValid(entry->xmin) &&
+			(!OXidIsValid(xmin) || entry->xmin < xmin))
+			xmin = entry->xmin;
+	}
+	pg_atomic_write_u64(&ring->retainXmin, xmin);
+	LWLockRelease(&ring->lock);
+
+	return result;
 }
 
 void
@@ -3130,7 +3361,18 @@ undo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				prentLogicalXid = get_savepoint_parent_xid();
 				assign_subtransaction_logical_xid(mySubid);
 				add_savepoint_wal_record(parentSubid, prentLogicalXid);
-				if (minParentSubId == InvalidSubTransactionId)
+
+				/*
+				 * Keep the minimum.  A savepoint whose parent is below
+				 * minParentSubId is taken to predate OrioleDB's involvement,
+				 * so rolling back to it undoes the whole transaction.  The
+				 * subtransaction that first set it may have ended since, and
+				 * this one, started under a lower parent, has an undo item of
+				 * its own: rolling back to it must stop there, not undo the
+				 * changes made before it.
+				 */
+				if (minParentSubId == InvalidSubTransactionId ||
+					parentSubid < minParentSubId)
 					minParentSubId = parentSubid;
 			}
 
@@ -3142,6 +3384,9 @@ undo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			break;
 
 		case SUBXACT_EVENT_ABORT_SUB:
+			/* A rewrite that failed half way leaves no mark behind */
+			wal_end_table_rewrite(false);
+
 			if (parentSubid < minParentSubId || minParentSubId == InvalidSubTransactionId)
 				parentSubid = InvalidSubTransactionId;
 

@@ -9,8 +9,8 @@ CREATE TABLE o_ser (
 ) USING orioledb;
 INSERT INTO o_ser SELECT i, i FROM generate_series(1, 3) i;
 
--- 'error' mode rejects SERIALIZABLE access to OrioleDB tables.
-SET orioledb.serializable = 'error';
+-- 'error' mode, the default, rejects SERIALIZABLE access to OrioleDB tables.
+SHOW orioledb.serializable;
 BEGIN ISOLATION LEVEL SERIALIZABLE;
 SELECT id, v FROM o_ser ORDER BY id;
 ROLLBACK;
@@ -27,7 +27,7 @@ WHERE relation = 'o_ser'::regclass
   AND mode = 'ExclusiveLock';
 COMMIT;
 
--- 'table_lock' mode (default) acquires an ExclusiveLock on every OrioleDB
+-- 'table_lock' mode acquires an ExclusiveLock on every OrioleDB
 -- relation a SERIALIZABLE transaction touches.
 SET orioledb.serializable = 'table_lock';
 BEGIN ISOLATION LEVEL SERIALIZABLE;

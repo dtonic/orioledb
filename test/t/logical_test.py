@@ -1079,7 +1079,9 @@ class LogicalTest(BaseTest):
 			#print(result)
 
 			expected1 = f"""BEGIN\ntable public.{o_relname}: INSERT: id[integer]:1 data[text]:'"""
-			expected2 = f"""'\ntable public.{o_relname}: INSERT: id[integer]:1 data[text]:unchanged-toast-datum data_3[bigint]:0\n"""
+			# The rewrite of ALTER ... TYPE copies the row into the new relnode;
+			# the copy is not a change and is not decoded.
+			expected2 = "'\n"
 			expected3 = f"""table public.{o_relname}: INSERT: id[integer]:2 data[text]:'"""
 			expected_tail = "' data_3[bigint]:1\nCOMMIT\n"
 
@@ -1178,7 +1180,9 @@ class LogicalTest(BaseTest):
 			#print(result)
 
 			expected_begin = f"""BEGIN\ntable public.{o_relname}: INSERT: id[integer]:1 data[text]:'"""
-			expected_added = f"""'\ntable public.{o_relname}: INSERT: id[integer]:1 data[text]:unchanged-toast-datum data_3[bigint]:0\n"""
+			# The rewrite of ALTER ... TYPE copies the row into the new relnode;
+			# the copy is not a change and is not decoded.
+			expected_added = "'\n"
 			expected_update1 = f"""table public.{o_relname}: UPDATE: old-key: id[integer]:1 new-tuple: id[integer]:1 data[text]:'"""
 			expected_tail1 = "' data_3[bigint]:1\n"
 			expected_update2 = f"""table public.{o_relname}: UPDATE: old-key: id[integer]:1 new-tuple: id[integer]:1 data[text]:'"""

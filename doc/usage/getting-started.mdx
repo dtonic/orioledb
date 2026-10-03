@@ -295,8 +295,8 @@ OrioleDB is currently in the development stage. Therefore it has the following t
 8.  `CREATE INDEX/REINDEX CONCURRENTLY` are supported with [limitations](../architecture/concurrent-index.mdx).
 9.  OrioleDB tables don't support `Sample Scans` yet.
 10. OrioleDB does not implement true SERIALIZABLE Snapshot Isolation. The `orioledb.serializable` GUC controls how SERIALIZABLE transactions are handled:
-    - `table_lock` (default): every relation a SERIALIZABLE transaction touches is protected by a coarse heavyweight `ExclusiveLock`. Correct, but pessimistic — concurrent non-conflicting workloads degrade to serial execution.
-    - `error`: reject SERIALIZABLE transactions with `ERRCODE_FEATURE_NOT_SUPPORTED` (the legacy behavior).
+    - `error` (default): reject SERIALIZABLE transactions with `ERRCODE_FEATURE_NOT_SUPPORTED`.
+    - `table_lock`: every relation a SERIALIZABLE transaction touches is protected by a coarse heavyweight `ExclusiveLock`. It does not prevent write skew: the lock is taken after the transaction's snapshot.
     - `repeatable_read`: treat SERIALIZABLE as `REPEATABLE READ` for OrioleDB tables only — no extra locks are taken, OrioleDB's CSN snapshot already provides per-transaction stable reads. Heap tables in the same transaction continue to use PG's SSI as usual.
 11. Backward fetches from a cursor is supported only when the cursor is declared with `SCROLL`.
 12. OrioleDB always uses checksums on data pages and initializing a database cluster without data checksums doesn't have effect on OrioleDB tables.
