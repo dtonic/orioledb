@@ -703,11 +703,22 @@ s3_schedule_file_part_read(uint32 chkpNum, OIndexKey key, int32 segNum,
 	status = s3_header_mark_part_loading(tag, partNum);
 	if (status == S3PartStatusLoading)
 	{
+		S3TaskLocation insertLocation = s3_queue_get_insert_location();
+
 		/*
 		 * The task is already scheduled.  We don't know the location, but we
-		 * know it's lower than current insert location.
+		 * know it's lower than current insert location, so it is done once
+		 * everything up to there is erased.  s3_queue_wait_for_location()
+		 * waits for the given location itself to be erased: given the insert
+		 * location, it waited for a task nobody has scheduled yet, and with
+		 * the queue idle that took until the next unrelated task (a WAL file,
+		 * a checkpoint) came and went.
+		 *
+		 * The process marking the part loading may not have put its task yet,
+		 * and then this returns early; s3_header_lock_part() looks at the
+		 * part's status again and waits for it to be loaded.
 		 */
-		return s3_queue_get_insert_location();
+		return insertLocation > 0 ? insertLocation - 1 : 0;
 	}
 	else if (status == S3PartStatusLoaded)
 	{

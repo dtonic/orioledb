@@ -249,8 +249,8 @@ s3_queue_get_task(S3TaskLocation taskLocation)
 
 		Assert(firstChunkLen >= sizeof(uint32));
 
-		memcpy(s3_queue_buffer + taskLocation % s3_queue_size + sizeof(uint32),
-			   result,
+		memcpy(result,
+			   s3_queue_buffer + taskLocation % s3_queue_size + sizeof(uint32),
 			   firstChunkLen - sizeof(uint32));
 		memcpy(result + (firstChunkLen - sizeof(uint32)),
 			   s3_queue_buffer,
