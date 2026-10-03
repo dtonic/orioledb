@@ -870,11 +870,15 @@ typedef struct
 	TupleDescData *o_toast_tupDesc;
 	TupleDescData *heap_toast_tupDesc;
 	bool		has_origin;
+	bool		table_rewrite;	/* see WAL_CONTAINER_TABLE_REWRITE */
 } DecodeWalDescCtx;
 
 static WalParseResult
 decode_on_container(WalReaderState *r)
 {
+	((DecodeWalDescCtx *) r->ctx)->table_rewrite =
+		(r->container.flags & WAL_CONTAINER_TABLE_REWRITE) != 0;
+
 	if (r->container.flags & WAL_CONTAINER_HAS_ORIGIN_INFO)
 	{
 		DecodeWalDescCtx *ctx = (DecodeWalDescCtx *) r->ctx;
@@ -1506,6 +1510,17 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 						 "IGNORED record type %d (%s) invalid logicalXid for oxid " UINT64_FORMAT,
 						 rec->type, recname, rec->oxid);
 					/* Skip */
+					break;
+				}
+
+				/*
+				 * A table rewrite copying its rows into the new relnode: not
+				 * a change of the table's contents.
+				 */
+				if (ctx->table_rewrite)
+				{
+					elog(DEBUG4, "SKIPPED record type %d (%s) of a table rewrite",
+						 rec->type, recname);
 					break;
 				}
 

@@ -20,6 +20,15 @@
 #define WAL_CONTAINER_HAS_ORIGIN_INFO	(1U << 1)
 
 /*
+ * The container's modify records copy a table into its new relnode during a
+ * rewrite (ALTER TABLE ... TYPE, a volatile default, ...).  Recovery replays
+ * them as any other; logical decoding skips them, as it skips the transient
+ * heap of a heap table's rewrite.  The flag carries no payload, so readers
+ * that do not know it parse the container all the same.
+ */
+#define WAL_CONTAINER_TABLE_REWRITE		(1U << 2)
+
+/*
  * Current WAL version of OrioleDB.
  * Bump it when WAL format changes compared to previous release.
  * ORIOLEDB_WAL_VERSION makes sense and should be converted even between
@@ -278,6 +287,8 @@ extern void add_database_copy_wal_record(Oid dboid, Oid src_tblspc, Oid dst_tbls
 extern void add_database_create_copy_wal_record(Oid src_datoid, Oid dst_datoid);
 extern void add_database_template_checkpoint_wal_record(Oid src_datoid);
 extern void wal_reset_xid_record(void);
+extern void wal_start_table_rewrite(void);
+extern void wal_end_table_rewrite(bool flush);
 extern bool local_wal_is_empty(void);
 extern XLogRecPtr flush_local_wal(bool isCommit, bool withXactTime);
 extern XLogRecPtr wal_commit(OXid oxid, TransactionId logicalXid,

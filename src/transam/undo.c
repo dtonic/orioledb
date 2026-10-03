@@ -3153,6 +3153,9 @@ undo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			break;
 
 		case SUBXACT_EVENT_ABORT_SUB:
+			/* A rewrite that failed half way leaves no mark behind */
+			wal_end_table_rewrite(false);
+
 			if (parentSubid < minParentSubId || minParentSubId == InvalidSubTransactionId)
 				parentSubid = InvalidSubTransactionId;
 

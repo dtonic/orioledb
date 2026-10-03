@@ -250,6 +250,7 @@ TESTGRESCHECKS_PART_2 = test/t/checkpoint_concurrent_test.py \
 						test/t/logical_test.py \
 						test/t/logical_undo_retain_test.py \
 						test/t/logical_xid_leak_test.py \
+						test/t/logical_rewrite_test.py \
 						test/t/logical_subxact_decoding_test.py \
 						test/t/logical_xid_subxacts_test.py \
 						test/t/merge_into_test.py \

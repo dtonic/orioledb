@@ -35,6 +35,7 @@ typedef struct
 	bool		has_material_changes;
 	bool		contains_xid;
 	bool		contains_switch_xid;
+	bool		table_rewrite;	/* see WAL_CONTAINER_TABLE_REWRITE */
 	ORelOids	oids;
 	OIndexType	ix_type;
 	char		buffer[LOCAL_WAL_BUFFER_SIZE];
@@ -389,6 +390,9 @@ void
 wal_rollback(OXid oxid, TransactionId logicalXid, bool isAutonomous)
 {
 	XLogRecPtr	wait_pos;
+
+	/* A rewrite that failed half way leaves no mark behind */
+	local_wal.table_rewrite = false;
 
 	if (!local_wal.has_material_changes)
 	{
@@ -841,6 +845,30 @@ wal_reset_xid_record(void)
 	local_wal.contains_xid = false;
 }
 
+/*
+ * Mark the containers that copy a table during its rewrite, see
+ * WAL_CONTAINER_TABLE_REWRITE.  What is buffered before the rewrite starts
+ * and after it ends goes to containers of its own.
+ */
+void
+wal_start_table_rewrite(void)
+{
+	flush_local_wal_buffer();
+	local_wal.table_rewrite = true;
+}
+
+/*
+ * 'flush' is false on the error path: the buffer is about to be thrown away
+ * with the transaction, only the mark must not outlive the rewrite.
+ */
+void
+wal_end_table_rewrite(bool flush)
+{
+	if (flush)
+		flush_local_wal_buffer();
+	local_wal.table_rewrite = false;
+}
+
 bool
 local_wal_is_empty(void)
 {
@@ -952,6 +980,9 @@ log_logical_wal_container_with_payload(Pointer ptr, int length,
 
 	if (hasOrigin)
 		flags |= WAL_CONTAINER_HAS_ORIGIN_INFO;
+
+	if (local_wal.table_rewrite)
+		flags |= WAL_CONTAINER_TABLE_REWRITE;
 
 	XLogRegisterData((char *) (&flags), sizeof(flags));
 

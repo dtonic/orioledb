@@ -2606,6 +2606,13 @@ rewrite_table(Relation rel, OTable *old_o_table, OTable *new_o_table)
 		}
 	}
 
+	/*
+	 * The copy is not a change of the table's contents: logical decoding must
+	 * not emit it.  An error on the way clears the mark at the
+	 * (sub)transaction abort.
+	 */
+	wal_start_table_rewrite();
+
 	while (!O_TUPLE_IS_NULL(tup = btree_seq_scan_getnext(sscan, old_slot->tts_mcxt, &tupleCsn, &hint)))
 	{
 		tts_orioledb_store_tuple(old_slot, tup, old_descr,
@@ -2850,6 +2857,8 @@ rewrite_table(Relation rel, OTable *old_o_table, OTable *new_o_table)
 		ExecClearTuple(old_slot);
 		ExecClearTuple(new_slot);
 	}
+
+	wal_end_table_rewrite(true);
 
 	if (check_estate)
 	{
