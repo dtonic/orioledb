@@ -1582,6 +1582,32 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 	memset(img, 0, O_PAGE_HEADER_SIZE);
 	((BTreePageHeader *) img)->o_header.checkpointNum = ondisk_page_header.checkpointNum;
 
+	/*
+	 * Drop a page-image undo link that cannot belong to this server's undo.
+	 *
+	 * The page header is written to disk with its undo link, and page-level
+	 * undo is not checkpointed: its locations start over at every startup. A
+	 * page read after a restart, or from a base backup on a standby, can then
+	 * link beyond everything this server has written, into undo that was the
+	 * primary's or the previous run's.  The link is never followed (the page
+	 * was changed before any snapshot of this server), but once the page is
+	 * changed again its image -- carrying that link -- is saved at a new,
+	 * lower location, and get_page_from_undo() rightly refuses a chain that
+	 * does not go backwards.  A link at or past the current undo position is
+	 * such a leftover; a page evicted and reloaded by this server links below
+	 * it.
+	 */
+	{
+		BTreePageHeader *header = (BTreePageHeader *) img;
+		UndoLogType pageUndoType = GET_PAGE_LEVEL_UNDO_TYPE(desc->undoType);
+
+		if (pageUndoType != UndoLogNone &&
+			UndoLocationIsValid(header->undoLocation) &&
+			header->undoLocation >=
+			pg_atomic_read_u64(&get_undo_meta_by_type(pageUndoType)->lastUsedLocation))
+			header->undoLocation = InvalidUndoLocation;
+	}
+
 #ifdef IS_DEV
 	/* For eviction/page checkpoint number test */
 	store_read_page_checkpoint_stats(((BTreePageHeader *) img)->o_header.checkpointNum);
