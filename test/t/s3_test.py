@@ -463,6 +463,66 @@ class S3Test(S3BaseTest):
 		                 node.execute("SELECT COUNT(*) FROM o_test")[0][0])
 		node.stop()
 
+	def s3_small_buffers_conf(self, desired_size):
+		self.node.append_conf(f"""
+			orioledb.s3_mode = true
+			orioledb.s3_host = '{self.host}:{self.port}/{self.bucket_name}'
+			orioledb.s3_region = '{self.region}'
+			orioledb.s3_accesskey = '{self.access_key_id}'
+			orioledb.s3_secretkey = '{self.secret_access_key}'
+			orioledb.s3_cainfo = '{self.s3_cainfo}'
+			orioledb.s3_desired_size = {desired_size}
+			orioledb.s3_headers_buffers = 128kB
+			orioledb.main_buffers = 8MB
+
+			orioledb.s3_num_workers = 3
+			checkpoint_timeout = 1h
+			max_wal_size = 4GB
+		""")
+
+	def load_tables_after_checkpoint(self, tables, rows):
+		node = self.node
+		node.safe_psql("CREATE EXTENSION IF NOT EXISTS orioledb;")
+		node.safe_psql("CHECKPOINT")
+		for t in range(tables):
+			node.safe_psql(f"""
+				CREATE TABLE o_test{t} (
+					id int PRIMARY KEY,
+					value text NOT NULL
+				) USING orioledb;
+				INSERT INTO o_test{t}
+					SELECT id, repeat(md5(id::text), 8)
+					FROM generate_series(1, {rows}) id;
+			""")
+
+	def assert_tables(self, tables, rows):
+		for t in range(tables):
+			self.assertEqual(
+			    rows,
+			    self.node.execute(f"SELECT count(*) FROM o_test{t}")[0][0])
+
+	def test_s3_evicted_data_of_checkpoint_in_progress(self):
+		"""
+		Data written since the last checkpoint gets uploaded and evicted
+		before the next checkpoint completes.  Once every part of such a
+		file is evicted and its header buffer goes to another file, the file
+		must still say its parts are in S3, not look like a new file whose
+		parts are all local.
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('20MB')
+		node.start()
+		self.load_tables_after_checkpoint(8, 40000)
+		for _ in range(60):
+			if self.get_data_size() <= 30 * 1024 * 1024:
+				break
+			time.sleep(1)
+		# Let later eviction cycles hand the header buffers of the evicted
+		# files to others
+		time.sleep(10)
+		self.assert_tables(8, 40000)
+		node.stop()
+
 	def test_s3_data_dir_load(self):
 		node = self.node
 		node.append_conf(f"""
