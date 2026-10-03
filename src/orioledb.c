@@ -1630,6 +1630,7 @@ o_proc_shmem_init(Pointer ptr, bool found)
 			}
 			pg_atomic_init_u64(&oProcData[i].commitInProgressXlogLocation, OWalInvalidCommitPos);
 			pg_atomic_init_u64(&oProcData[i].xmin, InvalidOXid);
+			pg_atomic_init_u64(&oProcData[i].logicalWalRetainXmin, InvalidOXid);
 			pg_atomic_init_u64(&oProcData[i].pendingSkUndoHead, InvalidUndoLocation);
 			pg_atomic_init_u64(&oProcData[i].pendingSkUndoTail, InvalidUndoLocation);
 			pg_atomic_init_u32(&oProcData[i].pinnedMetaPageBlkno,

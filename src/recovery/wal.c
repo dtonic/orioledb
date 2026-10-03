@@ -607,7 +607,7 @@ add_rel_wal_record(ORelOids oids, OIndexType type, uint32 version, uint32 base_v
 	 */
 	if (wal_level >= WAL_LEVEL_LOGICAL)
 	{
-		set_my_logical_wal_retain_location();
+		set_my_logical_wal_retain_location(runXmin);
 		pg_read_barrier();
 	}
 

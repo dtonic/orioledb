@@ -1609,6 +1609,20 @@ advance_global_xmin(OXid newXid)
 			globalXmin = rewindRunXmin;
 	}
 
+	/*
+	 * Logical decoding judges a record's tuples against the CommitSeqNos of
+	 * oxids from the record's xmin on, possibly long after the record's
+	 * transaction ended.  Freezing them would show a later change -- a table
+	 * version committed after the record -- as committed before it.
+	 */
+	if (wal_level >= WAL_LEVEL_LOGICAL)
+	{
+		OXid		logicalXmin = logical_wal_retain_xmin();
+
+		if (OXidIsValid(logicalXmin) && logicalXmin < globalXmin)
+			globalXmin = logicalXmin;
+	}
+
 	prevGlobalXmin = pg_atomic_read_u64(&xid_meta->globalXmin);
 
 	/*

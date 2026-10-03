@@ -302,11 +302,18 @@ class LogicalUndoRetainTest(BaseTest):
 		    "the slot moved past a record that is still waiting in its "
 		    "transaction's WAL buffer")
 
-		# Once that transaction is done and decoded, it may move.
+		# Once that transaction is done and decoded, it may move -- but only
+		# once the slot restarts past it: until then a restart decodes its
+		# records again.  restart_lsn moves on a decoded running_xacts record,
+		# which bgwriter writes every 15 seconds; a checkpoint writes one now.
+		# The slot asks what it retains before it confirms, so the value
+		# follows the new restart_lsn one call later.
 		old_con.commit()
 		old_con.close()
 		with node.connect(autocommit=True) as churn:
 			self.churn(churn, 'freed', 20)
+		node.safe_psql('postgres', "CHECKPOINT;")
+		self.decoded(node)
 		self.decoded(node)
 
 		self.assertGreater(self.slot_retain(node), held,
