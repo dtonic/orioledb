@@ -523,6 +523,22 @@ class S3Test(S3BaseTest):
 		self.assert_tables(8, 40000)
 		node.stop()
 
+	def test_s3_crash_before_checkpoint_of_new_tables(self):
+		"""
+		Tables created and filled after the last checkpoint live in data files
+		of the next checkpoint number, and recovery writes them again.  Those
+		files have to survive until the end-of-recovery checkpoint reads them.
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('1000MB')
+		node.start()
+		self.load_tables_after_checkpoint(8, 40000)
+		node.stop(['-m', 'immediate'])
+
+		node.start()
+		self.assert_tables(8, 40000)
+		node.stop()
+
 	def test_s3_data_dir_load(self):
 		node = self.node
 		node.append_conf(f"""

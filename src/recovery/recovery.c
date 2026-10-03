@@ -3827,7 +3827,15 @@ cleanup_tablespace_old_files(char *path, Oid tablespace, uint32 chkp_num,
 						file_segno;
 			bool		cleanup = false;
 
-			if (orioledb_s3_mode &&
+			/*
+			 * In S3 mode a data file is named after the checkpoint it is
+			 * written for.  One newer than the last checkpoint was written
+			 * before the crash and is stale: remove it before recovery, so
+			 * that recovery starts it over.  After recovery the files newer
+			 * than the last checkpoint are the ones recovery has just
+			 * written, and the end-of-recovery checkpoint reads them.
+			 */
+			if (orioledb_s3_mode && before_recovery &&
 				(sscanf(dbFile->d_name, "%10u-%10u",
 						&file_reloid, &file_chkp) == 2 ||
 				 sscanf(dbFile->d_name, "%10u.%10u-%10u",
@@ -3904,7 +3912,7 @@ cleanup_tablespace_old_files(char *path, Oid tablespace, uint32 chkp_num,
 					}
 				}
 			}
-			else if (before_recovery &&
+			else if (before_recovery && !cleanup &&
 					 sscanf(dbFile->d_name, "%10u", &file_reloid) == 1)
 			{
 				/*
