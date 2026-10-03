@@ -3130,7 +3130,18 @@ undo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				prentLogicalXid = get_savepoint_parent_xid();
 				assign_subtransaction_logical_xid(mySubid);
 				add_savepoint_wal_record(parentSubid, prentLogicalXid);
-				if (minParentSubId == InvalidSubTransactionId)
+
+				/*
+				 * Keep the minimum.  A savepoint whose parent is below
+				 * minParentSubId is taken to predate OrioleDB's involvement,
+				 * so rolling back to it undoes the whole transaction.  The
+				 * subtransaction that first set it may have ended since, and
+				 * this one, started under a lower parent, has an undo item of
+				 * its own: rolling back to it must stop there, not undo the
+				 * changes made before it.
+				 */
+				if (minParentSubId == InvalidSubTransactionId ||
+					parentSubid < minParentSubId)
 					minParentSubId = parentSubid;
 			}
 

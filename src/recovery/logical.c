@@ -653,6 +653,133 @@ forget_logical_xid(TransactionId logicalXid)
 		hash_search(logicalXidOxidHash, &logicalXid, HASH_REMOVE, NULL);
 }
 
+/*
+ * ReorderBufferAssignChild() for OrioleDB's logical xids.
+ *
+ * The reorder buffer keeps one level: a top-level transaction and a flat list
+ * of subtransactions.  OrioleDB's transaction can change its top-level name
+ * on the way.  It starts as a logical xid of its own, savepoints are assigned
+ * under that name, and only if the transaction writes a heap table too does
+ * the pre-commit switch record make that logical xid a child of the heap xid.
+ * By then it holds children of its own, and ReorderBufferAssignChild() would
+ * nest them one level deep (it asserts that a new child has none), where
+ * committing the heap transaction never reaches them.  So move them under
+ * the new top-level transaction first, with the memory they account for.
+ *
+ * A parent that is already somebody's subtransaction is named by its
+ * top-level transaction for the same reason.
+ */
+static void
+oriole_assign_child(ReorderBuffer *rb, TransactionId xid,
+					TransactionId subxid, XLogRecPtr lsn)
+{
+	ReorderBufferTXN *txn = get_reorder_buffer_txn(rb, xid);
+	ReorderBufferTXN *subtxn = get_reorder_buffer_txn(rb, subxid);
+
+	if (txn != NULL && rbtxn_is_known_subxact(txn))
+	{
+		txn = txn->toptxn;
+		xid = txn->xid;
+	}
+
+	if (xid == subxid)
+		return;
+
+	if (subtxn != NULL && !rbtxn_is_known_subxact(subtxn) &&
+		(subtxn->nsubtxns > 0 || subtxn->total_size > 0))
+	{
+		dlist_mutable_iter iter;
+
+		if (txn == NULL)
+		{
+			Assert(!XLogRecPtrIsInvalid(lsn));
+			ReorderBufferProcessXid(rb, xid, lsn);
+			txn = get_reorder_buffer_txn(rb, xid);
+		}
+
+		dlist_foreach_modify(iter, &subtxn->subtxns)
+		{
+			ReorderBufferTXN *child = dlist_container(ReorderBufferTXN, node, iter.cur);
+
+			dlist_delete(&child->node);
+			child->toptxn = txn;
+			child->toplevel_xid = xid;
+			dlist_push_tail(&txn->subtxns, &child->node);
+			txn->nsubtxns++;
+			elog(DEBUG4, "MOVE logical xid %u from %u to top-level %u",
+				 child->xid, subxid, xid);
+		}
+
+		/*
+		 * nsubtxns is not decremented when a subtransaction is cleaned up (it
+		 * only sizes arrays), so it may still count children rolled back
+		 * earlier; the list is empty now.
+		 */
+		subtxn->nsubtxns = 0;
+
+		/* The changes of 'subtxn' and its children now count for 'txn' */
+		txn->total_size += subtxn->total_size;
+		subtxn->total_size = 0;
+	}
+
+	ReorderBufferAssignChild(rb, xid, subxid, lsn);
+}
+
+/*
+ * A subtransaction rolled back: discard the OrioleDB subtransactions that
+ * started after it in the same transaction.
+ *
+ * Savepoint records name the top-level transaction as every subtransaction's
+ * parent (ReorderBufferAssignChild() takes a top-level one only), so the
+ * reorder buffer keeps them in one flat list.  Everything started after
+ * 'subtxn' while it was open is its descendant, so it rolled back with it,
+ * released or not -- yet it sits beside it in that list, and committing the
+ * transaction would emit it.  There is no release record, so the start
+ * position (first_lsn) is all that tells descendants apart; the ones started
+ * after the rollback are not in the reorder buffer yet.  The list order is not
+ * the start order once oriole_assign_child() has moved a logical xid's
+ * subtransactions under a heap xid.
+ *
+ * Only OrioleDB logical xids are discarded here (the ones a savepoint record
+ * or a change introduced): heap subtransactions in the list get abort records
+ * of their own.
+ */
+static void
+abort_later_subtxns(ReorderBuffer *rb, ReorderBufferTXN *subtxn,
+					XLogRecPtr lsn)
+{
+	ReorderBufferTXN *toptxn = rbtxn_get_toptxn(subtxn);
+	dlist_iter	iter;
+	TransactionId *later;
+	int			nlater = 0,
+				nalloc = 0,
+				i;
+
+	if (!logicalXidOxidHash)
+		return;
+
+	dlist_foreach(iter, &toptxn->subtxns)
+		nalloc++;
+	later = palloc(sizeof(TransactionId) * (nalloc + 1));
+	dlist_foreach(iter, &toptxn->subtxns)
+	{
+		ReorderBufferTXN *cur = dlist_container(ReorderBufferTXN, node, iter.cur);
+
+		if (cur != subtxn && cur->first_lsn > subtxn->first_lsn &&
+			hash_search(logicalXidOxidHash, &cur->xid, HASH_FIND, NULL))
+			later[nlater++] = cur->xid;
+	}
+
+	for (i = 0; i < nlater; i++)
+	{
+		elog(DEBUG4, "ABORT logical xid %u started inside rolled back logical xid %u",
+			 later[i], subtxn->xid);
+		forget_logical_xid(later[i]);
+		ReorderBufferAbort(rb, later[i], lsn, 0);
+	}
+	pfree(later);
+}
+
 #if PG_VERSION_NUM >= 180000
 ReorderBufferTxnStatus
 orioledb_logical_txn_status(TransactionId xid)
@@ -810,7 +937,7 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 				Assert(TransactionIdIsValid(topXid));
 				Assert(TransactionIdIsValid(subXid));
 
-				ReorderBufferAssignChild(ctx->decodeCtx->reorder, topXid, subXid, xlogPtr);
+				oriole_assign_child(ctx->decodeCtx->reorder, topXid, subXid, xlogPtr);
 
 				break;
 			}
@@ -1047,6 +1174,7 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 						elog(DEBUG4, "ReorderBufferCommitChild on record type %d (%s) oxid " UINT64_FORMAT " logicalXid %u heapXid %u",
 							 rec->type, recname, rec->oxid, rec->logicalXid, rec->heapXid);
 
+						oriole_assign_child(ctx->decodeCtx->reorder, rec->heapXid, rec->logicalXid, ctx->decodeBuf->origptr);
 						ReorderBufferCommitChild(ctx->decodeCtx->reorder, rec->heapXid, rec->logicalXid, ctx->decodeBuf->origptr, ctx->decodeBuf->endptr);
 					}
 
@@ -1202,7 +1330,50 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 				 rec->type, recname, rec->oxid, rec->logicalXid, rec->u.savepoint.parentLogicalXid);
 
 			if (!ctx->decodeCtx->fast_forward)
-				ReorderBufferAssignChild(ctx->decodeCtx->reorder, rec->u.savepoint.parentLogicalXid, rec->logicalXid, ctx->decodeBuf->origptr);
+			{
+				ReorderBuffer *rb = ctx->decodeCtx->reorder;
+				ReorderBufferTXN *subtxn = get_reorder_buffer_txn(rb, rec->logicalXid);
+				ReorderBufferTXN *named = get_reorder_buffer_txn(rb, rec->u.savepoint.parentLogicalXid);
+
+				/*
+				 * The record's own position, not the container's: several
+				 * savepoints can share a container, and abort_later_subtxns()
+				 * orders subtransactions by the position they started at.
+				 */
+				XLogRecPtr	xlogPtr = ctx->xlogRecPtr + rec->offset;
+
+				if (subtxn != NULL && rbtxn_is_known_subxact(subtxn))
+				{
+					/*
+					 * The heap -> oriole switch record that precedes the
+					 * savepoint record of a transaction holding a heap xid
+					 * has already put the subtransaction under the heap xid.
+					 * If the savepoint names a logical xid that is still a
+					 * top-level entry of its own -- the transaction wrote
+					 * OrioleDB before it got the heap xid -- that is the same
+					 * transaction: move it under the heap xid now rather than
+					 * at its pre-commit switch, so that its subtransactions
+					 * and the new ones are in one list.
+					 */
+					if (named != NULL && !rbtxn_is_known_subxact(named) &&
+						named != subtxn->toptxn)
+						oriole_assign_child(rb, subtxn->toptxn->xid,
+											rec->u.savepoint.parentLogicalXid,
+											xlogPtr);
+				}
+				else
+					oriole_assign_child(rb, rec->u.savepoint.parentLogicalXid,
+										rec->logicalXid, xlogPtr);
+
+				/*
+				 * Known as an OrioleDB subtransaction from its start, changes
+				 * or not: abort_later_subtxns() has to discard it with an
+				 * enclosing rollback, or its reorder buffer entry outlives
+				 * the rollback and a savepoint reusing its number takes over
+				 * its place in the list.
+				 */
+				remember_logical_xid(rec->logicalXid, rec->oxid);
+			}
 
 			break;
 
@@ -1286,6 +1457,11 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 						forget_logical_xid(cur_txn->xid);
 						ReorderBufferAbort(ctx->decodeCtx->reorder, cur_txn->xid, ctx->xlogRecPtr, 0);
 					}
+
+					if (rbtxn_is_subtxn(txn))
+						abort_later_subtxns(ctx->decodeCtx->reorder, txn,
+											ctx->xlogRecPtr);
+
 					elog(DEBUG4,
 						 "ABORT record type %d (%s) oxid " UINT64_FORMAT " logicalXid %u heapXid %u",
 						 rec->type, recname, rec->oxid, rec->logicalXid, rec->heapXid);

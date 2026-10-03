@@ -425,6 +425,24 @@ BEGIN
 END;$$;
 ROLLBACK;
 
+-- Rolling back to a savepoint started after OrioleDB got involved keeps the
+-- changes made before it, even when the savepoints open at the first change
+-- have ended since.
+CREATE TABLE o_subtrans_min (id int PRIMARY KEY) USING orioledb;
+BEGIN;
+SAVEPOINT s0;
+SAVEPOINT s1;
+INSERT INTO o_subtrans_min VALUES (1);
+ROLLBACK TO SAVEPOINT s1;
+INSERT INTO o_subtrans_min VALUES (2);
+RELEASE SAVEPOINT s0;
+SAVEPOINT s0;
+INSERT INTO o_subtrans_min VALUES (3);
+ROLLBACK TO SAVEPOINT s0;
+INSERT INTO o_subtrans_min VALUES (4);
+COMMIT;
+SELECT * FROM o_subtrans_min ORDER BY id;
+
 DROP EXTENSION orioledb CASCADE;
 DROP SCHEMA subtransactions CASCADE;
 RESET search_path;

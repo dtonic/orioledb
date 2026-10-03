@@ -360,7 +360,15 @@ wal_joint_commit(OXid oxid, TransactionId logicalXid, TransactionId xid,
 	add_joint_commit_wal_record(xid, pg_atomic_read_u64(&xid_meta->runXmin),
 								subTransaction);
 	walPos = flush_local_wal(!subTransaction, false);
-	local_wal.has_material_changes = false;
+
+	/*
+	 * A subtransaction's joint commit does not finish the transaction: its
+	 * changes are still the transaction's, and if the transaction aborts,
+	 * wal_rollback() has to write the rollback record that tells the decoder
+	 * and recovery to discard them.
+	 */
+	if (!subTransaction)
+		local_wal.has_material_changes = false;
 
 	/*
 	 * Don't need to flush local WAL, because we only commit if builtin
