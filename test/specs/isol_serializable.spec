@@ -1,4 +1,4 @@
-# Isolation tests for orioledb.serializable = 'table_lock' (default).
+# Isolation tests for orioledb.serializable = 'table_lock'.
 #
 # OrioleDB does not implement SSI; SERIALIZABLE is approximated by taking
 # a heavyweight ExclusiveLock on every relation a SERIALIZABLE transaction
@@ -36,12 +36,14 @@ teardown
 }
 
 session "s1"
+setup                    { SET orioledb.serializable = 'table_lock'; }
 step "s1_begin_ser"      { BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step "s1_update"         { UPDATE o_iso_ser SET val = val + 100 WHERE id = 1; }
 step "s1_insert"         { INSERT INTO o_iso_ser VALUES (10, 10); }
 step "s1_commit"         { COMMIT; }
 
 session "s2"
+setup                    { SET orioledb.serializable = 'table_lock'; }
 step "s2_begin_ser"      { BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step "s2_begin_rc"       { BEGIN ISOLATION LEVEL READ COMMITTED; }
 step "s2_update"         { UPDATE o_iso_ser SET val = val + 1000 WHERE id = 2; }
