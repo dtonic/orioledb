@@ -6305,6 +6305,46 @@ tbl_data_exists(ORelOids *oids)
 		return true;
 	}
 
+	if (orioledb_s3_mode)
+	{
+		SeqBufTag	map_tag = {0};
+		bool		found;
+
+		/*
+		 * In S3 mode data files are named after their checkpoint and the
+		 * plain "<relnode>" file below never exists, so a tree not loaded in
+		 * shared memory always read as empty: CREATE INDEX right after a
+		 * rebuild (ADD PRIMARY KEY, as pg_restore runs it) skipped the build
+		 * and left an empty index.  Ask what evictable_tree_init() opens: the
+		 * map file of the tree's latest checkpoint, fetched from S3 when only
+		 * the bucket holds it.
+		 */
+		map_tag.key = ix_key;
+		map_tag.type = 'm';
+		map_tag.num = o_get_latest_chkp_num(oids->datoid, oids->relnode,
+											oids->spcoid, PG_UINT32_MAX,
+											&found);
+		if (!found)
+			return false;
+
+		filename = get_seq_buf_filename(&map_tag);
+		file = PathNameOpenFile(filename, O_RDONLY | PG_BINARY);
+		if (file < 0 &&
+			map_tag.num <= checkpoint_state->lastCheckpointNumber)
+		{
+			s3_load_map_file(map_tag.num, ix_key);
+			file = PathNameOpenFile(filename, O_RDONLY | PG_BINARY);
+		}
+		pfree(filename);
+
+		if (file >= 0)
+		{
+			FileClose(file);
+			return true;
+		}
+		return false;
+	}
+
 	o_get_prefixes_for_tablespace(ix_key.oids.datoid, ix_key.oids.spcoid,
 								  NULL, &db_prefix);
 

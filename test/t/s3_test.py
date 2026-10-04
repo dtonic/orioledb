@@ -539,6 +539,34 @@ class S3Test(S3BaseTest):
 		self.assert_tables(8, 40000)
 		node.stop()
 
+	def test_s3_index_built_right_after_a_rebuild(self):
+		"""
+		ADD PRIMARY KEY rebuilds the table into files of the current
+		checkpoint without loading the tree in shared memory.  A CREATE INDEX
+		right after it -- the order pg_restore runs them in -- must still see
+		the rows: in S3 mode the data-exists check looked for a file name only
+		local mode uses and built an empty index.
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('1000MB')
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION IF NOT EXISTS orioledb;
+			CREATE TABLE o_test (id text NOT NULL, val int) USING orioledb;
+			INSERT INTO o_test SELECT g::text, g FROM generate_series(1, 1000) g;
+		""")
+		node.safe_psql("ALTER TABLE o_test ADD PRIMARY KEY (id)")
+		node.safe_psql("CREATE INDEX o_test_val ON o_test (val)")
+		count_by_index = """
+			SET enable_seqscan = off;
+			SET enable_bitmapscan = off;
+			SELECT count(*) FROM o_test WHERE val > 0;
+		"""
+		self.assertEqual(1000, node.execute(count_by_index)[0][0])
+		self.assertEqual(1000,
+		                 node.execute("SELECT count(*) FROM o_test")[0][0])
+		node.stop()
+
 	def test_s3_data_dir_load(self):
 		node = self.node
 		node.append_conf(f"""
