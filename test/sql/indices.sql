@@ -2547,6 +2547,76 @@ RESET enable_bitmapscan;
 RESET enable_seqscan;
 DROP TABLE o_test_array_backward;
 
+-- A secondary index scan starts each primary lookup from the leaf the
+-- previous one found its row on while the primary keys keep ascending, and
+-- from the root otherwise.  Each query below must give what a seq scan gives.
+CREATE TABLE o_test_primary_hint (
+	id text PRIMARY KEY,
+	grp int NOT NULL,
+	v int NOT NULL
+) USING orioledb;
+CREATE INDEX o_test_primary_hint_ko ON o_test_primary_hint ((id COLLATE "C"));
+CREATE INDEX o_test_primary_hint_v ON o_test_primary_hint (v);
+INSERT INTO o_test_primary_hint
+	SELECT 'k' || lpad(g::text, 6, '0'), g % 7, (g * 7919) % 1000
+	FROM generate_series(1, 20000) g;
+-- a hole: lookups past it land on a leaf the previous row was not on
+DELETE FROM o_test_primary_hint WHERE id BETWEEN 'k005000' AND 'k009000';
+ANALYZE o_test_primary_hint;
+
+CREATE FUNCTION o_test_primary_hint_check(q text) RETURNS text AS $$
+DECLARE
+	via_index text;
+	via_seq text;
+BEGIN
+	SET LOCAL enable_seqscan = off;
+	SET LOCAL enable_bitmapscan = off;
+	EXECUTE 'SELECT string_agg(id || '':'' || v, '','') FROM (' || q || ') s'
+		INTO via_index;
+	SET LOCAL enable_seqscan = on;
+	SET LOCAL enable_indexscan = off;
+	SET LOCAL enable_indexonlyscan = off;
+	EXECUTE 'SELECT string_agg(id || '':'' || v, '','') FROM (' || q || ') s'
+		INTO via_seq;
+	RESET enable_seqscan;
+	RESET enable_bitmapscan;
+	RESET enable_indexscan;
+	RESET enable_indexonlyscan;
+	RETURN CASE WHEN via_index IS NOT DISTINCT FROM via_seq
+		THEN 'same, ' || coalesce(length(via_index), 0) || ' chars'
+		ELSE 'DIFFERENT' END;
+END;
+$$ LANGUAGE plpgsql;
+
+SET enable_seqscan = OFF;
+SET enable_bitmapscan = OFF;
+EXPLAIN (COSTS OFF)
+	SELECT id, v FROM o_test_primary_hint WHERE grp = 3 ORDER BY id COLLATE "C";
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+-- ascending keys
+SELECT o_test_primary_hint_check(
+	'SELECT id, v FROM o_test_primary_hint WHERE grp = 3 ORDER BY id COLLATE "C"');
+-- descending keys
+SELECT o_test_primary_hint_check(
+	'SELECT id, v FROM o_test_primary_hint WHERE grp = 3 ORDER BY id COLLATE "C" DESC');
+-- keys in an order unrelated to the primary one
+SELECT o_test_primary_hint_check(
+	'SELECT id, v FROM o_test_primary_hint WHERE v < 100 ORDER BY v, id');
+-- the transaction's own changes, deleted rows among them
+BEGIN;
+UPDATE o_test_primary_hint SET v = v + 1 WHERE grp = 3 AND id < 'k012000';
+DELETE FROM o_test_primary_hint WHERE grp = 3 AND id BETWEEN 'k014000' AND 'k015000';
+INSERT INTO o_test_primary_hint
+	SELECT 'k' || lpad(g::text, 6, '0'), 3, 1 FROM generate_series(5001, 5100) g;
+SELECT o_test_primary_hint_check(
+	'SELECT id, v FROM o_test_primary_hint WHERE grp = 3 ORDER BY id COLLATE "C"');
+ROLLBACK;
+SELECT o_test_primary_hint_check(
+	'SELECT id, v FROM o_test_primary_hint WHERE grp = 3 ORDER BY id COLLATE "C"');
+DROP FUNCTION o_test_primary_hint_check(text);
+DROP TABLE o_test_primary_hint;
+
 SELECT orioledb_parallel_debug_stop();
 DROP EXTENSION orioledb CASCADE;
 DROP SCHEMA indices CASCADE;
