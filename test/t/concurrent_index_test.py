@@ -614,6 +614,72 @@ class ConcurrentIndexTest(BaseTest):
 			except Exception:
 				pass
 
+	def test_drop_index_concurrently_under_writes(self):
+		"""
+		DROP INDEX CONCURRENTLY while writers delete and re-insert rows.
+		The OIndex goes away before PG stops handing the index's changes
+		to it; no writer may fail on the index that is going away.
+		"""
+		import threading
+
+		node = self.node
+		node.start()
+		try:
+			node.safe_psql("""
+				CREATE EXTENSION orioledb;
+				CREATE TABLE o_dic (
+					id int NOT NULL PRIMARY KEY,
+					val int NOT NULL
+				) USING orioledb;
+				INSERT INTO o_dic SELECT g, g FROM generate_series(0, 39999) g;
+				CREATE INDEX o_dic_val_idx ON o_dic (val);
+			""")
+
+			stop = threading.Event()
+			errors = []
+
+			def writer(w):
+				import random
+				rnd = random.Random(w)
+				with node.connect() as c:
+					while not stop.is_set():
+						i = w * 10000 + rnd.randrange(10000)
+						try:
+							c.begin()
+							c.execute("DELETE FROM o_dic WHERE id = %d" % i)
+							c.execute("INSERT INTO o_dic VALUES (%d, %d)" %
+							          (i, rnd.randrange(100000)))
+							c.commit()
+						except Exception as e:
+							errors.append(repr(e))
+							return
+
+			threads = [
+			    threading.Thread(target=writer, args=(w, )) for w in range(4)
+			]
+			for t in threads:
+				t.start()
+			try:
+				time.sleep(0.5)
+				node.safe_psql("DROP INDEX CONCURRENTLY o_dic_val_idx;")
+				time.sleep(0.5)
+			finally:
+				stop.set()
+				for t in threads:
+					t.join()
+
+			self.assertEqual(errors, [])
+			self.assertEqual(
+			    node.execute("SELECT count(*) FROM pg_class "
+			                 "WHERE relname = 'o_dic_val_idx'")[0][0], 0)
+			self.assertEqual(
+			    node.execute("SELECT count(*) FROM o_dic")[0][0], 40000)
+		finally:
+			try:
+				node.stop()
+			except Exception:
+				pass
+
 	def test_cic_crash_orphan_cleanup(self):
 		"""
 		A stale cic_<...>/spool_<...>.bin left in orioledb_data from a
