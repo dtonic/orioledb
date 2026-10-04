@@ -646,6 +646,23 @@ remember_logical_xid(TransactionId logicalXid, OXid oxid)
 	entry->oxid = oxid;
 }
 
+/*
+ * The oxid that last queued changes under `logicalXid`, if any.
+ */
+static bool
+lookup_logical_xid(TransactionId logicalXid, OXid *oxid)
+{
+	LogicalXidOxidEntry *entry;
+
+	if (!logicalXidOxidHash || !TransactionIdIsValid(logicalXid))
+		return false;
+	entry = hash_search(logicalXidOxidHash, &logicalXid, HASH_FIND, NULL);
+	if (entry == NULL)
+		return false;
+	*oxid = entry->oxid;
+	return true;
+}
+
 static void
 forget_logical_xid(TransactionId logicalXid)
 {
@@ -977,6 +994,33 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 
 					csnSnapshot = SnapBuildGetCSNSnaphot(ctx->decodeCtx->snapshot_builder);
 					csnSnapshot->nextXid = Max(csnSnapshot->nextXid, rec->oxid);
+
+					/*
+					 * Logical xids come from a small pool and are handed out
+					 * again as soon as a transaction ends.  A transaction
+					 * ends in WAL with its commit or rollback, which frees
+					 * the reorder buffer entry -- except one cut short by a
+					 * crash, which leaves the changes it had written and
+					 * nothing after them.  The next transaction that gets its
+					 * logical xid then queued onto those changes, and its
+					 * commit sent the dead transaction's rows along with its
+					 * own.  Changes under this logical xid from another oxid
+					 * are such leftovers: drop them.
+					 */
+					{
+						OXid		prevOxid;
+
+						if (lookup_logical_xid(rec->logicalXid, &prevOxid) &&
+							prevOxid != rec->oxid)
+						{
+							elog(DEBUG4, "ABORT leftover logicalXid %u of oxid " UINT64_FORMAT " (now oxid " UINT64_FORMAT ")",
+								 rec->logicalXid, prevOxid, rec->oxid);
+							ReorderBufferAbort(ctx->decodeCtx->reorder,
+											   rec->logicalXid,
+											   ctx->xlogRecPtr + rec->offset, 0);
+							forget_logical_xid(rec->logicalXid);
+						}
+					}
 				}
 				else
 				{
