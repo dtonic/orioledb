@@ -883,7 +883,8 @@ orioledb_amupdate(Relation rel, bool new_valid, bool old_valid,
 	result = o_update_secondary_index(index_descr, ix_num,
 									  new_valid, old_valid,
 									  new_slot, new_tuple,
-									  old_slot, oxid, oSnapshot.csn,
+									  old_slot, old_tuple,
+									  oxid, oSnapshot.csn,
 									  checkUnique);
 
 	/*

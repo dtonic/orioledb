@@ -72,17 +72,24 @@ typedef struct
 	/* lookahead */
 	bool		havePeek;
 	CICSpoolEntry peek;
+
+	/*
+	 * The bytes `peek` points at.  Each stream keeps its own: the merge holds
+	 * one peeked entry per stream at a time, and with a buffer shared by all
+	 * streams, reading the next entry of one stream overwrote the peeked
+	 * entry of another -- the drain then applied one entry's op to another
+	 * entry's tuple.
+	 */
+	char	   *keyBuf;
+	Size		keyBufCap;
+	char	   *tupBuf;
+	Size		tupBufCap;
 } CICSpoolStream;
 
 struct CICSpoolReader
 {
 	int			nStreams;
 	CICSpoolStream *streams;
-	/* scratch buffer for the most-recently-returned entry */
-	char	   *lastKey;
-	Size		lastKeyCap;
-	char	   *tupBuf;
-	Size		tupBufCap;
 };
 
 /* ---------------------------------------------------------------------------
@@ -262,8 +269,7 @@ cic_spool_close_local(void)
  */
 
 static bool
-stream_read_one(CICSpoolStream *s, CICSpoolReader *reader,
-				CICSpoolEntry *out)
+stream_read_one(CICSpoolStream *s, CICSpoolEntry *out)
 {
 	int			n;
 	Size		needed;
@@ -290,14 +296,14 @@ stream_read_one(CICSpoolStream *s, CICSpoolReader *reader,
 	if (out->hdr.keyLength > 0)
 	{
 		needed = (Size) out->hdr.keyLength;
-		if (reader->lastKeyCap < needed)
+		if (s->keyBufCap < needed)
 		{
-			if (reader->lastKey)
-				pfree(reader->lastKey);
-			reader->lastKey = MemoryContextAlloc(TopMemoryContext, needed);
-			reader->lastKeyCap = needed;
+			if (s->keyBuf)
+				pfree(s->keyBuf);
+			s->keyBuf = MemoryContextAlloc(TopMemoryContext, needed);
+			s->keyBufCap = needed;
 		}
-		keyBuf = reader->lastKey;
+		keyBuf = s->keyBuf;
 		n = FileRead(s->file, keyBuf, needed,
 					 s->offset, WAIT_EVENT_DATA_FILE_READ);
 		if ((Size) n != needed)
@@ -310,14 +316,14 @@ stream_read_one(CICSpoolStream *s, CICSpoolReader *reader,
 	if (out->hdr.tupleLength > 0)
 	{
 		needed = (Size) out->hdr.tupleLength;
-		if (reader->tupBufCap < needed)
+		if (s->tupBufCap < needed)
 		{
-			if (reader->tupBuf)
-				pfree(reader->tupBuf);
-			reader->tupBuf = MemoryContextAlloc(TopMemoryContext, needed);
-			reader->tupBufCap = needed;
+			if (s->tupBuf)
+				pfree(s->tupBuf);
+			s->tupBuf = MemoryContextAlloc(TopMemoryContext, needed);
+			s->tupBufCap = needed;
 		}
-		tupBuf = reader->tupBuf;
+		tupBuf = s->tupBuf;
 		n = FileRead(s->file, tupBuf, needed,
 					 s->offset, WAIT_EVENT_DATA_FILE_READ);
 		if ((Size) n != needed)
@@ -333,13 +339,13 @@ stream_read_one(CICSpoolStream *s, CICSpoolReader *reader,
 }
 
 static bool
-stream_peek(CICSpoolStream *s, CICSpoolReader *reader)
+stream_peek(CICSpoolStream *s)
 {
 	if (s->havePeek)
 		return true;
 	if (s->atEnd)
 		return false;
-	if (!stream_read_one(s, reader, &s->peek))
+	if (!stream_read_one(s, &s->peek))
 		return false;
 	s->havePeek = true;
 	return true;
@@ -397,6 +403,10 @@ cic_spool_open_reader(ORelOids tableOids, OXid builderOxid)
 		streams[n].atEnd = (st.st_size == 0);
 		streams[n].havePeek = false;
 		memset(&streams[n].peek, 0, sizeof(CICSpoolEntry));
+		streams[n].keyBuf = NULL;
+		streams[n].keyBufCap = 0;
+		streams[n].tupBuf = NULL;
+		streams[n].tupBufCap = 0;
 		n++;
 	}
 	FreeDir(dir);
@@ -426,7 +436,7 @@ cic_spool_read_next(CICSpoolReader *reader, CICSpoolEntry *out)
 	{
 		CICSpoolStream *s = &reader->streams[i];
 
-		if (!stream_peek(s, reader))
+		if (!stream_peek(s))
 			continue;
 		if (bestIdx < 0)
 			bestIdx = i;
@@ -450,10 +460,9 @@ cic_spool_read_next(CICSpoolReader *reader, CICSpoolEntry *out)
 		return false;
 
 	/*
-	 * Materialise the chosen stream's peek into `out`.  Because peek's
-	 * keyData/tupleData point at reader->lastKey / reader->tupBuf which are
-	 * shared, the caller must consume the entry before the next call (we
-	 * re-read into those buffers next iteration).
+	 * Materialise the chosen stream's peek into `out`.  Its keyData and
+	 * tupleData point at that stream's buffers, which the next call re-reads
+	 * into, so the caller must consume the entry before calling again.
 	 */
 	*out = reader->streams[bestIdx].peek;
 	reader->streams[bestIdx].havePeek = false;
@@ -471,11 +480,11 @@ cic_spool_close_reader(CICSpoolReader *reader)
 	{
 		if (reader->streams[i].file >= 0)
 			FileClose(reader->streams[i].file);
+		if (reader->streams[i].keyBuf)
+			pfree(reader->streams[i].keyBuf);
+		if (reader->streams[i].tupBuf)
+			pfree(reader->streams[i].tupBuf);
 	}
-	if (reader->lastKey)
-		pfree(reader->lastKey);
-	if (reader->tupBuf)
-		pfree(reader->tupBuf);
 	pfree(reader->streams);
 	pfree(reader);
 }

@@ -131,6 +131,7 @@ extern OTableModifyResult o_update_secondary_index(OIndexDescr *id,
 												   TupleTableSlot *newSlot,
 												   OTuple new_ix_tup,
 												   TupleTableSlot *oldSlot,
+												   OTuple old_ix_tup,
 												   OXid oxid,
 												   CommitSeqNo csn,
 												   IndexUniqueCheck checkUnique);

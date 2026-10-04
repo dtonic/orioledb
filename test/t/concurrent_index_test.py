@@ -530,6 +530,90 @@ class ConcurrentIndexTest(BaseTest):
 			except Exception:
 				pass
 
+	def test_cic_writers_change_the_indexed_column(self):
+		"""
+		Several writers change the indexed column while CIC runs: key
+		changing UPDATEs and DELETE + INSERT of a row with a new value.
+		Every value must then be found through the new index exactly as
+		often as the table holds it, and no backend may fail.  With one
+		writer the spool has one file; several are what the drain's merge
+		of per-backend files has to get right.
+		"""
+		import threading
+
+		node = self.node
+		node.start()
+		try:
+			node.safe_psql("""
+				CREATE EXTENSION orioledb;
+				CREATE TABLE o_cic_chg (
+					id int NOT NULL PRIMARY KEY,
+					val text NOT NULL
+				) USING orioledb;
+				INSERT INTO o_cic_chg
+				SELECT g, 'N' FROM generate_series(0, 39999) g;
+			""")
+
+			stop = threading.Event()
+			errors = []
+
+			def writer(w):
+				import random
+				rnd = random.Random(w)
+				with node.connect() as c:
+					while not stop.is_set():
+						i = w * 10000 + rnd.randrange(10000)
+						v = "ABCDE"[rnd.randrange(5)]
+						try:
+							c.begin()
+							if rnd.random() < 0.5:
+								c.execute("UPDATE o_cic_chg SET val = '%s' "
+								          "WHERE id = %d" % (v, i))
+							else:
+								c.execute("DELETE FROM o_cic_chg "
+								          "WHERE id = %d" % i)
+								c.execute("INSERT INTO o_cic_chg "
+								          "VALUES (%d, '%s')" % (i, v))
+							c.commit()
+						except Exception as e:
+							errors.append(repr(e))
+							return
+
+			threads = [
+			    threading.Thread(target=writer, args=(w, )) for w in range(4)
+			]
+			for t in threads:
+				t.start()
+			try:
+				time.sleep(0.5)
+				node.safe_psql("CREATE INDEX CONCURRENTLY o_cic_chg_val_idx "
+				               "ON o_cic_chg (val);")
+				time.sleep(0.5)
+			finally:
+				stop.set()
+				for t in threads:
+					t.join()
+
+			self.assertEqual(errors, [])
+			for v in "NABCDE":
+				with node.connect() as c:
+					c.execute("SET enable_seqscan = off")
+					c.execute("SET enable_bitmapscan = off")
+					via_index = c.execute("SELECT count(*) FROM o_cic_chg "
+					                      "WHERE val = '%s'" % v)[0][0]
+				with node.connect() as c:
+					c.execute("SET enable_indexscan = off")
+					c.execute("SET enable_indexonlyscan = off")
+					c.execute("SET enable_bitmapscan = off")
+					in_table = c.execute("SELECT count(*) FROM o_cic_chg "
+					                     "WHERE val = '%s'" % v)[0][0]
+				self.assertEqual(via_index, in_table, "val = '%s'" % v)
+		finally:
+			try:
+				node.stop()
+			except Exception:
+				pass
+
 	def test_cic_crash_orphan_cleanup(self):
 		"""
 		A stale cic_<...>/spool_<...>.bin left in orioledb_data from a
