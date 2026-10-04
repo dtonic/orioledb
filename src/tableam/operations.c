@@ -2210,6 +2210,48 @@ fill_key_bound(TupleTableSlot *slot, OIndexDescr *idx, OBTreeKeyBound *bound)
 	}
 }
 
+/*
+ * Whether a change to secondary index `id` goes to the CREATE INDEX
+ * CONCURRENTLY spool instead of the index tree: the tree of an index still
+ * being built is a placeholder nobody else may open.
+ *
+ * Our descriptor may say BUILDING while the CIC driver has just flipped the
+ * index to VALID and dropped the spool directory; appending in that window
+ * would leak the change into a spool file no drain reads.  So re-read the
+ * state from the sys-tree (a cheap in-progress snapshot lookup) before
+ * deciding.
+ */
+static bool
+cic_spool_capture_needed(OIndexDescr *id)
+{
+	OIndex	   *fresh;
+	OIndexState fresh_state;
+
+	if (id->desc.type == oIndexPrimary || id->state == OINDEX_STATE_VALID)
+		return false;
+
+	fresh = o_indices_get(id->oids, id->desc.type);
+	fresh_state = fresh ? fresh->state : OINDEX_STATE_VALID;
+	if (fresh)
+		free_o_index(fresh);
+	return fresh_state != OINDEX_STATE_VALID;
+}
+
+/* Spool one change of a secondary index under CIC, undone on abort. */
+static void
+cic_spool_capture(OIndexDescr *id, CICOpType op, OTuple tup)
+{
+	UndoStackLocations locs;
+	OTuple		nullKey = {NULL, 0};
+	uint16		tupLen = (uint16) o_tuple_size(tup, &id->leafSpec);
+
+	get_cur_undo_locations(&locs, UndoLogRegular);
+	cic_spool_append(id->tableOids, id->builderOxid,
+					 locs.location, op, nullKey, 0, tup, tupLen);
+	cic_spool_track_for_abort(id->tableOids, id->builderOxid,
+							  locs.location, op, nullKey, 0, tup, tupLen);
+}
+
 OTableModifyResult
 o_update_secondary_index(OIndexDescr *id,
 						 OIndexNumber ix_num,
@@ -2218,6 +2260,7 @@ o_update_secondary_index(OIndexDescr *id,
 						 TupleTableSlot *newSlot,
 						 OTuple new_ix_tup,
 						 TupleTableSlot *oldSlot,
+						 OTuple old_ix_tup,
 						 OXid oxid,
 						 CommitSeqNo csn,
 						 IndexUniqueCheck checkUnique)
@@ -2239,6 +2282,23 @@ o_update_secondary_index(OIndexDescr *id,
 
 	if (is_keys_eq(id, &old_key, &new_key) && (old_valid == new_valid))
 		return res;
+
+	/*
+	 * Under CIC the change is the delete of the old entry and the insert of
+	 * the new one, spooled as o_tbl_index_delete() and o_tbl_index_insert()
+	 * spool theirs.  Writing it to the tree instead opened the placeholder (a
+	 * crash) and, once the build was done, left an entry the drain never
+	 * removed.  Both entries share one undo position; the spool keeps them in
+	 * this order.
+	 */
+	if (cic_spool_capture_needed(id))
+	{
+		if (old_valid)
+			cic_spool_capture(id, CIC_OP_DELETE, old_ix_tup);
+		if (new_valid)
+			cic_spool_capture(id, CIC_OP_INSERT, new_ix_tup);
+		return res;
+	}
 
 	O_TUPLE_SET_NULL(nullTup);
 
@@ -2463,45 +2523,25 @@ o_tbl_index_delete(OIndexDescr *id, OIndexNumber ix_num, TupleTableSlot *slot,
 
 	fill_key_bound(slot, id, &bound);
 
-	/* CIC capture for secondary index being built concurrently. */
-	if (id->desc.type != oIndexPrimary &&
-		id->state != OINDEX_STATE_VALID)
+	/*
+	 * CIC capture for secondary index being built concurrently.  The spool
+	 * replays the entry as a leaf tuple of this index.  An index slot that
+	 * holds the entry already has it; building one from the slot reads the
+	 * slot's columns by their table attribute numbers, which in an index slot
+	 * name other columns -- the replayed delete then looked up a key with its
+	 * columns swapped, missed, and left the entry in the index.
+	 */
+	if (cic_spool_capture_needed(id))
 	{
-		/*
-		 * Re-read OIndex.state from the sys-tree (cheap in-progress snapshot
-		 * lookup).  Our descr cache may still say BUILDING while the CIC
-		 * driver has just flipped to VALID and dropped the spool dir;
-		 * appending in that window leaks rows into a now-orphaned spool file
-		 * inode that no drain will read.
-		 */
-		OIndex	   *fresh = o_indices_get(id->oids, id->desc.type);
-		OIndexState fresh_state = fresh ? fresh->state : OINDEX_STATE_VALID;
+		OTableSlot *oslot = (OTableSlot *) slot;
 
-		if (fresh)
-			free_o_index(fresh);
-
-		if (fresh_state != OINDEX_STATE_VALID)
-		{
-			OTuple		sec_tup;
-			UndoStackLocations locs;
-			OTuple		nullKey = {NULL, 0};
-			uint16		tupLen;
-
-			sec_tup = tts_orioledb_make_secondary_tuple(slot, id, false);
-			tupLen = (uint16) o_tuple_size(sec_tup, &id->leafSpec);
-			get_cur_undo_locations(&locs, UndoLogRegular);
-			cic_spool_append(id->tableOids, id->builderOxid,
-							 locs.location, CIC_OP_DELETE,
-							 nullKey, 0, sec_tup, tupLen);
-			cic_spool_track_for_abort(id->tableOids, id->builderOxid,
-									  locs.location, CIC_OP_DELETE,
-									  nullKey, 0, sec_tup, tupLen);
-
-			memset(&result, 0, sizeof(result));
-			result.success = true;
-			return result;
-		}
-		/* fall through to normal index delete */
+		cic_spool_capture(id, CIC_OP_DELETE,
+						  (oslot->ixnum == ix_num && !O_TUPLE_IS_NULL(oslot->tuple)) ?
+						  oslot->tuple :
+						  tts_orioledb_make_secondary_tuple(slot, id, true));
+		memset(&result, 0, sizeof(result));
+		result.success = true;
+		return result;
 	}
 
 	res = o_btree_modify(&id->desc, BTreeOperationDelete,
@@ -2627,38 +2667,11 @@ o_tbl_index_insert(OTableDescr *descr,
 	 * creates the spool dir before flipping the index state, so we can append
 	 * unconditionally here.
 	 */
-	if (!primary && id->state != OINDEX_STATE_VALID)
+	if (!primary && cic_spool_capture_needed(id))
 	{
-		/*
-		 * Re-read OIndex.state from the sys-tree (cheap in-progress snapshot
-		 * lookup).  Our descr cache may say BUILDING while the CIC driver has
-		 * just flipped to VALID and dropped the spool dir; appending in that
-		 * window would leak rows into a now-orphaned spool file inode that no
-		 * drain will read.
-		 */
-		OIndex	   *fresh = o_indices_get(id->oids, id->desc.type);
-		OIndexState fresh_state = fresh ? fresh->state : OINDEX_STATE_VALID;
-
-		if (fresh)
-			free_o_index(fresh);
-
-		if (fresh_state != OINDEX_STATE_VALID)
-		{
-			UndoStackLocations locs;
-			OTuple		nullKey = {NULL, 0};
-			uint16		tupLen = (uint16) o_tuple_size(tup, &id->leafSpec);
-
-			get_cur_undo_locations(&locs, UndoLogRegular);
-			cic_spool_append(id->tableOids, id->builderOxid,
-							 locs.location, CIC_OP_INSERT,
-							 nullKey, 0, tup, tupLen);
-			cic_spool_track_for_abort(id->tableOids, id->builderOxid,
-									  locs.location, CIC_OP_INSERT,
-									  nullKey, 0, tup, tupLen);
-			((OTableSlot *) slot)->version = o_tuple_get_version(tup);
-			return OBTreeModifyResultInserted;
-		}
-		/* fall through to normal index write */
+		cic_spool_capture(id, CIC_OP_INSERT, tup);
+		((OTableSlot *) slot)->version = o_tuple_get_version(tup);
+		return OBTreeModifyResultInserted;
 	}
 
 	if (primary || !id->unique ||

@@ -160,6 +160,7 @@ static OTuple fetch_tuple_from_page(BTreeDescr *desc, Page p,
 static bool page_contains_key(BTreeIterator *it, void *key,
 							  BTreeKeyType kind, Page p, OTuple lokey);
 static OTuple get_lokey_if_exists(BTreeIterator *it);
+static OTuple undo_image_lokey(BTreeIterator *it);
 static void get_next_combined_location(BTreeIterator *it);
 static void load_page_from_undo(BTreeIterator *it, void *key, BTreeKeyType kind);
 static bool btree_iterator_check_load_next_page(BTreeIterator *it,
@@ -565,7 +566,7 @@ o_btree_find_tuples_continue(BTreeIterator *it,
 		if (it->combinedPage)
 		{
 			if (page_contains_key(it, key, kind,
-								  it->undoIt.image, it->undoIt.lokey.tuple))
+								  it->undoIt.image, undo_image_lokey(it)))
 			{
 				btree_page_search(it->context.desc,
 								  it->undoIt.image,
@@ -1139,7 +1140,7 @@ page_contains_key(BTreeIterator *it, void *key, BTreeKeyType kind,
 	{
 		int			cmp;
 
-		if (O_PAGE_IS(p, LEFTMOST))
+		if (O_PAGE_IS(p, LEFTMOST) || O_TUPLE_IS_NULL(lokey))
 			return true;
 
 		cmp = o_btree_cmp(it->context.desc,
@@ -1165,6 +1166,25 @@ get_lokey_if_exists(BTreeIterator *it)
 
 
 	return result;
+}
+
+/*
+ * The low key bounding the undo image for a backward scan, or a null tuple
+ * when nothing bounds it on the left.
+ *
+ * get_page_from_undo() fills undoIt.lokey only when it returns the right half
+ * of a merge image.  An image that is leftmost on its base location -- a
+ * split or compact image, or a merge's left half -- starts where the data
+ * page starts, so its low key is the data page's.  undoIt.lokey holds nothing
+ * for such an image (or the key of another page, from an earlier walk), and
+ * comparing with it crashed backward scans.
+ */
+static OTuple
+undo_image_lokey(BTreeIterator *it)
+{
+	if (it->undoIt.leftmost)
+		return get_lokey_if_exists(it);
+	return it->undoIt.lokey.tuple;
 }
 
 /*
@@ -1266,7 +1286,7 @@ o_btree_iterator_advance(BTreeIterator *it, void *key, BTreeKeyType kind)
 		if (it->combinedPage)
 		{
 			if (page_contains_key(it, key, kind,
-								  it->undoIt.image, it->undoIt.lokey.tuple))
+								  it->undoIt.image, undo_image_lokey(it)))
 			{
 				btree_page_search(it->context.desc,
 								  it->undoIt.image,
@@ -1880,7 +1900,7 @@ page_contains_end(BTreeIterator *it, Page p,
 	{
 		int			cmp;
 
-		if (O_PAGE_IS(p, LEFTMOST))
+		if (O_PAGE_IS(p, LEFTMOST) || O_TUPLE_IS_NULL(lokey))
 			return true;
 
 		cmp = o_btree_cmp(it->context.desc,
@@ -2038,7 +2058,7 @@ o_btree_interator_can_fetch_from_undo(BTreeDescr *desc, BTreeIterator *it,
 	 * range.
 	 */
 	if (end && page_contains_end(it, it->undoIt.image,
-								 it->undoIt.lokey.tuple, end))
+								 undo_image_lokey(it), end))
 		return can_fetch_from_undo(it);
 
 	Assert(it->combinedResult && header->csn >= it->oSnapshot.csn);

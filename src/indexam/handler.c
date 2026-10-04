@@ -705,7 +705,15 @@ orioledb_aminsert(Relation rel, Datum *values, bool *isnull,
 	ix_type = o_index_rel_get_ix_type(rel);
 	index_descr = o_fetch_index_descr(oids, ix_type,
 									  false, NULL);
-	Assert(index_descr != NULL);
+
+	/*
+	 * DROP INDEX CONCURRENTLY: PG runs the drop hook, where the OIndex goes
+	 * away, before the transactions that make the index invalid and then not
+	 * ready.  Until those finish, other backends still hand the index's
+	 * changes here, and there is no tree left to change.
+	 */
+	if (index_descr == NULL)
+		return true;
 	descr = o_fetch_table_descr(index_descr->tableOids);
 	Assert(descr != NULL);
 	/* Find ix_num */
@@ -842,7 +850,9 @@ orioledb_amupdate(Relation rel, bool new_valid, bool old_valid,
 	ix_type = o_index_rel_get_ix_type(rel);
 	index_descr = o_fetch_index_descr(oids, ix_type,
 									  false, NULL);
-	Assert(index_descr != NULL);
+	/* An index being dropped concurrently: see orioledb_aminsert(). */
+	if (index_descr == NULL)
+		return true;
 	descr = o_fetch_table_descr(index_descr->tableOids);
 	Assert(descr != NULL);
 
@@ -883,7 +893,8 @@ orioledb_amupdate(Relation rel, bool new_valid, bool old_valid,
 	result = o_update_secondary_index(index_descr, ix_num,
 									  new_valid, old_valid,
 									  new_slot, new_tuple,
-									  old_slot, oxid, oSnapshot.csn,
+									  old_slot, old_tuple,
+									  oxid, oSnapshot.csn,
 									  checkUnique);
 
 	/*
@@ -1001,7 +1012,9 @@ orioledb_amdelete(Relation rel, Datum *values, bool *isnull,
 	ix_type = o_index_rel_get_ix_type(rel);
 	index_descr = o_fetch_index_descr(oids, ix_type,
 									  false, NULL);
-	Assert(index_descr != NULL);
+	/* An index being dropped concurrently: see orioledb_aminsert(). */
+	if (index_descr == NULL)
+		return true;
 	descr = o_fetch_table_descr(index_descr->tableOids);
 	Assert(descr != NULL);
 

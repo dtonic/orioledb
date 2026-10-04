@@ -65,6 +65,20 @@ typedef struct OScanState
 	/* Parallel index scan state (NULL for serial scans) */
 	ParallelOScanDesc pidxscan;
 	BTreeSeqScan *seqScan;
+
+	/*
+	 * Secondary-index scan: the primary leaf the last primary lookup found
+	 * its row on, and that row's key.  A later key no smaller than this one
+	 * is at or right of the leaf's low key, so while the leaf is unchanged
+	 * the next lookup can start from it instead of from the root (see
+	 * fetch_primary_tuple()).
+	 */
+	bool		primaryHintValid;
+	BTreeLocationHint primaryHint;
+	OFixedKey	primaryHintKey;
+	/* consecutive lookups the hint sent to the wrong leaf, and a back-off */
+	uint8		primaryHintMisses;
+	uint8		primaryHintSkip;
 } OScanState;
 
 typedef struct OIndexPlanState

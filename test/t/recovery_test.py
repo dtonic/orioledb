@@ -892,6 +892,64 @@ class RecoveryTest(BaseTest):
 
 		node.stop()  # stop PostgreSQL
 
+	def test_rollback_to_savepoint_over_a_released_one(self):
+		"""
+		RELEASE is not WAL-logged, so recovery replays the released
+		subtransaction's SAVEPOINT and keeps its undo item.  Rolling back to
+		an outer savepoint must step over that item, not undo the whole
+		transaction: the rows written before the outer savepoint stay.
+		"""
+		node = self.node
+		node.start()
+		node.safe_psql(
+		    'postgres', """
+			CREATE EXTENSION IF NOT EXISTS orioledb;
+			CREATE TABLE o_test (id integer PRIMARY KEY, val text) USING orioledb;
+			CHECKPOINT;
+			""")
+		node.safe_psql(
+		    'postgres', """
+			BEGIN;
+			INSERT INTO o_test VALUES (1, 'kept');
+			SAVEPOINT s0;
+			SAVEPOINT s1;
+			RELEASE SAVEPOINT s1;
+			ROLLBACK TO SAVEPOINT s0;
+			COMMIT;
+			BEGIN;
+			INSERT INTO o_test VALUES (2, 'kept');
+			SAVEPOINT s0;
+			INSERT INTO o_test VALUES (3, 'rolled back');
+			SAVEPOINT s1;
+			INSERT INTO o_test VALUES (4, 'rolled back');
+			RELEASE SAVEPOINT s1;
+			ROLLBACK TO SAVEPOINT s0;
+			INSERT INTO o_test VALUES (5, 'kept');
+			COMMIT;
+			BEGIN;
+			INSERT INTO o_test VALUES (6, 'kept');
+			SAVEPOINT s0;
+			INSERT INTO o_test VALUES (7, 'rolled back');
+			SAVEPOINT s1;
+			SAVEPOINT s2;
+			INSERT INTO o_test VALUES (8, 'rolled back');
+			RELEASE SAVEPOINT s2;
+			RELEASE SAVEPOINT s1;
+			ROLLBACK TO SAVEPOINT s0;
+			COMMIT;
+			""")
+		expected = [(1, 'kept'), (2, 'kept'), (5, 'kept'), (6, 'kept')]
+		self.assertEqual(
+		    node.execute('postgres', 'SELECT * FROM o_test ORDER BY id'),
+		    expected)
+		node.stop(['-m', 'immediate'])
+
+		node.start()
+		self.assertEqual(
+		    node.execute('postgres', 'SELECT * FROM o_test ORDER BY id'),
+		    expected)
+		node.stop()
+
 	def test_subtrans_from_begin(self):
 		node = self.node
 		node.start()  # start PostgreSQL

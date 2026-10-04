@@ -957,6 +957,82 @@ o_iterate_index(OIndexDescr *indexDescr, OScanState *ostate,
 	return tup;
 }
 
+/*
+ * Find the primary row a secondary index tuple points to.
+ *
+ * Every lookup used to descend from the root.  A scan whose secondary order
+ * follows the primary order -- an index on an expression of the primary key,
+ * or on a column that grows with it -- finds row after row on the same
+ * primary leaf, so start from the leaf the last lookup ended on.
+ * refind_page() checks that the leaf is unchanged and moves right past its
+ * high key, falling back to a descent from the root when it cannot.  What it
+ * cannot check is the leaf's low key, which the page does not hold: that is
+ * why the leaf is only reused for a key no smaller than the last row found on
+ * it.
+ */
+static OTuple
+fetch_primary_tuple(OScanState *ostate, OIndexDescr *primary,
+					OBTreeKeyBound *bound, CommitSeqNo *tupleCsn,
+					MemoryContext tupleCxt)
+{
+	BTreeDescr *desc = &primary->desc;
+	OTuple		ptup;
+	OInMemoryBlkno hinted = OInvalidInMemoryBlkno;
+
+	if (ostate->primaryHintSkip > 0)
+		ostate->primaryHintSkip--;
+	else if (ostate->primaryHintValid &&
+			 o_btree_cmp(desc, (Pointer) bound, BTreeKeyBound,
+						 &ostate->primaryHintKey.tuple, BTreeKeyNonLeafKey) >= 0)
+		hinted = ostate->primaryHint.blkno;
+
+	if (!OInMemoryBlknoIsValid(hinted))
+	{
+		ostate->primaryHint.blkno = OInvalidInMemoryBlkno;
+		ostate->primaryHint.pageChangeCount = 0;
+	}
+
+	ptup = o_btree_find_tuple_by_key(desc, (Pointer) bound, BTreeKeyBound,
+									 &ostate->oSnapshot, tupleCsn,
+									 tupleCxt, &ostate->primaryHint);
+
+	/*
+	 * A hint that names the wrong leaf costs a page read on top of the
+	 * descent.  When the secondary order does not follow the primary one that
+	 * happens on every other row, so after two misses in a row stop trying
+	 * for a while.
+	 */
+	if (OInMemoryBlknoIsValid(hinted))
+	{
+		if (ostate->primaryHint.blkno == hinted)
+			ostate->primaryHintMisses = 0;
+		else if (++ostate->primaryHintMisses >= 2)
+		{
+			ostate->primaryHintMisses = 0;
+			ostate->primaryHintSkip = 32;
+		}
+	}
+
+	/*
+	 * Without a row, nothing proves the key's leaf is the one the hint names
+	 * now; forget it.  While backing off, the key would not be read before it
+	 * is replaced.
+	 */
+	ostate->primaryHintValid = !O_TUPLE_IS_NULL(ptup) &&
+		ostate->primaryHintSkip == 0;
+	if (ostate->primaryHintValid)
+	{
+		bool		allocated;
+		OTuple		key;
+
+		key = o_btree_tuple_make_key(desc, ptup, NULL, false, &allocated);
+		copy_fixed_key(desc, &ostate->primaryHintKey, key);
+		if (allocated)
+			pfree(key.data);
+	}
+	return ptup;
+}
+
 OTuple
 o_index_scan_getnext(OTableDescr *descr, OScanState *ostate,
 					 CommitSeqNo *tupleCsn, bool scan_primary,
@@ -1024,16 +1100,10 @@ o_index_scan_getnext(OTableDescr *descr, OScanState *ostate,
 			/* fetch primary index key from tuple and search raw tuple */
 			o_fill_pindex_tuple_key_bound(&id->desc, tup, &bound);
 
+			ptup = fetch_primary_tuple(ostate, primary, &bound, tupleCsn,
+									   tupleCxt);
 			if (hint)
-			{
-				hint->blkno = OInvalidInMemoryBlkno;
-				hint->pageChangeCount = 0;
-			}
-
-			ptup = o_btree_find_tuple_by_key(&primary->desc,
-											 (Pointer) &bound, BTreeKeyBound,
-											 &ostate->oSnapshot, tupleCsn,
-											 tupleCxt, hint);
+				*hint = ostate->primaryHint;
 			pfree(tup.data);
 			tup = ptup;
 

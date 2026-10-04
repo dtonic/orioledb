@@ -57,6 +57,39 @@ RESET enable_bitmapscan;
 RESET enable_indexonlyscan;
 DROP TABLE o_skip_step;
 
+-- A backward index scan whose snapshot predates the page it reads takes the
+-- page from undo.  An undo image leftmost on its base location got its low key
+-- compared from nothing, and the backend crashed: here, MAX() over the target
+-- table inside an INSERT ... SELECT, once earlier rows of that range had been
+-- inserted and deleted.  (Crashed on release builds only.)
+CREATE TABLE o_self_max (
+	rt text NOT NULL,
+	rid text NOT NULL,
+	version bigint NOT NULL,
+	PRIMARY KEY (rt, rid, version)
+) USING orioledb;
+INSERT INTO o_self_max
+	SELECT 'a' || lpad(g::text, 6, '0'), 'resource.' || md5(g::text), 1
+	FROM generate_series(1, 100) g;
+\set ECHO none
+SELECT stmt FROM generate_series(0, 29) i,
+	LATERAL (VALUES
+		(format($q$INSERT INTO o_self_max
+			SELECT v.rt, v.rid,
+				   COALESCE((SELECT max(h.version) FROM o_self_max h
+							 WHERE h.rt = v.rt AND h.rid = v.rid), 0) + v.ord + 1
+			FROM (VALUES (0, %1$L, 'a'), (1, %1$L, 'a'), (2, %1$L, 'a'),
+						 (3, %1$L, 'a'), (4, %1$L, 'a'), (5, %1$L, 'a'),
+						 (6, %1$L, 'a'), (7, %1$L, 'a'), (8, %1$L, 'a'),
+						 (9, %1$L, 'a')) AS v(ord, rt, rid)$q$,
+			't' || lpad(i::text, 8, '0')), 1),
+		(format('DELETE FROM o_self_max WHERE rt = %L',
+				't' || lpad(i::text, 8, '0')), 2)) AS s(stmt, n)
+ORDER BY i, n \gexec
+\set ECHO all
+SELECT count(*) FROM o_self_max;
+DROP TABLE o_self_max;
+
 DROP EXTENSION orioledb CASCADE;
 DROP SCHEMA iterator CASCADE;
 RESET search_path;

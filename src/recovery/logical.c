@@ -646,6 +646,23 @@ remember_logical_xid(TransactionId logicalXid, OXid oxid)
 	entry->oxid = oxid;
 }
 
+/*
+ * The oxid that last queued changes under `logicalXid`, if any.
+ */
+static bool
+lookup_logical_xid(TransactionId logicalXid, OXid *oxid)
+{
+	LogicalXidOxidEntry *entry;
+
+	if (!logicalXidOxidHash || !TransactionIdIsValid(logicalXid))
+		return false;
+	entry = hash_search(logicalXidOxidHash, &logicalXid, HASH_FIND, NULL);
+	if (entry == NULL)
+		return false;
+	*oxid = entry->oxid;
+	return true;
+}
+
 static void
 forget_logical_xid(TransactionId logicalXid)
 {
@@ -889,6 +906,69 @@ decode_on_container(WalReaderState *r)
 	return WALPARSE_OK;
 }
 
+/*
+ * The table descriptor of `version` for a WAL record that saw it at
+ * `snapshot`.
+ *
+ * Read at the record's snapshot, the system tree rebuilds its pages as they
+ * were then from page-level undo -- undo that, after a restart, nothing
+ * retains for the slot: it is gone as soon as recovery ends, and the decoder
+ * PANICked on "undo record was cleaned" each time the slot was read, a crash
+ * loop for as long as its consumer retried.  When the version the record
+ * names is still the table's current one, the row as it is now is the row the
+ * record means, and needs no undo.  Read at the record's snapshot only for an
+ * older version, whose row exists only in undo.
+ */
+static OTableDescr *
+fetch_decoding_table_descr(ORelOids oids, OSnapshot *snapshot, uint32 version)
+{
+	OTableDescr *descr;
+
+	/*
+	 * Ask for the latest version, not for `version`: a lookup of an older one
+	 * walks the row's undo chain, the very undo that is gone.
+	 */
+	descr = o_fetch_table_descr_extended(oids,
+										 build_fetch_context(&o_in_progress_snapshot,
+															 O_TABLE_INVALID_VERSION));
+	if (descr != NULL && descr->version == version)
+		return descr;
+	return o_fetch_table_descr_extended(oids,
+										build_fetch_context(snapshot, version));
+}
+
+/*
+ * The TOAST index descriptor for a WAL record: `version` of the index on
+ * `base_version` of its table, read now when both are still current, as
+ * fetch_decoding_table_descr() does for a table.
+ */
+static OIndexDescr *
+fetch_decoding_toast_descr(ORelOids oids, OIndexType ix_type,
+						   OSnapshot *snapshot, uint32 version,
+						   uint32 base_version)
+{
+	OIndexDescr *descr;
+
+	descr = o_fetch_index_descr_extended(oids, ix_type, false,
+										 build_fetch_context(&o_in_progress_snapshot,
+															 O_TABLE_INVALID_VERSION),
+										 build_fetch_context(&o_in_progress_snapshot,
+															 O_TABLE_INVALID_VERSION));
+	if (descr != NULL && descr->version == version)
+	{
+		OTableDescr *table;
+
+		table = o_fetch_table_descr_extended(descr->tableOids,
+											 build_fetch_context(&o_in_progress_snapshot,
+																 O_TABLE_INVALID_VERSION));
+		if (table != NULL && table->version == base_version)
+			return descr;
+	}
+	return o_fetch_index_descr_extended(oids, ix_type, false,
+										build_fetch_context(snapshot, version),
+										build_fetch_context(snapshot, base_version));
+}
+
 static WalParseResult
 decode_on_record(WalReaderState *r, WalRecord *rec)
 {
@@ -914,6 +994,33 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 
 					csnSnapshot = SnapBuildGetCSNSnaphot(ctx->decodeCtx->snapshot_builder);
 					csnSnapshot->nextXid = Max(csnSnapshot->nextXid, rec->oxid);
+
+					/*
+					 * Logical xids come from a small pool and are handed out
+					 * again as soon as a transaction ends.  A transaction
+					 * ends in WAL with its commit or rollback, which frees
+					 * the reorder buffer entry -- except one cut short by a
+					 * crash, which leaves the changes it had written and
+					 * nothing after them.  The next transaction that gets its
+					 * logical xid then queued onto those changes, and its
+					 * commit sent the dead transaction's rows along with its
+					 * own.  Changes under this logical xid from another oxid
+					 * are such leftovers: drop them.
+					 */
+					{
+						OXid		prevOxid;
+
+						if (lookup_logical_xid(rec->logicalXid, &prevOxid) &&
+							prevOxid != rec->oxid)
+						{
+							elog(DEBUG4, "ABORT leftover logicalXid %u of oxid " UINT64_FORMAT " (now oxid " UINT64_FORMAT ")",
+								 rec->logicalXid, prevOxid, rec->oxid);
+							ReorderBufferAbort(ctx->decodeCtx->reorder,
+											   rec->logicalXid,
+											   ctx->xlogRecPtr + rec->offset, 0);
+							forget_logical_xid(rec->logicalXid);
+						}
+					}
 				}
 				else
 				{
@@ -1158,8 +1265,21 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 					break;
 				}
 
-				/* Skip actual commit processing */
-				if (SnapBuildXactNeedsSkip(ctx->decodeCtx->snapshot_builder, ctx->xlogRecEndPtr - 1) || ctx->decodeCtx->fast_forward)
+				/*
+				 * A joint commit is written before the heap COMMIT record of
+				 * the same transaction, so whether the transaction was
+				 * already sent cannot be told here: a slot confirmed up to a
+				 * point between the two records -- the end of WAL when a
+				 * previous decoding session stopped -- has not sent it, yet
+				 * this record lies before that point.  Skipping here left the
+				 * heap COMMIT to send the heap changes alone, the OrioleDB
+				 * ones lost.  Attach the OrioleDB transaction to the heap one
+				 * instead and let the heap COMMIT decide: DecodeCommit()
+				 * forgets the whole transaction, children included, when it
+				 * was sent.
+				 */
+				if (!TransactionIdIsValid(rec->heapXid) &&
+					(SnapBuildXactNeedsSkip(ctx->decodeCtx->snapshot_builder, ctx->xlogRecEndPtr - 1) || ctx->decodeCtx->fast_forward))
 				{
 					elog(DEBUG4, "FORGET record type %d (%s) oxid " UINT64_FORMAT " logicalXid %u heapXid %u",
 						 rec->type, recname, rec->oxid, rec->logicalXid, rec->heapXid);
@@ -1248,8 +1368,9 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 						 rec->oids.datoid, rec->oids.reloid, rec->oids.relnode,
 						 rec->u.relation.version);
 
-					ctx->descr = o_fetch_table_descr_extended(rec->oids,
-															  build_fetch_context(&rec->u.relation.snapshot, rec->u.relation.version));
+					ctx->descr = fetch_decoding_table_descr(rec->oids,
+															&rec->u.relation.snapshot,
+															rec->u.relation.version);
 					ctx->indexDescr = ctx->descr ? GET_PRIMARY(ctx->descr) : NULL;
 					if (ctx->descr)
 					{
@@ -1263,9 +1384,10 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 						 rec->oids.datoid, rec->oids.reloid, rec->oids.relnode,
 						 rec->u.relation.version, rec->u.relation.base_version);
 
-					ctx->indexDescr = o_fetch_index_descr_extended(rec->oids, ctx->ix_type, false,
-																   build_fetch_context(&rec->u.relation.snapshot, rec->u.relation.version),
-																   build_fetch_context(&rec->u.relation.snapshot, rec->u.relation.base_version));
+					ctx->indexDescr = fetch_decoding_toast_descr(rec->oids, ctx->ix_type,
+																 &rec->u.relation.snapshot,
+																 rec->u.relation.version,
+																 rec->u.relation.base_version);
 					if (ctx->indexDescr)
 					{
 						elog(DEBUG4,
@@ -1275,8 +1397,9 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 							 ctx->indexDescr->tableOids.relnode,
 							 rec->u.relation.base_version);
 
-						ctx->descr = o_fetch_table_descr_extended(ctx->indexDescr->tableOids,
-																  build_fetch_context(&rec->u.relation.snapshot, rec->u.relation.base_version));
+						ctx->descr = fetch_decoding_table_descr(ctx->indexDescr->tableOids,
+																&rec->u.relation.snapshot,
+																rec->u.relation.base_version);
 						Assert(ctx->descr);
 
 						ctx->o_toast_tupDesc = ctx->descr->toast->leafTupdesc;
