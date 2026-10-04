@@ -889,6 +889,69 @@ decode_on_container(WalReaderState *r)
 	return WALPARSE_OK;
 }
 
+/*
+ * The table descriptor of `version` for a WAL record that saw it at
+ * `snapshot`.
+ *
+ * Read at the record's snapshot, the system tree rebuilds its pages as they
+ * were then from page-level undo -- undo that, after a restart, nothing
+ * retains for the slot: it is gone as soon as recovery ends, and the decoder
+ * PANICked on "undo record was cleaned" each time the slot was read, a crash
+ * loop for as long as its consumer retried.  When the version the record
+ * names is still the table's current one, the row as it is now is the row the
+ * record means, and needs no undo.  Read at the record's snapshot only for an
+ * older version, whose row exists only in undo.
+ */
+static OTableDescr *
+fetch_decoding_table_descr(ORelOids oids, OSnapshot *snapshot, uint32 version)
+{
+	OTableDescr *descr;
+
+	/*
+	 * Ask for the latest version, not for `version`: a lookup of an older one
+	 * walks the row's undo chain, the very undo that is gone.
+	 */
+	descr = o_fetch_table_descr_extended(oids,
+										 build_fetch_context(&o_in_progress_snapshot,
+															 O_TABLE_INVALID_VERSION));
+	if (descr != NULL && descr->version == version)
+		return descr;
+	return o_fetch_table_descr_extended(oids,
+										build_fetch_context(snapshot, version));
+}
+
+/*
+ * The TOAST index descriptor for a WAL record: `version` of the index on
+ * `base_version` of its table, read now when both are still current, as
+ * fetch_decoding_table_descr() does for a table.
+ */
+static OIndexDescr *
+fetch_decoding_toast_descr(ORelOids oids, OIndexType ix_type,
+						   OSnapshot *snapshot, uint32 version,
+						   uint32 base_version)
+{
+	OIndexDescr *descr;
+
+	descr = o_fetch_index_descr_extended(oids, ix_type, false,
+										 build_fetch_context(&o_in_progress_snapshot,
+															 O_TABLE_INVALID_VERSION),
+										 build_fetch_context(&o_in_progress_snapshot,
+															 O_TABLE_INVALID_VERSION));
+	if (descr != NULL && descr->version == version)
+	{
+		OTableDescr *table;
+
+		table = o_fetch_table_descr_extended(descr->tableOids,
+											 build_fetch_context(&o_in_progress_snapshot,
+																 O_TABLE_INVALID_VERSION));
+		if (table != NULL && table->version == base_version)
+			return descr;
+	}
+	return o_fetch_index_descr_extended(oids, ix_type, false,
+										build_fetch_context(snapshot, version),
+										build_fetch_context(snapshot, base_version));
+}
+
 static WalParseResult
 decode_on_record(WalReaderState *r, WalRecord *rec)
 {
@@ -1261,8 +1324,9 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 						 rec->oids.datoid, rec->oids.reloid, rec->oids.relnode,
 						 rec->u.relation.version);
 
-					ctx->descr = o_fetch_table_descr_extended(rec->oids,
-															  build_fetch_context(&rec->u.relation.snapshot, rec->u.relation.version));
+					ctx->descr = fetch_decoding_table_descr(rec->oids,
+															&rec->u.relation.snapshot,
+															rec->u.relation.version);
 					ctx->indexDescr = ctx->descr ? GET_PRIMARY(ctx->descr) : NULL;
 					if (ctx->descr)
 					{
@@ -1276,9 +1340,10 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 						 rec->oids.datoid, rec->oids.reloid, rec->oids.relnode,
 						 rec->u.relation.version, rec->u.relation.base_version);
 
-					ctx->indexDescr = o_fetch_index_descr_extended(rec->oids, ctx->ix_type, false,
-																   build_fetch_context(&rec->u.relation.snapshot, rec->u.relation.version),
-																   build_fetch_context(&rec->u.relation.snapshot, rec->u.relation.base_version));
+					ctx->indexDescr = fetch_decoding_toast_descr(rec->oids, ctx->ix_type,
+																 &rec->u.relation.snapshot,
+																 rec->u.relation.version,
+																 rec->u.relation.base_version);
 					if (ctx->indexDescr)
 					{
 						elog(DEBUG4,
@@ -1288,8 +1353,9 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 							 ctx->indexDescr->tableOids.relnode,
 							 rec->u.relation.base_version);
 
-						ctx->descr = o_fetch_table_descr_extended(ctx->indexDescr->tableOids,
-																  build_fetch_context(&rec->u.relation.snapshot, rec->u.relation.base_version));
+						ctx->descr = fetch_decoding_table_descr(ctx->indexDescr->tableOids,
+																&rec->u.relation.snapshot,
+																rec->u.relation.base_version);
 						Assert(ctx->descr);
 
 						ctx->o_toast_tupDesc = ctx->descr->toast->leafTupdesc;
