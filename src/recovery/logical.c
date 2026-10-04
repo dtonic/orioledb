@@ -1158,8 +1158,21 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 					break;
 				}
 
-				/* Skip actual commit processing */
-				if (SnapBuildXactNeedsSkip(ctx->decodeCtx->snapshot_builder, ctx->xlogRecEndPtr - 1) || ctx->decodeCtx->fast_forward)
+				/*
+				 * A joint commit is written before the heap COMMIT record of
+				 * the same transaction, so whether the transaction was
+				 * already sent cannot be told here: a slot confirmed up to a
+				 * point between the two records -- the end of WAL when a
+				 * previous decoding session stopped -- has not sent it, yet
+				 * this record lies before that point.  Skipping here left the
+				 * heap COMMIT to send the heap changes alone, the OrioleDB
+				 * ones lost.  Attach the OrioleDB transaction to the heap one
+				 * instead and let the heap COMMIT decide: DecodeCommit()
+				 * forgets the whole transaction, children included, when it
+				 * was sent.
+				 */
+				if (!TransactionIdIsValid(rec->heapXid) &&
+					(SnapBuildXactNeedsSkip(ctx->decodeCtx->snapshot_builder, ctx->xlogRecEndPtr - 1) || ctx->decodeCtx->fast_forward))
 				{
 					elog(DEBUG4, "FORGET record type %d (%s) oxid " UINT64_FORMAT " logicalXid %u heapXid %u",
 						 rec->type, recname, rec->oxid, rec->logicalXid, rec->heapXid);
