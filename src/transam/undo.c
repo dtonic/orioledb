@@ -3218,6 +3218,27 @@ search_for_undo_sub_location(UndoLogType undoType,
 			}
 			else if (kind == UndoStackTail)
 			{
+				UndoLocation prevSubLocation = item->prevSubLocation;
+
+				/*
+				 * Recovery replays SAVEPOINT records but sees no RELEASE: a
+				 * released subtransaction pops its item only at run time.
+				 * Such an item is left above the savepoint being rolled back
+				 * to, and its parent, started inside that savepoint, is the
+				 * higher subtransaction id.  Step over it, as the run-time
+				 * stack did; stopping there would roll back the whole
+				 * transaction, the changes made before the savepoint too.
+				 */
+				if (item->parentSubid > parentSubid &&
+					UndoLocationIsValid(prevSubLocation))
+				{
+					if (prevSubLocation >= location)
+						elog(PANIC,
+							 "corrupted undo subxact chain: location " UINT64_FORMAT " links to non-decreasing location " UINT64_FORMAT,
+							 location, prevSubLocation);
+					location = prevSubLocation;
+					continue;
+				}
 				*toLoc = InvalidUndoLocation;
 				*toSubLoc = InvalidUndoLocation;
 				return true;
