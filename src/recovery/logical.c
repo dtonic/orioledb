@@ -671,6 +671,85 @@ forget_logical_xid(TransactionId logicalXid)
 }
 
 /*
+ * Take `logicalXid` for `oxid` in the reorder buffer, first dropping what a
+ * dead transaction left under that number.
+ *
+ * Logical xids come from a small pool and are handed out again as soon as a
+ * transaction ends, and their values are heap xids below RecentXmin (see
+ * acquire_logical_xid()).  A transaction ends in WAL with its commit or
+ * rollback, which frees its reorder buffer entry -- except one cut short by a
+ * crash, which leaves the changes it had written and nothing after them.  So
+ * the number a new transaction gets may still name such leftovers:
+ *
+ *   - an OrioleDB transaction that held the same logical xid, known by its
+ *     other oxid;
+ *   - a heap transaction whose xid it was: after the crash the heap xids it
+ *     wrote under are below RecentXmin, and an entry no OrioleDB record made
+ *     can only be that, since a heap xid is reused only after it ended.
+ *
+ * The new transaction's changes then went into the dead one's entry, and its
+ * commit sent the dead transaction's rows along with its own; a dead heap
+ * subtransaction's entry kept the new changes out of the new transaction's
+ * commit instead.  Drop such an entry before the number is used.  Prepared
+ * transactions hold back RecentXmin, so a logical xid never names one.
+ *
+ * Callers pass every OrioleDB record that names a logical xid of a
+ * transaction, so after the first one the lookup answers at once.  A switch
+ * record whose transaction is not known yet passes InvalidOXid: the entry is
+ * then remembered as OrioleDB's, and its owner is filled in by the first
+ * record that names it.
+ */
+/*
+ * Whether a record names its transaction's oxid: the WAL reader zeroes a
+ * container's record state, and oxids start at FirstNormalTransactionId, so
+ * the records before the container's XID record carry 0.
+ */
+static inline bool
+oxid_known(OXid oxid)
+{
+	return OXidIsValid(oxid) && oxid >= FirstNormalTransactionId;
+}
+
+static void
+claim_logical_xid(ReorderBuffer *rb, TransactionId logicalXid, OXid oxid,
+				  XLogRecPtr lsn)
+{
+	OXid		prevOxid;
+	ReorderBufferTXN *txn;
+
+	if (!TransactionIdIsValid(logicalXid))
+		return;
+	if (!oxid_known(oxid))
+		oxid = InvalidOXid;
+
+	if (lookup_logical_xid(logicalXid, &prevOxid))
+	{
+		if (prevOxid == oxid || !OXidIsValid(oxid))
+			return;
+		if (OXidIsValid(prevOxid))
+		{
+			elog(DEBUG4, "ABORT leftover logicalXid %u of oxid " UINT64_FORMAT " (now oxid " UINT64_FORMAT ")",
+				 logicalXid, prevOxid, oxid);
+			ReorderBufferAbort(rb, logicalXid, lsn, 0);
+		}
+		/* else a switch record made the entry before the owner was known */
+	}
+	else
+	{
+		txn = get_reorder_buffer_txn(rb, logicalXid);
+		if (txn != NULL &&
+			(txn->nentries > 0 || !dlist_is_empty(&txn->subtxns) ||
+			 rbtxn_is_known_subxact(txn)))
+		{
+			elog(DEBUG4, "ABORT leftover heap xid %u (now logical xid of oxid " UINT64_FORMAT ")",
+				 logicalXid, oxid);
+			ReorderBufferAbort(rb, logicalXid, lsn, 0);
+		}
+	}
+	remember_logical_xid(logicalXid, oxid);
+}
+
+/*
  * ReorderBufferAssignChild() for OrioleDB's logical xids.
  *
  * The reorder buffer keeps one level: a top-level transaction and a flat list
@@ -807,7 +886,7 @@ orioledb_logical_txn_status(TransactionId xid)
 	if (!logicalXidOxidHash)
 		return RBTXN_STATUS_UNKNOWN;
 	entry = hash_search(logicalXidOxidHash, &xid, HASH_FIND, NULL);
-	if (!entry)
+	if (!entry || !OXidIsValid(entry->oxid))
 		return RBTXN_STATUS_UNKNOWN;
 
 	csn = oxid_get_csn(entry->oxid, false);
@@ -888,7 +967,28 @@ typedef struct
 	TupleDescData *heap_toast_tupDesc;
 	bool		has_origin;
 	bool		table_rewrite;	/* see WAL_CONTAINER_TABLE_REWRITE */
+
+	/*
+	 * A switch record waiting for the XID record after it, which tells whose
+	 * logical xid it moves (see WAL_REC_SWITCH_LOGICAL_XID).
+	 */
+	bool		switch_pending;
+	TransactionId switch_top_xid;
+	TransactionId switch_sub_xid;
+	XLogRecPtr	switch_lsn;
 } DecodeWalDescCtx;
+
+static void
+apply_pending_switch(DecodeWalDescCtx *ctx, OXid oxid)
+{
+	if (!ctx->switch_pending)
+		return;
+	ctx->switch_pending = false;
+	claim_logical_xid(ctx->decodeCtx->reorder, ctx->switch_sub_xid, oxid,
+					  ctx->switch_lsn);
+	oriole_assign_child(ctx->decodeCtx->reorder, ctx->switch_top_xid,
+						ctx->switch_sub_xid, ctx->switch_lsn);
+}
 
 static WalParseResult
 decode_on_container(WalReaderState *r)
@@ -981,6 +1081,9 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 
 	elog(DEBUG4, "[%s] GET RTYPE %d `%s`", __func__, rec->type, recname);
 
+	if (rec->type != WAL_REC_XID && rec->type != WAL_REC_SWITCH_LOGICAL_XID)
+		apply_pending_switch(ctx, InvalidOXid);
+
 	switch (rec->type)
 	{
 		case WAL_REC_XID:
@@ -995,32 +1098,8 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 					csnSnapshot = SnapBuildGetCSNSnaphot(ctx->decodeCtx->snapshot_builder);
 					csnSnapshot->nextXid = Max(csnSnapshot->nextXid, rec->oxid);
 
-					/*
-					 * Logical xids come from a small pool and are handed out
-					 * again as soon as a transaction ends.  A transaction
-					 * ends in WAL with its commit or rollback, which frees
-					 * the reorder buffer entry -- except one cut short by a
-					 * crash, which leaves the changes it had written and
-					 * nothing after them.  The next transaction that gets its
-					 * logical xid then queued onto those changes, and its
-					 * commit sent the dead transaction's rows along with its
-					 * own.  Changes under this logical xid from another oxid
-					 * are such leftovers: drop them.
-					 */
-					{
-						OXid		prevOxid;
-
-						if (lookup_logical_xid(rec->logicalXid, &prevOxid) &&
-							prevOxid != rec->oxid)
-						{
-							elog(DEBUG4, "ABORT leftover logicalXid %u of oxid " UINT64_FORMAT " (now oxid " UINT64_FORMAT ")",
-								 rec->logicalXid, prevOxid, rec->oxid);
-							ReorderBufferAbort(ctx->decodeCtx->reorder,
-											   rec->logicalXid,
-											   ctx->xlogRecPtr + rec->offset, 0);
-							forget_logical_xid(rec->logicalXid);
-						}
-					}
+					claim_logical_xid(ctx->decodeCtx->reorder, rec->logicalXid,
+									  rec->oxid, ctx->xlogRecPtr + rec->offset);
 				}
 				else
 				{
@@ -1032,6 +1111,9 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 					elog(DEBUG4, "IGNORED record type %d (%s) invalid logicalXid for oxid " UINT64_FORMAT,
 						 rec->type, recname, rec->oxid);
 				}
+				apply_pending_switch(ctx, ctx->switch_pending &&
+									 rec->logicalXid == ctx->switch_sub_xid ?
+									 rec->oxid : InvalidOXid);
 				break;
 			}
 
@@ -1048,7 +1130,29 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 				Assert(TransactionIdIsValid(topXid));
 				Assert(TransactionIdIsValid(subXid));
 
-				oriole_assign_child(ctx->decodeCtx->reorder, topXid, subXid, xlogPtr);
+				/*
+				 * The switch record opens its container, ahead of the XID
+				 * record that names the transaction, so whose logical xid
+				 * `subXid` is is not known yet; claim_logical_xid() has to
+				 * drop a dead transaction's entry under that number before
+				 * this record puts it under the heap xid.  Wait for the XID
+				 * record unless the container already named the transaction
+				 * (one container holds one transaction's records).
+				 */
+				apply_pending_switch(ctx, InvalidOXid);
+				if (oxid_known(rec->oxid))
+				{
+					claim_logical_xid(ctx->decodeCtx->reorder, subXid,
+									  rec->oxid, xlogPtr);
+					oriole_assign_child(ctx->decodeCtx->reorder, topXid, subXid, xlogPtr);
+				}
+				else
+				{
+					ctx->switch_pending = true;
+					ctx->switch_top_xid = topXid;
+					ctx->switch_sub_xid = subXid;
+					ctx->switch_lsn = xlogPtr;
+				}
 
 				break;
 			}
@@ -1459,8 +1563,8 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 			if (!ctx->decodeCtx->fast_forward)
 			{
 				ReorderBuffer *rb = ctx->decodeCtx->reorder;
-				ReorderBufferTXN *subtxn = get_reorder_buffer_txn(rb, rec->logicalXid);
-				ReorderBufferTXN *named = get_reorder_buffer_txn(rb, rec->u.savepoint.parentLogicalXid);
+				ReorderBufferTXN *subtxn;
+				ReorderBufferTXN *named;
 
 				/*
 				 * The record's own position, not the container's: several
@@ -1468,6 +1572,11 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 				 * orders subtransactions by the position they started at.
 				 */
 				XLogRecPtr	xlogPtr = ctx->xlogRecPtr + rec->offset;
+
+				claim_logical_xid(rb, rec->u.savepoint.parentLogicalXid, rec->oxid, xlogPtr);
+				claim_logical_xid(rb, rec->logicalXid, rec->oxid, xlogPtr);
+				subtxn = get_reorder_buffer_txn(rb, rec->logicalXid);
+				named = get_reorder_buffer_txn(rb, rec->u.savepoint.parentLogicalXid);
 
 				if (subtxn != NULL && rbtxn_is_known_subxact(subtxn))
 				{
@@ -1647,6 +1756,7 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 					break;
 				}
 
+				claim_logical_xid(ctx->decodeCtx->reorder, rec->logicalXid, rec->oxid, xlogPtr);
 				ReorderBufferProcessXid(ctx->decodeCtx->reorder, rec->logicalXid, xlogPtr);
 
 				/* If the origin is defined and filtering is enabled, Skip */
@@ -1786,6 +1896,8 @@ orioledb_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 
 	if (st != WALPARSE_OK)
 		elog(FATAL, "[WAL PARSE ERROR %d]", st);
+
+	apply_pending_switch(&dctx, InvalidOXid);
 }
 
 static inline bool
