@@ -133,3 +133,67 @@ class LogicalCrashLeftoverTest(BaseTest):
 				tags[key] = tags.get(key, 0) + 1
 		self.assertEqual(tags, {'o_cl:live': 40, 'h_cl:live': 40})
 		node.stop()
+
+	def test_a_transaction_in_flight_at_a_crash_does_not_hold_the_slot(self):
+		node = self.node
+		node.append_conf('postgresql.conf',
+		                 "wal_level = logical\nmax_connections = 100\n")
+		node.start()
+		node.safe_psql(
+		    'postgres', """
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_cl (id bigint PRIMARY KEY, tag text) USING orioledb;
+			CREATE TABLE h_cl (id bigint, tag text) USING heap;
+			CREATE FUNCTION o_cl_f() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN INSERT INTO h_cl VALUES (NEW.id, NEW.tag); RETURN NEW; END $$;
+			CREATE TRIGGER o_cl_t AFTER INSERT ON o_cl
+				FOR EACH ROW EXECUTE FUNCTION o_cl_f();
+		""")
+		node.safe_psql(
+		    'postgres',
+		    "SELECT pg_create_logical_replication_slot('cl', 'test_decoding');"
+		)
+
+		# The transaction in flight at the crash takes a backend slot that no
+		# backend after the restart takes again, so its logical xid is not
+		# reused.
+		idle = [node.connect() for _ in range(30)]
+		for c in idle:
+			c.execute("SELECT 1;")
+		dead = node.connect()
+		dead.begin()
+		dead.execute("INSERT INTO o_cl SELECT g, 'dead' "
+		             "FROM generate_series(1, 2000) g")
+		# A commit flushes WAL up to its record, the dead transaction's too
+		node.safe_psql('postgres', "INSERT INTO o_cl VALUES (0, 'flush');")
+		crash_lsn = node.execute("SELECT pg_current_wal_lsn();")[0][0]
+		node.stop(['-m', 'immediate'])
+		for c in idle + [dead]:
+			try:
+				c.close()
+			except Exception:
+				pass
+		node.start()
+
+		# One backend, on one slot: none of its logical xids is the dead
+		# transaction's.
+		live = node.connect()
+		for i in range(50):
+			live.execute("INSERT INTO o_cl VALUES (%d, 'live');" % (10000 + i))
+			live.commit()
+		# Running xacts records: the first drops the heap half of the dead
+		# transaction, the next can take a restart point past it.
+		for i in range(2):
+			live.execute("CHECKPOINT;")
+			live.commit()
+			live.execute("INSERT INTO o_cl VALUES (%d, 'last');" % (i + 1))
+			live.commit()
+		live.close()
+		node.execute(
+		    "SELECT count(*) FROM pg_logical_slot_get_changes('cl', NULL, NULL);"
+		)
+		moved = node.execute(
+		    "SELECT restart_lsn > '%s'::pg_lsn FROM pg_replication_slots "
+		    "WHERE slot_name = 'cl';" % crash_lsn)[0][0]
+		self.assertTrue(moved)
+		node.stop()

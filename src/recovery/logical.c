@@ -750,6 +750,69 @@ claim_logical_xid(ReorderBuffer *rb, TransactionId logicalXid, OXid oxid,
 }
 
 /*
+ * Drop the OrioleDB transactions that ended without a record.
+ *
+ * A transaction cut short by a crash leaves its reorder buffer entry behind,
+ * and PG's own cleanup of such entries (ReorderBufferAbortOld() at a running
+ * xacts record) skips OrioleDB's -- their logical xids are always below the
+ * oldest running heap xid -- and stops at the first one it meets.  Unless a
+ * new transaction happened to get the same logical xid, the entry stayed for
+ * good: the slot could not move its restart point past it, so it kept WAL
+ * from the crash on, and every crashed heap transaction after it in the
+ * buffer stayed too.
+ *
+ * Commit and rollback records carry `xmin`, the oldest oxid running when they
+ * were written, and an oxid stops running only after its own commit or
+ * rollback record is in WAL.  So a transaction whose oxid is below that xmin
+ * and whose end has not been decoded never wrote one: drop it.  Only
+ * top-level entries: an OrioleDB transaction that also wrote heap tables is a
+ * subtransaction of its heap xid, which a running xacts record cleans up with
+ * it.
+ */
+static void
+abort_dead_oriole_txns(ReorderBuffer *rb, OXid xmin, XLogRecPtr lsn)
+{
+	HASH_SEQ_STATUS seq;
+	LogicalXidOxidEntry *entry;
+	TransactionId *dead;
+	long		nalloc;
+	int			ndead = 0,
+				i;
+
+	if (!logicalXidOxidHash || !oxid_known(xmin))
+		return;
+	nalloc = hash_get_num_entries(logicalXidOxidHash);
+	if (nalloc == 0)
+		return;
+
+	dead = palloc(sizeof(TransactionId) * nalloc);
+	hash_seq_init(&seq, logicalXidOxidHash);
+	while ((entry = (LogicalXidOxidEntry *) hash_seq_search(&seq)) != NULL)
+	{
+		ReorderBufferTXN *txn;
+
+		if (!OXidIsValid(entry->oxid) || entry->oxid >= xmin)
+			continue;
+		txn = get_reorder_buffer_txn(rb, entry->logicalXid);
+		if (txn != NULL && rbtxn_is_known_subxact(txn))
+			continue;
+		dead[ndead++] = entry->logicalXid;
+	}
+
+	for (i = 0; i < ndead; i++)
+	{
+		if (get_reorder_buffer_txn(rb, dead[i]) != NULL)
+		{
+			elog(DEBUG4, "ABORT logical xid %u, which ended without a record (xmin " UINT64_FORMAT ")",
+				 dead[i], xmin);
+			ReorderBufferAbort(rb, dead[i], lsn, 0);
+		}
+		forget_logical_xid(dead[i]);
+	}
+	pfree(dead);
+}
+
+/*
  * ReorderBufferAssignChild() for OrioleDB's logical xids.
  *
  * The reorder buffer keeps one level: a top-level transaction and a flat list
@@ -1169,6 +1232,8 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 				elog(DEBUG4, "RECEIVE record type %d (%s) oxid " UINT64_FORMAT " logicalXId %u heapXid %u",
 					 rec->type, recname, rec->oxid, rec->logicalXid, rec->heapXid);
 
+				abort_dead_oriole_txns(ctx->decodeCtx->reorder, rec->u.finish.xmin, xlogPtr);
+
 				if (!TransactionIdIsValid(rec->logicalXid))
 				{
 					/*
@@ -1328,6 +1393,8 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 
 				elog(DEBUG4, "RECEIVE record type %d (%s) oxid " UINT64_FORMAT " logicalXId %u heapXid %u",
 					 rec->type, recname, rec->oxid, rec->logicalXid, rec->heapXid);
+
+				abort_dead_oriole_txns(ctx->decodeCtx->reorder, rec->u.joint_commit.xmin, xlogPtr);
 
 				if (!TransactionIdIsValid(rec->logicalXid))
 				{
