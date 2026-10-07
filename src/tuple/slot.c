@@ -322,7 +322,9 @@ tts_orioledb_getsomeattrs(TupleTableSlot *slot, int __natts)
 			oslot->isfilledLen = needed;
 		}
 		isfilled = oslot->isfilled;
-		memset(isfilled, 0, sizeof(bool) * needed);
+		/* only the attributes from tts_nvalid on are read back below */
+		memset(isfilled + slot->tts_nvalid, 0,
+			   sizeof(bool) * (needed - slot->tts_nvalid));
 	}
 
 	/* Iterate over the attributes to populate values and null flags. */
@@ -502,7 +504,9 @@ tts_orioledb_getsomeattrs(TupleTableSlot *slot, int __natts)
 		{
 			if (isfilled[attnum])
 			{
-				slot_getmissingattrs(slot, first_unfilled, attnum);
+				/* fill the gap of unread attributes before this one, if any */
+				if (first_unfilled < attnum)
+					slot_getmissingattrs(slot, first_unfilled, attnum);
 				first_unfilled = attnum + 1;
 			}
 		}
