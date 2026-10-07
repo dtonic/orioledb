@@ -184,6 +184,11 @@ static UndoItemTypeDescr undoItemTypeDescrs[] = {
 		.callback = cic_capture_undo_callback,
 		.callOnCommit = false
 	},
+	{
+		.type = LockDispatchUndoItemType,
+		.callback = lock_dispatch_undo_callback,
+		.callOnCommit = false
+	},
 };
 
 
@@ -3512,6 +3517,26 @@ start_autonomous_transaction(OAutonomousTxState *state)
 	GET_CUR_PROCDATA()->autonomousNestingLevel++;
 }
 
+/*
+ * The end of an autonomous transaction that no enclosing transaction with an
+ * oxid of its own outlives: give up what its WAL records retained for logical
+ * decoding, as the end of a regular transaction does.
+ *
+ * The retain lives in the process, not the transaction, and is otherwise
+ * given up only in undo_xact_callback() at the end of the enclosing
+ * transaction.  The checkpointer has none: it deletes system cache entries
+ * in autonomous transactions (o_sys_caches_delete_by_lsn()), and the retain
+ * of their first record held the global xmin back for as long as the
+ * checkpointer lived.  An enclosing transaction with an oxid keeps it until
+ * its own end, since its records share it.
+ */
+static void
+release_autonomous_logical_wal_retain(OAutonomousTxState *state)
+{
+	if (!OXidIsValid(state->oxid))
+		clear_my_logical_wal_retain_location();
+}
+
 void
 abort_autonomous_transaction(OAutonomousTxState *state)
 {
@@ -3536,6 +3561,7 @@ abort_autonomous_transaction(OAutonomousTxState *state)
 		}
 	}
 
+	release_autonomous_logical_wal_retain(state);
 	oxid_needs_wal_flush = state->needs_wal_flush;
 	xidless_commit_lsn = state->saved_xidless_commit_lsn;
 	GET_CUR_PROCDATA()->autonomousNestingLevel--;
@@ -3585,6 +3611,7 @@ finish_autonomous_transaction(OAutonomousTxState *state)
 		}
 	}
 
+	release_autonomous_logical_wal_retain(state);
 	oxid_needs_wal_flush = state->needs_wal_flush;
 	xidless_commit_lsn = state->saved_xidless_commit_lsn;
 	GET_CUR_PROCDATA()->autonomousNestingLevel--;

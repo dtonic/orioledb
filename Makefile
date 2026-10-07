@@ -185,12 +185,14 @@ ISOLATIONCHECKS = bitmap_hist_scan \
 				  rll_mix \
 				  rll_mode_raise \
 				  rll_subtrans \
+				  rollback_lock_stale_copy \
 				  skipundo \
 				  table_lock_test \
 				  concurrent_truncate \
 				  seqscan_own_writes \
 				  uniq
 TESTGRESCHECKS_PART_1 = test/t/amcheck_test.py \
+						test/t/checkpointer_logical_retain_test.py \
 						test/t/collate_test.py \
 						test/t/commit_window_test.py \
 						test/t/tablespace_test.py \
@@ -234,6 +236,7 @@ TESTGRESCHECKS_PART_1 = test/t/amcheck_test.py \
 						test/t/database_template_test.py
 TESTGRESCHECKS_PART_2 = test/t/checkpoint_concurrent_test.py \
 						test/t/checkpoint_error_test.py \
+						test/t/truncate_under_checkpoint_test.py \
 						test/t/checkpoint_collation_test.py \
 						test/t/checkpoint_eviction_test.py \
 						test/t/checkpoint_same_trx_test.py \

@@ -306,7 +306,7 @@ EXPLAIN (COSTS OFF)
 SELECT p FROM o_test_ix_ams WHERE p <@ box(point(0,0), point(4000, 5000));
 COMMIT;
 
-CREATE TABLE o_bridging_vacuum_test (id serial primary key, val float, p point) USING orioledb;
+CREATE TABLE o_bridging_vacuum_test (id serial primary key, val float, p point) USING orioledb WITH (autovacuum_enabled = false);
 INSERT INTO o_bridging_vacuum_test (p) (SELECT point(0.01 * i, 0.02 * i) FROM generate_series(1,5) i);
 SELECT orioledb_tbl_structure('o_bridging_vacuum_test'::regclass, 'ne');
 CREATE INDEX o_bridging_vacuum_test_p_idx on o_bridging_vacuum_test using gist(p);
@@ -1281,7 +1281,7 @@ CREATE TABLE o_bridge_mixed (
 	id int NOT NULL PRIMARY KEY,
 	tags int[],
 	other int
-) USING orioledb;
+) USING orioledb WITH (autovacuum_enabled = false);
 CREATE INDEX ON o_bridge_mixed USING gin(tags);
 INSERT INTO o_bridge_mixed
 	SELECT i, ARRAY[i], i FROM generate_series(1, 4) i;
@@ -1362,6 +1362,90 @@ SET enable_seqscan = off;
 SELECT id, value FROM o_bridge_expr WHERE lower(value) = 'gamma';
 UPDATE o_bridge_expr SET value = 'GAMMA' WHERE id = 2;
 SELECT id, value FROM o_bridge_expr ORDER BY id;
+RESET enable_seqscan;
+
+-- ON CONFLICT with a bridged index that is not an arbiter.  The bridged-index
+-- insertion call used to see every index of the result relation, so it also
+-- wrote OrioleDB's own non-arbiter secondary indexes -- which the ON CONFLICT
+-- loop then wrote again, met the row it had just inserted itself, and called
+-- a unique violation on (issue #1275); with a secondary arbiter the second
+-- write of the arbiter tripped a speculative conflict with ourselves instead.
+CREATE TABLE o_bridge_ioc_sk (
+	id integer,
+	part integer,
+	tenant text,
+	terms tsvector,
+	PRIMARY KEY (id, part),
+	UNIQUE (id, part, tenant)
+) USING orioledb;
+CREATE INDEX ON o_bridge_ioc_sk USING gin (terms);
+
+-- first insert into an empty table used to fail with a false 23505 on the
+-- secondary unique constraint
+INSERT INTO o_bridge_ioc_sk VALUES (1, 0, 'tenant-a', 'alpha'::tsvector)
+	ON CONFLICT (id, part) DO UPDATE
+	SET tenant = EXCLUDED.tenant, terms = EXCLUDED.terms;
+SELECT id, part, tenant FROM o_bridge_ioc_sk;
+
+-- a real conflict on the primary key arbiter takes the update path
+INSERT INTO o_bridge_ioc_sk VALUES (1, 0, 'tenant-b', 'beta'::tsvector)
+	ON CONFLICT (id, part) DO UPDATE
+	SET tenant = EXCLUDED.tenant, terms = EXCLUDED.terms;
+SELECT id, part, tenant FROM o_bridge_ioc_sk;
+
+-- the secondary unique constraint as the arbiter used to crash the backend
+INSERT INTO o_bridge_ioc_sk VALUES (2, 0, 'x', 'xx'::tsvector)
+	ON CONFLICT (id, part, tenant) DO UPDATE SET terms = EXCLUDED.terms;
+INSERT INTO o_bridge_ioc_sk VALUES (2, 0, 'x', 'yy'::tsvector)
+	ON CONFLICT (id, part, tenant) DO UPDATE SET terms = EXCLUDED.terms;
+SELECT id, part, tenant, terms::text FROM o_bridge_ioc_sk ORDER BY id, part;
+
+-- the bridged index is still maintained through all of the above
+SET enable_seqscan = off;
+SELECT id FROM o_bridge_ioc_sk WHERE terms @@ to_tsquery('simple', 'beta');
+SELECT id FROM o_bridge_ioc_sk WHERE terms @@ to_tsquery('simple', 'yy');
+SELECT id FROM o_bridge_ioc_sk WHERE terms @@ to_tsquery('simple', 'alpha');
+RESET enable_seqscan;
+
+-- a non-unique secondary index must not be written twice either: the doubled
+-- entry made every scan through it return the same row twice
+CREATE TABLE o_bridge_ioc_plainsk (
+	id int NOT NULL PRIMARY KEY,
+	tenant text,
+	tags int[]
+) USING orioledb;
+CREATE INDEX ON o_bridge_ioc_plainsk (tenant);
+CREATE INDEX ON o_bridge_ioc_plainsk USING gin (tags);
+
+INSERT INTO o_bridge_ioc_plainsk VALUES (1, 'a', ARRAY[1])
+	ON CONFLICT (id) DO UPDATE SET tenant = EXCLUDED.tenant;
+SET enable_seqscan = off;
+SELECT id, tenant FROM o_bridge_ioc_plainsk WHERE tenant = 'a';
+SELECT id FROM o_bridge_ioc_plainsk WHERE tags @> ARRAY[1];
+RESET enable_seqscan;
+
+-- The table stays bridged after its last bridged index is dropped.  With a
+-- secondary unique arbiter the first insert into the empty table used to be
+-- skipped as a conflict with itself, silently (issue #1278).
+CREATE TABLE o_bridge_ioc_dropped (
+	id integer PRIMARY KEY,
+	message_id integer UNIQUE,
+	terms tsvector
+) USING orioledb;
+CREATE INDEX o_bridge_ioc_dropped_terms ON o_bridge_ioc_dropped
+	USING gin (terms);
+DROP INDEX o_bridge_ioc_dropped_terms;
+INSERT INTO o_bridge_ioc_dropped VALUES (1, 2, 'alpha'::tsvector)
+	ON CONFLICT (message_id) DO NOTHING RETURNING id;
+-- a real conflict on the secondary arbiter is still skipped
+INSERT INTO o_bridge_ioc_dropped VALUES (3, 2, 'beta'::tsvector)
+	ON CONFLICT (message_id) DO NOTHING RETURNING id;
+-- and the primary key arbiter does not report the secondary key as taken
+INSERT INTO o_bridge_ioc_dropped VALUES (4, 5, 'gamma'::tsvector)
+	ON CONFLICT (id) DO NOTHING RETURNING id;
+SELECT * FROM o_bridge_ioc_dropped ORDER BY id;
+SET enable_seqscan = off;
+SELECT id FROM o_bridge_ioc_dropped WHERE message_id = 2;
 RESET enable_seqscan;
 
 DROP EXTENSION pageinspect;

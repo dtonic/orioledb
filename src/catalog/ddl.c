@@ -1225,6 +1225,40 @@ orioledb_utility_command(PlannedStmt *pstmt,
 					}
 				}
 			}
+			else if (rel->rd_rel->relkind == RELKIND_RELATION ||
+					 rel->rd_rel->relkind == RELKIND_MATVIEW)
+			{
+				ListCell   *lc;
+				AlterTableCmd *set_am_cmd = NULL;
+
+				foreach(lc, atstmt->cmds)
+				{
+					AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+
+					if (cmd->subtype == AT_SetAccessMethod)
+					{
+						if (set_am_cmd != NULL)
+						{
+							set_am_cmd = NULL;
+							break;
+						}
+						set_am_cmd = cmd;
+					}
+				}
+
+				if (set_am_cmd != NULL)
+				{
+					const char *amname = set_am_cmd->name
+						? set_am_cmd->name
+						: default_table_access_method;
+
+					if (strcmp(amname, "orioledb") == 0)
+						ereport(ERROR,
+								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+								 errmsg("changing access method to OrioleDB is not supported"),
+								 errdetail("Use CREATE TABLE ... USING orioledb instead.")));
+				}
+			}
 			else if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 			{
 				/*
@@ -3679,8 +3713,8 @@ orioledb_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
 
 				o_find_composite_type_dependencies(rel->rd_rel->reltype, rel);
 				CommandCounterIncrement();
-				o_class_cache_update_if_needed(MyDatabaseId, rel->rd_rel->oid,
-											   (Pointer) &arg);
+				o_class_cache_refresh(MyDatabaseId, rel->rd_rel->oid,
+									  (Pointer) &arg);
 			}
 			else if ((rel->rd_rel->relkind == RELKIND_INDEX) &&
 					 (drop_arg->dropflags & PERFORM_DELETION_OF_RELATION))
@@ -4199,8 +4233,8 @@ orioledb_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
 
 				o_find_composite_type_dependencies(rel->rd_rel->reltype, rel);
 				CommandCounterIncrement();
-				o_class_cache_update_if_needed(MyDatabaseId, rel->rd_rel->oid,
-											   (Pointer) &arg);
+				o_class_cache_refresh(MyDatabaseId, rel->rd_rel->oid,
+									  (Pointer) &arg);
 				if (arg.found)
 				{
 					XLogRecPtr	cur_lsn;
@@ -4741,7 +4775,11 @@ orioledb_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
 
 					CommandCounterIncrement();
 					o_sys_cache_set_datoid_lsn(&cur_lsn, &datoid);
-					o_enum_cache_add_all(datoid, objectId, cur_lsn);
+					o_enum_cache_delete_all(datoid, objectId);
+					STOPEVENT(STOPEVENT_ENUM_CACHE_AFTER_DELETE_ALL,
+							  NULL);
+					o_enum_cache_add_all(datoid, objectId, cur_lsn,
+										 true);
 				}
 				break;
 
@@ -4757,8 +4795,8 @@ orioledb_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
 					reltype = rel->rd_rel->reltype;
 					relation_close(rel, AccessShareLock);
 					CommandCounterIncrement();
-					o_class_cache_update_if_needed(MyDatabaseId, reloid,
-												   (Pointer) &arg);
+					o_class_cache_refresh(MyDatabaseId, reloid,
+										  (Pointer) &arg);
 					if (arg.found)
 					{
 						XLogRecPtr	cur_lsn;
