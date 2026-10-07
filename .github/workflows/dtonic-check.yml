@@ -63,6 +63,16 @@ jobs:
           ref: ${{ env.PGTAG }}
           path: postgresql
 
+      # The fork's code needs hooks the fork adds to orioledb/postgres
+      # (docker/patches/postgres/*.patch, applied in name order, as the
+      # Dockerfile does).
+      - name: Apply the fork's PostgreSQL patches
+        run: |
+          for p in orioledb/docker/patches/postgres/*.patch; do
+            echo "applying $p"
+            patch -d postgresql -p1 --forward < "$p"
+          done
+
       - name: Setup prerequisites
         run: bash ./orioledb/ci/prerequisites.sh
 
