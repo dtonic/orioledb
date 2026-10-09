@@ -481,6 +481,54 @@ class S3Test(S3BaseTest):
 			max_wal_size = 4GB
 		""")
 
+	def test_s3_blocks_written_past_checkpoint_256(self):
+		"""
+		Blocks written by checkpoint 256 and later are read back from their
+		own checkpoint's objects once evicted.  The checkpoint number was read
+		back from the extent offset with an 8-bit mask, so such a block was
+		looked for under the number modulo 256: the S3 worker failed on the
+		missing object over and over, and whoever needed the block waited for
+		it forever.
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('1MB')
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION IF NOT EXISTS orioledb;
+			CREATE TABLE o_test (
+				id int PRIMARY KEY,
+				value text NOT NULL
+			) USING orioledb;
+			INSERT INTO o_test SELECT id, repeat('a', 300)
+				FROM generate_series(1, 20000) id;
+		""")
+		con = node.connect(autocommit=True)
+		# A broken read hangs: fail instead
+		con.execute("SET statement_timeout = '120s';")
+		for _ in range(260):
+			con.execute("CHECKPOINT;")
+		con.execute("UPDATE o_test SET value = repeat('b', 300);")
+		con.execute("CHECKPOINT;")
+		for _ in range(60):
+			if self.get_data_size() <= 2 * 1024 * 1024:
+				break
+			time.sleep(1)
+		self.assertEqual([(20000, 20000)],
+		                 con.execute("""
+			SELECT count(*), count(*) FILTER (WHERE value = repeat('b', 300))
+			FROM o_test;
+		"""))
+		con.close()
+		node.stop(['-m', 'immediate'])
+
+		node.start()
+		self.assertEqual([(20000, )],
+		                 node.execute("""
+			SET statement_timeout = '120s';
+			SELECT count(*) FROM o_test WHERE value = repeat('b', 300);
+		"""))
+		node.stop()
+
 	def load_tables_after_checkpoint(self, tables, rows):
 		node = self.node
 		node.safe_psql("CREATE EXTENSION IF NOT EXISTS orioledb;")

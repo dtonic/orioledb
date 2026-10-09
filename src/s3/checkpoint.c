@@ -242,6 +242,13 @@ s3_perform_backup(int flags, S3TaskLocation maxLocation)
 
 	backup_started_in_recovery = RecoveryInProgress();
 
+	if (chkpNum > S3_CHKP_NUM_MAX - 4096)
+		ereport(WARNING,
+				(errmsg("checkpoint number %u is close to the S3 mode limit of %u",
+						chkpNum, (uint32) S3_CHKP_NUM_MAX),
+				 errdetail("Past the limit the server stops: the number of the checkpoint that wrote a block is part of the name it is read back from."),
+				 errhint("Move the data to a new instance with a new bucket before the limit is reached.")));
+
 	total_checksum_failures = 0;
 
 	s3_headers_sync();

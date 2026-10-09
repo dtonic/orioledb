@@ -460,9 +460,17 @@ StaticAssertDecl(sizeof(OrioleDBPageHeader) == sizeof(OrioleDBOndiskPageHeader),
 		O_PAGE_HEADER(page)->pageChangeCount++;
 #define O_PAGE_GET_CHANGE_COUNT(p) (O_PAGE_HEADER(p)->pageChangeCount)
 
-#define S3_OFFSET_MASK		(0x00FFFFFFFF)
-#define S3_CHKP_NUM_MASK	(0xFF00000000)
+/*
+ * In S3 mode the 48-bit offset of a file extent holds the block offset in its
+ * low 32 bits and, in the 16 bits above, the number of the checkpoint whose
+ * data file holds the block.  The number is part of the object name the block
+ * is read back from, so a checkpoint number past S3_CHKP_NUM_MAX cannot be
+ * written (see s3_extent_offset()).
+ */
+#define S3_OFFSET_MASK		(UINT64CONST(0x00FFFFFFFF))
+#define S3_CHKP_NUM_MASK	(UINT64CONST(0xFFFF00000000))
 #define S3_CHKP_NUM_SHIFT	(32)
+#define S3_CHKP_NUM_MAX		(UINT64CONST(0xFFFF))
 #define S3_GET_CHKP_NUM(offset) (((offset) & S3_CHKP_NUM_MASK) >> S3_CHKP_NUM_SHIFT)
 
 #define InvalidFileExtentLen (0)

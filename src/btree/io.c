@@ -1163,6 +1163,24 @@ get_free_disk_offset(BTreeDescr *desc)
 }
 
 /*
+ * The extent offset of a block at `offset` in the data file of checkpoint
+ * `chkpNum`, in S3 mode.  A checkpoint number that does not fit would be
+ * truncated and the block later read from another checkpoint's object, so
+ * stop here instead.
+ */
+static uint64
+s3_extent_offset(uint32 chkpNum, uint64 offset)
+{
+	if (chkpNum > S3_CHKP_NUM_MAX)
+		ereport(PANIC,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("checkpoint number %u is past the S3 mode limit of %u",
+						chkpNum, (uint32) S3_CHKP_NUM_MAX)));
+	Assert((offset & ~S3_OFFSET_MASK) == 0);
+	return offset | ((uint64) chkpNum << S3_CHKP_NUM_SHIFT);
+}
+
+/*
  * Fills free file extent for B-tree.
  *
  * FileExtentIsValid(extent) == false if fails.
@@ -1188,7 +1206,7 @@ get_free_disk_extent(BTreeDescr *desc, uint32 chkpNum,
 			s3_headers_increase_loaded_parts(1);
 		}
 
-		extent->off |= (uint64) chkpNum << S3_CHKP_NUM_SHIFT;
+		extent->off = s3_extent_offset(chkpNum, extent->off);
 
 		return FileExtentIsValid(*extent);
 	}
@@ -2427,7 +2445,7 @@ perform_page_io_build(BTreeDescr *desc, Page img,
 				s3_header_mark_part_loaded(tag, index);
 		}
 
-		extent->off |= (uint64) chkpNum << S3_CHKP_NUM_SHIFT;
+		extent->off = s3_extent_offset(chkpNum, extent->off);
 	}
 
 	Assert(FileExtentIsValid(*extent));
