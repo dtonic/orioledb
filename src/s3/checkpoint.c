@@ -301,6 +301,17 @@ s3_perform_backup(int flags, S3TaskLocation maxLocation)
 	location = flush_small_files(&state);
 	maxLocation = Max(maxLocation, location);
 
+	/*
+	 * Write out the checksums still buffered.  The buffer is flushed only when
+	 * it is full, so without this the last entries are missing from the
+	 * checksum file: an unchanged file among them is neither uploaded with
+	 * this checkpoint nor recorded as unchanged, and a restore from this
+	 * checkpoint loses it.
+	 */
+	if (state.checksumState->fileChecksumsLen > 0)
+		flushS3ChecksumState(state.checksumState,
+							 SMALL_FILE_CHECKSUMS_TMP_FILENAME);
+
 	freeS3ChecksumState(state.checksumState);
 	list_free_deep(state.tablespaces);
 	pfree(tablespaceMapData.data);

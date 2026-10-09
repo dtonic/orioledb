@@ -4,6 +4,7 @@ import time
 import re
 import shutil
 import signal
+import struct
 from tempfile import mkstemp
 
 from unittest.mock import patch
@@ -682,6 +683,85 @@ class S3Test(S3BaseTest):
 			                 new_node.execute("SELECT * FROM o_test_2"))
 			new_node.stop()
 			new_node.cleanup()
+
+	def s3_conf(self):
+		return f"""
+			orioledb.s3_mode = true
+			orioledb.s3_host = '{self.host}:{self.port}/{self.bucket_name}'
+			orioledb.s3_region = '{self.region}'
+			orioledb.s3_accesskey = '{self.access_key_id}'
+			orioledb.s3_secretkey = '{self.secret_access_key}'
+			orioledb.s3_cainfo = '{self.s3_cainfo}'
+			orioledb.s3_num_workers = 3
+
+			archive_mode = on
+			archive_library = 'orioledb'
+		"""
+
+	def wait_for_object(self, key, timeout=60):
+		# list_objects returns the response, never [], so test for Contents
+		deadline = time.time() + timeout
+		while "Contents" not in self.client.list_objects(
+		    Bucket=self.bucket_name, Prefix=key):
+			self.assertLess(time.time(), deadline, f"{key} never arrived")
+			time.sleep(0.1)
+
+	def s3_object(self, key):
+		return self.client.get_object(Bucket=self.bucket_name,
+		                              Key=key)["Body"].read()
+
+	def test_s3_small_file_checksums_list_every_file(self):
+		"""Every small file a checkpoint uploads is listed in that checkpoint's
+		small_file_checksums.  The entries used to be written out only in full
+		batches, so the last ones of each checkpoint were lost: an unchanged
+		file that fell among them was neither uploaded with the checkpoint nor
+		recorded as unchanged, and a data directory loaded from it lacked the
+		file (PG_VERSION, global/*)."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test_1 (val_1 int) USING orioledb;
+			INSERT INTO o_test_1 SELECT * FROM generate_series(1, 5);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		node.safe_psql("CREATE TABLE test_2 (val_1 int) USING heap;")
+		node.safe_psql("CHECKPOINT;")
+		chkp_nums = sorted({
+		    int(x["Key"].split('/')[1])
+		    for x in self.client.list_objects(Bucket=self.bucket_name,
+		                                      Prefix='data/').get(
+		                                          "Contents", [])
+		    if re.match(r'data/\d+/orioledb_data/small_file_checksums$',
+		                x["Key"])
+		})
+		self.assertGreaterEqual(len(chkp_nums), 2)
+		for chkp_num in chkp_nums:
+			listed = set(
+			    re.findall(
+			        r'^FILE: (.+), CHECKSUM: \w+, CHECKPOINT: \d+$',
+			        self.s3_object(
+			            f"data/{chkp_num}/orioledb_data/small_file_checksums").
+			        decode(), re.MULTILINE))
+			bundled = set()
+			i = 0
+			while True:
+				try:
+					data = self.s3_object(
+					    f"data/{chkp_num}/orioledb_data/small_files_{i}")
+				except self.client.exceptions.NoSuchKey:
+					break
+				for j in range(struct.unpack('i', data[0:4])[0]):
+					(name_offset, _, _) = struct.unpack(
+					    'iii', data[4 + j * 12:16 + j * 12])
+					bundled.add(data[name_offset:data.find(b'\0', name_offset
+					                                         )].decode())
+				i += 1
+			self.assertTrue(bundled, f"checkpoint {chkp_num} uploaded no small files")
+			self.assertEqual(set(), bundled - listed,
+			                 f"checkpoint {chkp_num}")
+		node.stop()
 
 	@s3_test_attrs(
 	    http=True,
