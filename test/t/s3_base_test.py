@@ -244,7 +244,7 @@ class OrioledbS3Loader:
 		self._prefix = prefix
 		self._verify = verify
 
-	def download(self, path, verbose=False):
+	def download(self, path, verbose=False, checkpoint_only=False):
 		dir_path = os.path.dirname(os.path.realpath(__file__))
 		old_argv = sys.argv
 		sys.argv = [f"{dir_path}/../../orioledb_s3_loader.py"]
@@ -256,6 +256,8 @@ class OrioledbS3Loader:
 		sys.argv += ["-d", path]
 		if verbose:
 			sys.argv += ["--verbose"]
+		if checkpoint_only:
+			sys.argv += ["--checkpoint-only"]
 		runpy.run_path(sys.argv[0], None, "__main__")
 		sys.argv = old_argv
 

@@ -763,6 +763,132 @@ class S3Test(S3BaseTest):
 			                 f"checkpoint {chkp_num}")
 		node.stop()
 
+	def test_s3_data_dir_load_retained_undo(self):
+		"""A checkpoint taken while a transaction holds undo across more than
+		one undo file keeps that range, and the loader has to fetch it: the
+		row undo files the control file names, under the data directory.  The
+		loader read the range from stale control file offsets, asked for
+		object names the server no longer writes, left out the last file and
+		wrote the rest relative to the current directory."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf(f"""
+			orioledb.recovery_pool_size = 1
+			orioledb.recovery_idx_pool_size = 1
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (
+				id int PRIMARY KEY,
+				pad text
+			) USING orioledb;
+			INSERT INTO o_test SELECT g, repeat('a', 300)
+				FROM generate_series(1, 200000) g;
+		""")
+		# An open writing transaction keeps every undo record written after
+		# it in the range the checkpoint retains.
+		con = node.connect()
+		con.begin()
+		con.execute("INSERT INTO o_test VALUES (-1, 'uncommitted');")
+		for ch in "bcd":
+			node.safe_psql(
+			    f"UPDATE o_test SET pad = repeat('{ch}', 300) WHERE id > 0;")
+		node.safe_psql("CHECKPOINT;")
+		# The checkpoint's REDO segment has to be in the archive
+		redo = node.execute("SELECT pg_walfile_name(pg_current_wal_lsn());")[0][0]
+		node.safe_psql("SELECT pg_switch_wal();")
+		self.wait_for_object(f'wal/{redo}', timeout=600)
+		retained = sorted(
+		    f for f in os.listdir(os.path.join(node.data_dir, "orioledb_undo"))
+		    if f.endswith("row"))
+		self.assertGreater(len(retained), 1)
+		# An immediate stop: no shutdown checkpoint to release the range
+		node.stop(['-m', 'immediate'])
+		con.close()
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			loaded = sorted(
+			    f for f in os.listdir(
+			        os.path.join(new_node.data_dir, "orioledb_undo"))
+			    if f.endswith("row"))
+			self.assertGreater(len(loaded), 1)
+			for f in loaded:
+				self.assertEqual(
+				    self.s3_object(f"orioledb_undo/{f}"),
+				    open(os.path.join(new_node.data_dir, "orioledb_undo", f),
+				         'rb').read())
+			new_node.append_conf(port=new_node.port)
+
+			new_node.start()
+			self.assertEqual([(200000, 1)],
+			                 new_node.execute(
+			                     "SELECT count(*), count(DISTINCT pad) FROM o_test"))
+			self.assertEqual([(0, )],
+			                 new_node.execute(
+			                     "SELECT count(*) FROM o_test WHERE id = -1"))
+			self.assertEqual([('d' * 300, )],
+			                 new_node.execute(
+			                     "SELECT pad FROM o_test WHERE id = 1"))
+			new_node.stop()
+			new_node.cleanup()
+
+	def load_after_archived_commits(self, checkpoint_only):
+		"""Commit three rows after the last checkpoint, each in a WAL segment
+		that gets archived, lose the node, and return the rows of a node loaded
+		from the bucket.  Each restore runs on its own bucket: a loaded node
+		writes its own checkpoints and WAL to the bucket it was loaded from."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf(f"""
+			orioledb.recovery_pool_size = 1
+			orioledb.recovery_idx_pool_size = 1
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test_1 (
+				val_1 int PRIMARY KEY
+			) USING orioledb;
+			INSERT INTO o_test_1 SELECT * FROM generate_series(1, 5);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		archived = []
+		for i in range(3):
+			node.safe_psql(f"INSERT INTO o_test_1 VALUES ({10 + i});")
+			archived.append(
+			    node.execute("SELECT pg_walfile_name(pg_current_wal_lsn());")
+			    [0][0])
+			node.safe_psql("SELECT pg_switch_wal();")
+		for wal_file in archived:
+			self.wait_for_object(f'wal/{wal_file}')
+		# An immediate stop: no shutdown checkpoint
+		node.stop(['-m', 'immediate'])
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir,
+			                     checkpoint_only=checkpoint_only)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			rows = new_node.execute("SELECT * FROM o_test_1 ORDER BY 1")
+			new_node.stop()
+			new_node.cleanup()
+		return rows
+
+	def test_s3_data_dir_load_replays_archived_wal(self):
+		"""Commits made after the last checkpoint are back when their WAL was
+		archived: the loader fetches the archived segments that follow the
+		checkpoint's REDO segment, and the server replays them."""
+		self.assertEqual([(x, ) for x in [1, 2, 3, 4, 5, 10, 11, 12]],
+		                 self.load_after_archived_commits(False))
+
+	def test_s3_data_dir_load_checkpoint_only(self):
+		"""With --checkpoint-only the loaded node holds the state of the last
+		checkpoint."""
+		self.assertEqual([(x, ) for x in [1, 2, 3, 4, 5]],
+		                 self.load_after_archived_commits(True))
+
 	@s3_test_attrs(
 	    http=True,
 	    prefix=f'{S3BaseTest.bucket_name}/{S3BaseTest.optional_prefix}')

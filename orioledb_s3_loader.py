@@ -49,6 +49,12 @@ class OrioledbS3ObjectLoader:
 		                    dest='cert_file',
 		                    help="Path to crt file")
 		parser.add_argument(
+		    '--checkpoint-only',
+		    dest='checkpoint_only',
+		    action='store_true',
+		    help="Restore the state of the last checkpoint only: fetch its "
+		    "REDO WAL segment, not the archived segments after it")
+		parser.add_argument(
 		    '--verbose',
 		    dest='verbose',
 		    action='store_true',
@@ -112,6 +118,7 @@ class OrioledbS3ObjectLoader:
 		self.bucket_name = bucket_name
 		self.prefix = prefix
 		self.verbose = args.verbose
+		self.checkpoint_only = args.checkpoint_only
 		self.s3 = s3_client
 
 	def run(self):
@@ -141,24 +148,56 @@ class OrioledbS3ObjectLoader:
 		orioledb_control = get_orioledb_control_data(self.data_dir)
 		self.download_undo(orioledb_control['undoRegularStartLocation'],
 		                   orioledb_control['undoRegularEndLocation'],
-		                   "orioledb_data/%02X%08Xdata")
+		                   "orioledb_undo/%02X%08Xrow")
 		self.download_undo(orioledb_control['undoSystemStartLocation'],
 		                   orioledb_control['undoSystemEndLocation'],
-		                   "orioledb_data/%02X%08Xsystem")
+		                   "orioledb_undo/%02X%08Xsystem")
+		self.download_wal(control)
+
+	def download_wal(self, control):
+		"""
+		Fetch the checkpoint's REDO segment and, unless --checkpoint-only is
+		given, every archived segment that follows it on its timeline without
+		a gap.  The server then replays up to the end of the archive at startup,
+		not only to the checkpoint, and writes its next WAL past the last
+		archived segment instead of over it.
+		"""
 		wal_file = control["Latest checkpoint's REDO WAL file"]
-		local_path = os.path.join(self.data_dir, f"pg_wal/{wal_file}")
-		wal_file = os.path.join(self.prefix, f"wal/{wal_file}")
-		self.download_file(self.bucket_name, wal_file, local_path)
+		segment_size = int(control["Bytes per WAL segment"])
+		segments_per_id = 0x100000000 // segment_size
+		timeline = int(wal_file[0:8], 16)
+		log = int(wal_file[8:16], 16)
+		segment = int(wal_file[16:24], 16)
+		archived = None
+		while True:
+			local_path = os.path.join(self.data_dir, f"pg_wal/{wal_file}")
+			self.download_file(self.bucket_name,
+			                   os.path.join(self.prefix, f"wal/{wal_file}"),
+			                   local_path)
+			if self.checkpoint_only:
+				break
+			if archived is None:
+				archived = set(
+				    os.path.basename(key)
+				    for key in self.list_objects(self.bucket_name, 'wal/'))
+			segment += 1
+			if segment == segments_per_id:
+				log += 1
+				segment = 0
+			wal_file = f"{timeline:08X}{log:08X}{segment:08X}"
+			if wal_file not in archived:
+				break
 
 	def download_undo(self, startLocation, endLocation, template):
 		UNDO_FILE_SIZE = 0x4000000
 		if startLocation >= endLocation:
 			return
 		for fileNum in range(startLocation // UNDO_FILE_SIZE,
-		                     (endLocation - 1) // UNDO_FILE_SIZE):
+		                     (endLocation - 1) // UNDO_FILE_SIZE + 1):
 			fileName = template % (fileNum >> 32, fileNum & 0xFFFFFFFF)
-			fileName = os.path.join(self.prefix, fileName)
-			loader.download_file(self.bucket_name, fileName, fileName)
+			loader.download_file(self.bucket_name,
+			                     os.path.join(self.prefix, fileName),
+			                     os.path.join(self.data_dir, fileName))
 
 	def last_checkpoint_number(self, bucket_name):
 		paginator = self.s3.get_paginator('list_objects_v2')
@@ -544,11 +583,12 @@ def get_orioledb_control_data(data_dir: str):
 	"""
 
 	f = open(f"{data_dir}/orioledb_data/control", 'rb')
-	data = f.read(8 * 13)
+	data = f.read(8 * 15)
+	# CheckpointControl.undoInfo[i].checkpointRetain{Start,End}Location
 	(undoRegularStartLocation,
-	 undoRegularEndLocation) = struct.unpack('QQ', data[8 * 8:8 * 10])
+	 undoRegularEndLocation) = struct.unpack('QQ', data[8 * 10:8 * 12])
 	(undoSystemStartLocation,
-	 undoSystemEndLocation) = struct.unpack('QQ', data[8 * 11:8 * 13])
+	 undoSystemEndLocation) = struct.unpack('QQ', data[8 * 13:8 * 15])
 	f.close()
 
 	dict = {
