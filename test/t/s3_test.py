@@ -1095,11 +1095,18 @@ class S3Test(S3BaseTest):
 			new_node.cleanup()
 
 	def test_s3_chunks_are_removed_under_load(self):
-		"""Chunks go once archived while commits keep coming, and the
-		instance restarts over the chunks its previous run left."""
+		"""Chunks go once archived while commits keep coming and checkpoints
+		recycle the archived segments (an archived segment the checkpoint
+		removed has no archive status file left to say so), and the instance
+		restarts over the chunks its previous run left."""
 		node = self.node
 		node.append_conf(self.s3_conf())
-		node.append_conf("synchronous_standby_names = 's3'")
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			wal_keep_size = 0
+			min_wal_size = 32MB
+			max_wal_size = 64MB
+		""")
 		node.start()
 		node.safe_psql("""
 			CREATE EXTENSION orioledb;
@@ -1118,7 +1125,10 @@ class S3Test(S3BaseTest):
 			deadline = time.time() + 80
 			removed = False
 			while time.time() < deadline and not removed:
+				# a checkpoint recycles archived segments, and their
+				# archive status files go with them
 				node.safe_psql("SELECT pg_switch_wal();")
+				node.safe_psql("CHECKPOINT;")
 				time.sleep(2)
 				count = len(self.chunk_keys())
 				removed = peak > 50 and count < peak / 2

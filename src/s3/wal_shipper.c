@@ -770,6 +770,11 @@ segments_reach_bucket(void)
 		strcmp(XLogArchiveLibrary, "orioledb") == 0;
 }
 
+/*
+ * Whether the segment holding lsn is in the archive.  A checkpoint removes
+ * or recycles a segment, and its archive status file with it, only once it
+ * is archived: a segment removed already is.
+ */
 static bool
 segment_archived(TimeLineID tli, XLogRecPtr lsn)
 {
@@ -779,6 +784,8 @@ segment_archived(TimeLineID tli, XLogRecPtr lsn)
 	XLogSegNo	segno;
 
 	XLByteToSeg(lsn, segno, wal_segment_size);
+	if (segno <= XLogGetLastRemovedSegno())
+		return true;
 	XLogFileName(xlogfname, tli, segno, wal_segment_size);
 	snprintf(path, sizeof(path), XLOGDIR "/archive_status/%s.done", xlogfname);
 	return stat(path, &st) == 0;
