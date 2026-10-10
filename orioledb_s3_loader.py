@@ -483,7 +483,13 @@ class OrioledbS3ObjectLoader:
 		with open(path, 'rb') as f:
 			data = f.read()
 		xmin, xmax = struct.unpack('<QQ', data[:16])
-		items = data[16:]
+		if xmin == XIDMAP_RANGE_ENCODED:
+			if xmax != 1:
+				raise Exception(f"{path} has an unknown format {xmax}")
+			xmin, xmax = struct.unpack('<QQ', data[16:32])
+			items = decode_xidmap_items(data[32:], xmax - xmin, path)
+		else:
+			items = data[16:]
 		item_size = 16
 		file_size = 0x1000000
 		if len(items) != (xmax - xmin) * item_size:
@@ -1094,6 +1100,35 @@ class ReaderPin:
 		self.remove()
 
 
+XIDMAP_RANGE_ENCODED = 2**64 - 1
+
+
+def decode_xidmap_items(data, count, path):
+	"""The xidmap items of a range file: per item the differences of its csn
+	and its commit LSN from the item before, as zigzag varints."""
+	out = bytearray(count * 16)
+	values = [0, 0]
+	pos = 0
+	n = len(data)
+	for i in range(count * 2):
+		zz = 0
+		shift = 0
+		while True:
+			if pos >= n:
+				raise Exception(f"{path} ends before its {count} items")
+			b = data[pos]
+			pos += 1
+			zz |= (b & 0x7F) << shift
+			if b < 0x80:
+				break
+			shift += 7
+		d = (zz >> 1) ^ -(zz & 1)
+		v = (values[i & 1] + d) & 0xFFFFFFFFFFFFFFFF
+		values[i & 1] = v
+		struct.pack_into('<Q', out, i * 8, v)
+	if pos != n:
+		raise Exception(f"{path} goes on past its {count} items")
+	return bytes(out)
 
 
 def parse_root_body(text):
