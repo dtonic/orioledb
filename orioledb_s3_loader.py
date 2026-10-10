@@ -812,7 +812,11 @@ class OrioledbS3ObjectLoader:
 			if end <= lo or start >= hi:
 				continue
 			if pos is None:
-				pos = max(start, lo)
+				# the chunks of a timeline follow one another from its first
+				# one on, and none that reaches into a segment not archived
+				# yet is removed: a later one is the first here only when the
+				# one before it is missing
+				pos = lo if seq != 0 else max(start, lo)
 			if start > pos:
 				# a chunk missing between two that are there: the WAL
 				# after it was acknowledged and is not here; ending the

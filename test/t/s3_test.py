@@ -2041,6 +2041,15 @@ class S3Test(S3BaseTest):
 		acknowledged and is not in the bucket: restoring the segment up to the
 		gap would end recovery there and leave the rest out without a word.
 		Recovery stops instead."""
+		self.gap_in_the_chunks(lambda keys, ranges, seg_start: keys[len(keys) // 2])
+
+	def test_s3_restore_refuses_a_gap_at_a_segment_start(self):
+		"""The chunk that a segment starts in missing is a gap too: the
+		segment is not assembled from the next chunk on."""
+		self.gap_in_the_chunks(lambda keys, ranges, seg_start: next(
+		    k for k in keys if ranges[k][0] <= seg_start < ranges[k][1]))
+
+	def gap_in_the_chunks(self, pick):
 		node = self.node
 		node.append_conf(self.s3_conf())
 		node.append_conf("synchronous_standby_names = 's3'")
@@ -2050,16 +2059,27 @@ class S3Test(S3BaseTest):
 			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
 		""")
 		node.safe_psql("CHECKPOINT;")
-		before = set(self.chunk_keys())
+		# the commits go to the next segment: the load takes the
+		# checkpoint's own, and recovery meets the gap
+		node.safe_psql("SELECT pg_switch_wal();")
 		for i in range(1, 11):
 			node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+		lsn = node.execute("SELECT pg_current_wal_lsn() - '0/0'")[0][0]
+		seg_size = int(node.execute("SHOW wal_segment_size")[0][0][:-2]) * 1024 * 1024
+		seg_start = int(lsn) // seg_size * seg_size
 		node.stop(['-m', 'immediate'])
-		# one of the chunks the commits after the checkpoint went to
-		keys = sorted(k for k in self.chunk_keys()
-		              if k.startswith('wal/00000001/') and k not in before)
+		ranges = {}
+		for k in self.chunk_keys():
+			if k.startswith('wal/00000001/chunks/'):
+				head = self.client.get_object(Bucket=self.bucket_name,
+				                              Key=k)['Body'].read()[:32]
+				_, _, _, start, end = struct.unpack('<IIQQQ', head)
+				if end > seg_start:
+					ranges[k] = (start, end)
+		keys = sorted(ranges, key=lambda k: ranges[k][0])
 		self.assertGreater(len(keys), 4)
 		self.client.delete_object(Bucket=self.bucket_name,
-		                          Key=keys[len(keys) // 2])
+		                          Key=pick(keys, ranges, seg_start))
 		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
 			self.loader.download(new_node.data_dir)
 			new_node.append_conf(port=new_node.port)
