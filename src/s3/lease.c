@@ -1598,6 +1598,7 @@ s3_lease_worker_main(Datum main_arg)
 	/* a reader holds no lease: it keeps its pin from expiring */
 	while (orioledb_s3_reader && !ShutdownRequestPending)
 	{
+		s3_take_config_reload();
 		s3_reader_pin_renew();
 		MemoryContextReset(cxt);
 		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
@@ -1607,7 +1608,10 @@ s3_lease_worker_main(Datum main_arg)
 
 	while (!ShutdownRequestPending)
 	{
-		TimestampTz now = GetCurrentTimestamp();
+		TimestampTz now;
+
+		s3_take_config_reload();
+		now = GetCurrentTimestamp();
 
 		LWLockAcquire(&lease->lock, LW_EXCLUSIVE);
 		if (!renewed ||

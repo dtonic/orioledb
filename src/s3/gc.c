@@ -1572,8 +1572,10 @@ s3_gc_worker_main(Datum main_arg)
 
 	while (!ShutdownRequestPending)
 	{
-		MemoryContext old = MemoryContextSwitchTo(cxt);
+		MemoryContext old;
 
+		s3_take_config_reload();
+		old = MemoryContextSwitchTo(cxt);
 		(void) s3_gc_cycle();
 		MemoryContextSwitchTo(old);
 		MemoryContextReset(cxt);

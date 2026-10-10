@@ -1192,6 +1192,7 @@ s3worker_main(Datum main_arg)
 
 			if (ShutdownRequestPending)
 				break;
+			s3_take_config_reload();
 
 			/*
 			 * Sleep until we are signaled or it's time to check the queue.

@@ -49,6 +49,7 @@ extern void s3_delete_object(char *objectname);
 extern bool s3_object_exists(char *objectname);
 extern void (*s3_request_wait_hook) (void);
 extern int	s3_auth_retry_time;
+extern void s3_take_config_reload(void);
 extern void s3_check_bucket_versioning(void);
 extern void s3_delete_objects(char **objectnames, int count);
 extern List *s3_list_objects(const char *prefix, const char *startAfter);

@@ -269,13 +269,14 @@ void		(*s3_request_wait_hook) (void) = NULL;
 int			s3_auth_retry_time = 300;
 
 /*
- * A process that is not a client backend takes a configuration reload while
- * it waits to retry: new credentials reach the S3 workers, the WAL shipper
- * and the checkpointer this way.  A client backend takes it between commands,
- * as always.
+ * A process that is not a client backend takes a pending configuration
+ * reload here: the S3 workers, the lease and GC workers and the WAL shipper
+ * call it in their loops, and every process while a request waits to be
+ * retried, so new credentials reach the checkpointer too.  A client backend
+ * takes it between commands, as always.
  */
-static void
-request_reload_config(void)
+void
+s3_take_config_reload(void)
 {
 	if (ConfigReloadPending && MyBackendType != B_BACKEND)
 	{
@@ -307,7 +308,7 @@ s3_request_backoff(int attempt, long http_code)
 							 slice, PG_WAIT_EXTENSION);
 			ResetLatch(MyLatch);
 			CHECK_FOR_INTERRUPTS();
-			request_reload_config();
+			s3_take_config_reload();
 			delay -= slice;
 			if (s3_request_wait_hook)
 				s3_request_wait_hook();

@@ -1389,6 +1389,7 @@ walk:
 		bool		replyNow = false;
 
 		CHECK_FOR_INTERRUPTS();
+		s3_take_config_reload();
 
 		len = walrcv_receive(conn, &buf, &wait_fd);
 		if (len < 0)

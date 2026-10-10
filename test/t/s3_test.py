@@ -1115,7 +1115,10 @@ class S3Test(S3BaseTest):
 		taken by every process, and what waited goes on."""
 		node = self.node
 		node.append_conf(self.s3_conf())
-		node.append_conf("synchronous_standby_names = 's3'")
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_lease_duration = 15
+		""")
 		node.start()
 		node.safe_psql("""
 			CREATE EXTENSION orioledb;
@@ -1138,6 +1141,11 @@ class S3Test(S3BaseTest):
 			node.reload()
 			commit.join(60)
 			self.assertTrue(done)
+			# no checkpoint renews the lease meanwhile: its own worker does,
+			# with the new key
+			time.sleep(20)
+			with open(node.pg_log_file) as f:
+				self.assertNotIn("lost the S3 writer lease", f.read())
 			node.safe_psql("CHECKPOINT;")
 			self.assertGreater(revoked.accepted, 0)
 		self.assertEqual([(11, )], node.execute("SELECT count(*) FROM o_test"))
