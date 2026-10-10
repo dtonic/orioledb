@@ -2459,6 +2459,55 @@ class S3Test(S3BaseTest):
 		Recovery stops instead."""
 		self.gap_in_the_chunks(lambda keys, ranges, seg_start: keys[len(keys) // 2])
 
+	def test_s3_restore_command_that_cannot_run_stops_recovery(self):
+		"""A restore_command that cannot run at all (no interpreter, no
+		module, a wrong path) answers PostgreSQL with a code that reads as
+		"no such file", and recovery would end the WAL there, without the
+		commits in the bucket after it.  The restore_command the loader
+		writes turns every failure other than its own "not there" into a
+		stop."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		node.safe_psql("SELECT pg_switch_wal();")
+		for i in range(1, 11):
+			node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+		node.stop(['-m', 'immediate'])
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			auto = os.path.join(new_node.data_dir, 'postgresql.auto.conf')
+			with open(auto) as f:
+				conf = f.read()
+			self.assertIn('orioledb_s3_loader.py', conf)
+			with open(auto, 'w') as f:
+				f.write(conf.replace('orioledb_s3_loader.py', 'no_such_loader.py'))
+			try:
+				new_node.start()
+			except StartNodeException:
+				pass
+			deadline = time.time() + 60
+			while True:
+				with open(new_node.pg_log_file) as f:
+					log = f.read()
+				if "could not restore file" in log:
+					break
+				self.assertLess(time.time(), deadline)
+				time.sleep(0.5)
+			self.assertNotIn("database system is ready to accept connections",
+			                 log)
+			try:
+				new_node.stop(['-m', 'immediate'])
+			except Exception:
+				pass
+			new_node.cleanup()
+
 	def test_s3_restore_refuses_a_gap_at_a_segment_start(self):
 		"""The chunk that a segment starts in missing is a gap too: the
 		segment is not assembled from the next chunk on."""

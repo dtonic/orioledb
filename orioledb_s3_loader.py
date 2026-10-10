@@ -394,7 +394,12 @@ class OrioledbS3ObjectLoader:
 			cmd += ['--segment-size', str(segment_size),
 			        '--resolved-endpoint', endpoint, '--resolved-bucket', bucket,
 			        '--resolved-prefix', prefix, '--resolved-style', style]
-			command = ' '.join(shlex.quote(x) for x in cmd) + ' --restore %f %p'
+			# only an answer of this script says a file is not there: one
+			# that cannot run at all (no interpreter, no module) stops
+			# recovery instead of ending the WAL where it is
+			command = (' '.join(shlex.quote(x) for x in cmd) +
+			           ' --restore %f %p; rc=$?; [ $rc -eq 0 ] && exit 0; '
+			           f'[ $rc -eq {RESTORE_NOT_FOUND} ] && exit 1; exit 128')
 		if not self.local_wal:
 			# the writer's terminator check: recovery reads the bucket
 			open(os.path.join(self.data_dir, 'orioledb_data',
@@ -876,9 +881,11 @@ class OrioledbS3ObjectLoader:
 		return seg
 
 	def restore(self, fname, path):
-		"""restore_command: 0 when FILE is put at PATH, 1 when the bucket
-		does not have it, and above 125 when it cannot tell: PostgreSQL then
-		stops recovery rather than take the file as the end of the WAL."""
+		"""restore_command: 0 when FILE is put at PATH, RESTORE_NOT_FOUND when
+		the bucket does not have it, and above 125 when it cannot tell:
+		PostgreSQL then stops recovery rather than take the file as the end
+		of the WAL.  The restore_command this script writes turns
+		RESTORE_NOT_FOUND into 1 and any other failure into 128."""
 		try:
 			return self.restore_file(fname, path)
 		except Exception as e:
@@ -895,7 +902,7 @@ class OrioledbS3ObjectLoader:
 		else:
 			data = None
 		if data is None:
-			return 1
+			return RESTORE_NOT_FOUND
 		with open(path, 'wb') as f:
 			f.write(data)
 		return 0
@@ -1101,6 +1108,10 @@ class ReaderPin:
 
 
 XIDMAP_RANGE_ENCODED = 2**64 - 1
+
+# --restore's answer for a file the bucket does not have (below 126, so a
+# restore_command that calls it directly reads it as "not there" too)
+RESTORE_NOT_FOUND = 99
 
 
 def decode_xidmap_items(data, count, path):
