@@ -93,6 +93,13 @@ class OrioledbS3ObjectLoader:
 		    help="restore_command to write instead of this script's own "
 		    "--restore (as the server would run it)")
 		parser.add_argument(
+		    '--repair-root',
+		    dest='repair_root',
+		    action='store_true',
+		    help="Put root back when the bucket's is missing or cannot be "
+		    "read: from the copy the latest checkpoint whose manifest is "
+		    "there left under roots/.  With the writer stopped")
+		parser.add_argument(
 		    '--sweep',
 		    dest='sweep',
 		    action='store_true',
@@ -214,9 +221,11 @@ class OrioledbS3ObjectLoader:
 		self.cert_file = args.cert_file
 		self.raw_prefix = args.prefix
 		self.sweep = args.sweep
+		self.repair = args.repair_root
 		self.local_wal = args.local_wal
 		self.restore_command = args.restore_command
-		if args.restore is None and args.data_dir is None and not args.sweep:
+		if args.restore is None and args.data_dir is None and \
+		    not args.sweep and not args.repair_root:
 			raise Exception("-d/--data-dir is required")
 		self.s3 = s3_client
 
@@ -225,6 +234,8 @@ class OrioledbS3ObjectLoader:
 			raise SystemExit(self.restore(*self.restore_args))
 		if self.sweep:
 			return self.sweep_orphans()
+		if self.repair:
+			return self.repair_root()
 		if self.keep_parts:
 			self.clear_keeping_parts()
 		root = self.read_root(self.bucket_name)
@@ -523,6 +534,37 @@ class OrioledbS3ObjectLoader:
 		with open(path, 'wb') as f:
 			f.write(data)
 
+	def repair_root(self):
+		"""Put root back from the newest copy under roots/ whose
+		checkpoint's manifest is in the bucket; a root that reads is left
+		alone."""
+		try:
+			root = self.read_root(self.bucket_name)
+			if root is not None and 'checkpoint' in root and \
+			    'token' in root and 'bucket' in root:
+				print("root reads: nothing to repair")
+				return
+		except (ValueError, UnicodeDecodeError):
+			pass
+		copies = []
+		for key in self.list_objects(self.bucket_name, 'roots/'):
+			name = key.rsplit('/', 1)[-1]
+			if name.isdigit():
+				copies.append((int(name), key))
+		for chkp, key in sorted(copies, reverse=True):
+			body = self.s3.get_object(Bucket=self.bucket_name,
+			                          Key=key)['Body'].read()
+			self.epochs = parse_root_body(body.decode())['epochs']
+			if self.read_object(
+			    f"manifests/{self.token_of(chkp)}-{chkp}") is None:
+				continue
+			self.s3.put_object(Bucket=self.bucket_name,
+			                   Key=os.path.join(self.prefix, 'root'),
+			                   Body=body)
+			print(f"root put back from {key}")
+			return
+		raise Exception("No copy of root has its manifest in the bucket")
+
 	def read_root(self, bucket_name):
 		"""The bucket's root object as a dict, or None when it has none."""
 		try:
@@ -532,15 +574,7 @@ class OrioledbS3ObjectLoader:
 			if e.response['Error']['Code'] in ("404", "NoSuchKey"):
 				return None
 			raise
-		root = {'epochs': []}
-		for line in obj['Body'].read().decode().splitlines():
-			key, _, value = line.partition(' ')
-			if key == 'epoch':
-				first, token = value.split(' ')
-				root['epochs'].append((int(first), int(token)))
-			else:
-				root[key] = value
-		return root
+		return parse_root_body(obj['Body'].read().decode())
 
 	def token_of(self, chkp_num):
 		"""The writer token that wrote checkpoint chkp_num."""
@@ -1058,6 +1092,20 @@ class ReaderPin:
 		self.stop.set()
 		self.thread.join()
 		self.remove()
+
+
+
+
+def parse_root_body(text):
+	root = {'epochs': []}
+	for line in text.splitlines():
+		key, _, value = line.partition(' ')
+		if key == 'epoch':
+			first, token = value.split(' ')
+			root['epochs'].append((int(first), int(token)))
+		else:
+			root[key] = value
+	return root
 
 
 def end_after_record(seg, pos, block_size):

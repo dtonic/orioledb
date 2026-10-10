@@ -1311,6 +1311,21 @@ _PG_init(void)
 							NULL,
 							NULL);
 
+	DefineCustomIntVariable("orioledb.s3_auth_retry_time",
+							"How long an S3 request refused as unauthorized is retried",
+							"New credentials take effect on a configuration reload; "
+							"a refusal within this long is taken for keys being "
+							"rotated.  0 fails at once.",
+							&s3_auth_retry_time,
+							300,
+							0,
+							INT_MAX / 1000,
+							PGC_SIGHUP,
+							GUC_UNIT_S,
+							NULL,
+							NULL,
+							NULL);
+
 	DefineCustomIntVariable("orioledb.s3_gc_keep_time",
 							"How long the S3 GC keeps committed checkpoints restorable",
 							"It keeps what this or orioledb.s3_gc_keep_checkpoints "
@@ -1441,7 +1456,7 @@ _PG_init(void)
 							   NULL,
 							   &s3_accesskey,
 							   NULL,
-							   PGC_POSTMASTER,
+							   PGC_SIGHUP,
 							   0,
 							   NULL,
 							   NULL,
@@ -1452,7 +1467,7 @@ _PG_init(void)
 							   NULL,
 							   &s3_secretkey,
 							   NULL,
-							   PGC_POSTMASTER,
+							   PGC_SIGHUP,
 							   0,
 							   NULL,
 							   NULL,

@@ -22,7 +22,8 @@ from testgres.exceptions import StartNodeException, QueryException
 
 from .base_test import wait_checkpointer_stopevent
 from .s3_base_test import S3BaseTest, s3_test_attrs, mock_put_object, \
- mock_put_object_conflict, mock_moto_unkown_error, FlakyPutObject
+ mock_put_object_conflict, mock_moto_unkown_error, FlakyPutObject, \
+ RevokedKeyPut, AmbiguousPut
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
@@ -1103,6 +1104,129 @@ class S3Test(S3BaseTest):
 			new_node.stop()
 			new_node.cleanup()
 
+	def test_s3_keys_rotate_on_a_reload(self):
+		"""Once the store refuses the old key, requests are retried for
+		orioledb.s3_auth_retry_time; new keys set meanwhile and reloaded are
+		taken by every process, and what waited goes on."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		revoked = RevokedKeyPut(self.access_key_id)
+		with patch('moto.s3.responses.S3Response.put_object',
+		           new=lambda response: revoked(response)):
+			done = []
+			commit = Thread(target=lambda: done.append(
+			    node.safe_psql("INSERT INTO o_test VALUES (11);")))
+			commit.start()
+			deadline = time.time() + 60
+			while revoked.refused < 2 and time.time() < deadline:
+				time.sleep(0.2)
+			self.assertGreaterEqual(revoked.refused, 2)
+			self.assertFalse(done)
+			node.append_conf(f"orioledb.s3_accesskey = '{self.access_key_id}NEW'")
+			node.reload()
+			commit.join(60)
+			self.assertTrue(done)
+			node.safe_psql("CHECKPOINT;")
+			self.assertGreater(revoked.accepted, 0)
+		self.assertEqual([(11, )], node.execute("SELECT count(*) FROM o_test"))
+		node.stop()
+
+	def test_s3_a_refused_key_fails_with_no_retry_time(self):
+		"""With orioledb.s3_auth_retry_time = 0 a refusal is the answer."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_auth_retry_time = 0
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+		""")
+		revoked = RevokedKeyPut(self.access_key_id)
+		with patch('moto.s3.responses.S3Response.put_object',
+		           new=lambda response: revoked(response)):
+			with self.assertRaises(Exception):
+				node.safe_psql("CHECKPOINT;")
+		with open(node.pg_log_file) as f:
+			self.assertIn("http code = 403", f.read())
+		node.stop(['-m', 'immediate'])
+
+	def test_s3_status(self):
+		"""orioledb_s3_status() says where the writer and the bucket stand,
+		from shared memory."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_gc_interval = 1
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		node.safe_psql("CHECKPOINT;")
+		node.safe_psql("CHECKPOINT;")
+		row = node.execute("""
+			SELECT role, token, lease_remaining > 0, root_checkpoint,
+			       wal_ship_lag, wal_shipper_running, unsealed_parts
+			FROM orioledb_s3_status();
+		""")[0]
+		self.assertEqual(('writer', int(self.kv('root')['token']), True,
+		                  int(self.kv('root')['checkpoint']), 0, True, 0), row)
+		deadline = time.time() + 30
+		while node.execute("SELECT gc_retain FROM orioledb_s3_status()")[0][0] == 0:
+			self.assertLess(time.time(), deadline)
+			time.sleep(0.5)
+		node.stop()
+
+	def test_s3_a_damaged_root_is_put_back(self):
+		"""Each commit leaves a copy of root under roots/; a damaged root is
+		put back from the newest copy whose manifest is there, and the
+		writer goes on from it.  A root that reads is left alone."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		node.safe_psql("INSERT INTO o_test SELECT generate_series(11, 20);")
+		node.safe_psql("CHECKPOINT;")
+		node.stop()
+		good = self.client.get_object(Bucket=self.bucket_name,
+		                              Key='root')['Body'].read()
+		chkp = int(self.kv('root')['checkpoint'])
+		self.wait_for_object(f'roots/{chkp}')
+		self.loader.download(None, repair_root=True)
+		self.assertEqual(good, self.client.get_object(
+		    Bucket=self.bucket_name, Key='root')['Body'].read())
+
+		self.client.put_object(Bucket=self.bucket_name, Key='root',
+		                       Body=b'\x00garbage')
+		with self.assertRaises(StartNodeException):
+			node.start()
+		self.loader.download(None, repair_root=True)
+		self.assertEqual(chkp, int(self.kv('root')['checkpoint']))
+		node.start()
+		self.assertEqual([(20, )], node.execute("SELECT count(*) FROM o_test"))
+		node.safe_psql("CHECKPOINT;")
+		self.assertGreater(int(self.kv('root')['checkpoint']), chkp)
+		node.stop()
+
 	def test_s3_chunks_are_removed_once_archived(self):
 		"""A chunk is removed once an archived segment holds its WAL; a
 		restore takes the segments and the chunks after them."""
@@ -1471,6 +1595,44 @@ class S3Test(S3BaseTest):
 		self.assertEqual([(30000, 90000)],
 		                 node.execute("SELECT count(*), sum(v) FROM o_test"))
 		node.stop()
+
+	def test_s3_gc_prunes_writer_epochs(self):
+		"""Every run that commits a checkpoint adds an epoch to root.  The GC
+		drops the ones no retained checkpoint names an object under, so the
+		table stays small however often the instance restarts."""
+		node = self.gc_world()
+
+		def epochs():
+			body = self.client.get_object(Bucket=self.bucket_name,
+			                              Key='root')['Body'].read().decode()
+			return [l for l in body.splitlines() if l.startswith('epoch ')]
+
+		for v in range(1, 7):
+			node.safe_psql(f"UPDATE o_test SET v = {v};")
+			node.safe_psql("CHECKPOINT;")
+			node.stop(['-m', 'immediate'])
+			node.start()
+		node.safe_psql("UPDATE o_test SET v = 7;")
+		node.safe_psql("CHECKPOINT;")
+		grown = len(epochs())
+		deadline = time.time() + 60
+		while time.time() < deadline and len(epochs()) >= grown:
+			node.safe_psql("CHECKPOINT;")
+			time.sleep(1)
+		self.assertLess(len(epochs()), grown)
+		self.assertEqual([(30000, 210000)],
+		                 node.execute("SELECT count(*), sum(v) FROM o_test"))
+		node.stop()
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.append_conf("orioledb.main_buffers = 8MB")
+			new_node.start()
+			self.assertEqual([(30000, 210000)],
+			                 new_node.execute("SELECT count(*), sum(v) FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
 
 	def test_s3_gc_spares_a_reader_pin(self):
 		"""A reader's pin keeps the GC below the checkpoint it opened."""

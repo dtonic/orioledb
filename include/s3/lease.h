@@ -13,6 +13,9 @@
 #ifndef __S3_LEASE_H__
 #define __S3_LEASE_H__
 
+/* the copy of root a checkpoint's commit leaves */
+#define ROOT_COPY_FORMAT	"roots/%u"
+
 #include "access/xlogdefs.h"
 #include "datatype/timestamp.h"
 
@@ -30,6 +33,7 @@ extern PGDLLEXPORT void s3_lease_worker_main(Datum main_arg);
 
 extern uint64 s3_lease_token(void);
 extern uint32 s3_lease_root_checkpoint(void);
+extern void s3_lease_prune_epochs(uint32 from, const uint32 *refs, int nrefs);
 extern void s3_gc_publish(uint32 retain, uint32 folded, uint32 collected,
 						  uint32 pinFloor, uint32 pinWarn);
 extern bool s3_gc_progress(uint32 *retain, uint32 *folded, uint32 *collected);

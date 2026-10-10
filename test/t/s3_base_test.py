@@ -89,6 +89,61 @@ class TransientServerError(S3ClientError):
 		                 **kwargs)
 
 
+class AccessDenied(S3ClientError):
+	code = 403
+
+	def __init__(self, **kwargs: Any):
+		super().__init__("AccessDenied", "Access Denied", **kwargs)
+
+
+class RevokedKeyPut:
+	"""
+	A put_object() that refuses (403) requests signed with a revoked access
+	key, as a store does once a rotated key is withdrawn, and stores the
+	others.
+	"""
+
+	def __init__(self, revoked):
+		self.revoked = revoked
+		self.refused = 0
+		self.accepted = 0
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		if f"Credential={self.revoked}/" in response.headers.get(
+		    "Authorization", ""):
+			self.refused += 1
+			raise AccessDenied()
+		self.accepted += 1
+		return orig_put_object(response)
+
+
+class AmbiguousPut:
+	"""
+	A put_object() that stores every `every`-th request for each kind of key
+	in `contains` and then answers it 503, as when the answer to a PUT that
+	went through is lost: the client cannot tell it from one that did not.
+	"""
+
+	def __init__(self, every=3, contains=('root', 'writer', '/chunks/',
+	                                      '/parts/', 'manifests/')):
+		self.every = every
+		self.contains = contains
+		self.seen = {c: 0 for c in contains}
+		self.landed = {c: 0 for c in contains}
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		key = response.parse_key_name()
+		kind = next((c for c in self.contains
+		             if (key == c if '/' not in c else c in key)), None)
+		if kind is not None:
+			self.seen[kind] += 1
+			if self.seen[kind] % self.every == 0:
+				orig_put_object(response)
+				self.landed[kind] += 1
+				raise TransientServerError()
+		return orig_put_object(response)
+
+
 class FlakyPutObject:
 	"""
 	A put_object() that answers the first `failures` requests for a part
@@ -279,7 +334,7 @@ class OrioledbS3Loader:
 		self._verify = verify
 
 	def download(self, path, verbose=False, checkpoint_only=False, as_of=None,
-	             keep_parts=False, local_wal=False):
+	             keep_parts=False, local_wal=False, repair_root=False):
 		dir_path = os.path.dirname(os.path.realpath(__file__))
 		old_argv = sys.argv
 		sys.argv = [f"{dir_path}/../../orioledb_s3_loader.py"]
@@ -302,7 +357,7 @@ class OrioledbS3Loader:
 		if path is None:
 			sys.argv.remove("-d")
 			sys.argv.remove(None)
-			sys.argv += ["--sweep"]
+			sys.argv += ["--repair-root" if repair_root else "--sweep"]
 		runpy.run_path(sys.argv[0], None, "__main__")
 		sys.argv = old_argv
 

@@ -936,6 +936,45 @@ collect_checkpoint(S3Manifest *m, S3Manifest *r, HTAB *dropped, HTAB *deleted)
 
 static void delete_chunks_below(TimeLineID tli, XLogRecPtr below);
 
+/*
+ * The checkpoints whose objects m refers to: a PG file, a bundle, an undo
+ * file or a tree's map uploaded then.  Their keys carry the token of that
+ * checkpoint's run, so its epoch stays (s3_lease_prune_epochs()).
+ */
+static void
+prune_epochs_for(S3Manifest *m)
+{
+	HASH_SEQ_STATUS seq;
+	S3ManifestRef *ref;
+	S3ManifestBundles *b;
+	S3ManifestTree *t;
+	HTAB	   *refs[] = {m->files, m->small, m->undo};
+	List	   *chkps = NIL;
+	uint32	   *arr;
+	int			n = 0;
+	ListCell   *lc;
+
+	for (int i = 0; i < lengthof(refs); i++)
+	{
+		hash_seq_init(&seq, refs[i]);
+		while ((ref = hash_seq_search(&seq)) != NULL)
+			chkps = list_append_unique_int(chkps, (int) ref->chkp);
+	}
+	hash_seq_init(&seq, m->bundles);
+	while ((b = hash_seq_search(&seq)) != NULL)
+		chkps = list_append_unique_int(chkps, (int) b->chkp);
+	hash_seq_init(&seq, m->trees);
+	while ((t = hash_seq_search(&seq)) != NULL)
+		if (t->map != 0)
+			chkps = list_append_unique_int(chkps, (int) t->map);
+	arr = palloc(sizeof(uint32) * Max(1, list_length(chkps)));
+	foreach(lc, chkps)
+		arr[n++] = (uint32) lfirst_int(lc);
+	s3_lease_prune_epochs(m->checkpoint, arr, n);
+	pfree(arr);
+	list_free(chkps);
+}
+
 static void
 delete_wal(S3Manifest *from, S3Manifest *to)
 {
@@ -1429,9 +1468,16 @@ s3_gc_cycle(void)
 					gc_delete(key);
 					pfree(key);
 				}
+				{
+					char	   *key = psprintf(ROOT_COPY_FORMAT, k);
+
+					gc_delete(key);
+					pfree(key);
+				}
 			}
 			gc_flush();
 			collected = rk;
+			prune_epochs_for(rm);
 			s3_gc_publish(retain, folded, collected, pinFloor, pinWarn);
 			hash_destroy(dropped);
 			hash_destroy(deleted);
@@ -1518,6 +1564,7 @@ s3_gc_worker_main(Datum main_arg)
 	MemoryContext cxt;
 
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	BackgroundWorkerUnblockSignals();
 
 	cxt = AllocSetContextCreate(TopMemoryContext, "orioledb s3 gc",

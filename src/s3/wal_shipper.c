@@ -1160,6 +1160,17 @@ s3_wal_shipper_wait(XLogRecPtr lsn)
 	return reached;
 }
 
+/*
+ * Where the WAL in the bucket ends as this run's shipper put it, and whether
+ * the shipper is streaming.
+ */
+void
+s3_wal_shipper_state(XLogRecPtr *flushed, bool *running)
+{
+	*flushed = pg_atomic_read_u64(&shipper->flushedLsn);
+	*running = pg_atomic_read_u32(&shipper->running) != 0;
+}
+
 static void
 set_flushed(XLogRecPtr lsn)
 {
@@ -1190,6 +1201,7 @@ s3_wal_shipper_main(Datum main_arg)
 	bool		leaseChecked = false;
 
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	BackgroundWorkerUnblockSignals();
 	/* shared catalogs only: the bootstrap superuser's name */
 	BackgroundWorkerInitializeConnection(NULL, NULL, 0);

@@ -25,8 +25,10 @@
 
 #include "common/base64.h"
 #include "miscadmin.h"
+#include "postmaster/interrupt.h"
 #include "storage/latch.h"
 #include "lib/stringinfo.h"
+#include "utils/guc.h"
 #include "utils/wait_event.h"
 
 #include "curl/curl.h"
@@ -264,6 +266,24 @@ s3_request_is_transient(int sc, long http_code)
  */
 void		(*s3_request_wait_hook) (void) = NULL;
 
+int			s3_auth_retry_time = 300;
+
+/*
+ * A process that is not a client backend takes a configuration reload while
+ * it waits to retry: new credentials reach the S3 workers, the WAL shipper
+ * and the checkpointer this way.  A client backend takes it between commands,
+ * as always.
+ */
+static void
+request_reload_config(void)
+{
+	if (ConfigReloadPending && MyBackendType != B_BACKEND)
+	{
+		ConfigReloadPending = false;
+		ProcessConfigFile(PGC_SIGHUP);
+	}
+}
+
 static void
 s3_request_backoff(int attempt, long http_code)
 {
@@ -287,6 +307,7 @@ s3_request_backoff(int attempt, long http_code)
 							 slice, PG_WAIT_EXTENSION);
 			ResetLatch(MyLatch);
 			CHECK_FOR_INTERRUPTS();
+			request_reload_config();
 			delay -= slice;
 			if (s3_request_wait_hook)
 				s3_request_wait_hook();
@@ -358,6 +379,7 @@ s3_request(const char *method, char *objectname,
 	long		http_code = 0;
 	int			sc = 0;
 	int			attempt;
+	TimestampTz authSince = 0;
 
 	if (dataChecksum == NULL)
 	{
@@ -498,8 +520,24 @@ s3_request(const char *method, char *objectname,
 		 * A body the store received cut short (BadDigest, IncompleteBody) was
 		 * damaged on the way and refused: send it again.
 		 */
+		/*
+		 * Refused as unauthorized: the keys may be being rotated (the new
+		 * ones arrive with a configuration reload), or the store's view of
+		 * them is catching up.  Retried for orioledb.s3_auth_retry_time from
+		 * the first refusal, then the refusal is the answer.
+		 */
+		if (http_code == 403 && sc == 0)
+		{
+			if (authSince == 0)
+				authSince = GetCurrentTimestamp();
+		}
+		else
+			authSince = 0;
 		if (!retry || !IsUnderPostmaster || request_deadline_passed() ||
 			!(s3_request_is_transient(sc, http_code) ||
+			  (authSince != 0 && s3_auth_retry_time > 0 &&
+			   !TimestampDifferenceExceeds(authSince, GetCurrentTimestamp(),
+										   s3_auth_retry_time * 1000)) ||
 			  (http_code == 400 && body->data &&
 			   (strstr(body->data, "<Code>BadDigest</Code>") != NULL ||
 				strstr(body->data, "<Code>IncompleteBody</Code>") != NULL))))

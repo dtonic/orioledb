@@ -1158,6 +1158,7 @@ s3worker_main(Datum main_arg)
 
 	/* catch SIGTERM signal for reason to not interrupt background writing */
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	BackgroundWorkerUnblockSignals();
 
 	elog(LOG, "orioledb s3 worker %d started", worker_num);

@@ -35,12 +35,17 @@
 #include "orioledb.h"
 
 #include "checkpoint/control.h"
+#include "utils/seq_buf.h"	/* s3/headers.h needs it */
 #include "s3/control.h"
+#include "s3/headers.h"
 #include "s3/lease.h"
 #include "s3/requests.h"
 #include "s3/wal_shipper.h"
 
+#include "access/htup_details.h"
+#include "access/xlog.h"
 #include "common/controldata_utils.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/bgworker.h"
@@ -49,8 +54,12 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
+#include "utils/builtins.h"
 #include "utils/memutils.h"
+#include "utils/pg_lsn.h"
 #include "utils/timestamp.h"
+
+PG_FUNCTION_INFO_V1(orioledb_s3_status);
 
 #define WRITER_KEY				"writer"
 #define ROOT_KEY				"root"
@@ -123,6 +132,7 @@ typedef struct
 	RootBody	root;
 	char		rootEtag[S3_ETAG_LEN];
 	int			numEpochs;
+	uint32		gcPublished[3];	/* retain, folded, collected */
 	S3Epoch		epochs[S3_MAX_EPOCHS];
 } S3LeaseState;
 
@@ -578,6 +588,45 @@ start_epoch(S3LeaseState *state, uint32 localCheckpoint, uint64 token)
 	state->epochs[state->numEpochs].firstCheckpoint = first;
 	state->epochs[state->numEpochs].token = token;
 	state->numEpochs++;
+}
+
+/*
+ * The GC: the checkpoints from `from` on are retained, and of the ones
+ * before only refs[] have objects a retained checkpoint refers to.  The other
+ * epochs are no longer needed to name an object: they go, so the table does
+ * not grow with every run for ever.  A map of checkpoint c may carry the
+ * token of the run after c's (a build names it so), so that epoch stays too.
+ */
+void
+s3_lease_prune_epochs(uint32 from, const uint32 *refs, int nrefs)
+{
+	bool		keep[S3_MAX_EPOCHS];
+	int			n = 0;
+
+	LWLockAcquire(&lease->lock, LW_EXCLUSIVE);
+	for (int i = 0; i < lease->numEpochs; i++)
+		keep[i] = i + 1 == lease->numEpochs ||
+			lease->epochs[i + 1].firstCheckpoint > from;
+	for (int r = 0; r < nrefs; r++)
+	{
+		int			i = lease->numEpochs - 1;
+
+		while (i >= 0 && lease->epochs[i].firstCheckpoint > refs[r])
+			i--;
+		if (i >= 0)
+			keep[i] = true;
+		if (i + 1 < lease->numEpochs)
+			keep[i + 1] = true;
+	}
+	for (int i = 0; i < lease->numEpochs; i++)
+		if (keep[i])
+			lease->epochs[n++] = lease->epochs[i];
+	if (n < lease->numEpochs)
+	{
+		lease->numEpochs = n;
+		write_epochs_file(lease);
+	}
+	LWLockRelease(&lease->lock);
 }
 
 /*
@@ -1189,6 +1238,23 @@ s3_root_commit(uint32 checkpointNum, XLogRecPtr redoLsn,
 	lease->root = r;
 	LWLockRelease(&lease->lock);
 
+	/*
+	 * A copy under the checkpoint's number: root is a single object, and a
+	 * root lost or damaged is put back from the last copy whose manifest is
+	 * there (orioledb_s3_loader.py --repair-root).  The GC removes the
+	 * copies with the manifests.
+	 */
+	{
+		char	   *key = psprintf(ROOT_COPY_FORMAT, checkpointNum);
+
+		if (s3_put_object_conditional(key, body.data, body.len, NULL, false,
+									  NULL) != S3_RESPONSE_OK)
+			ereport(WARNING,
+					(errmsg("could not put a copy of \"%s\" to S3 as \"%s\"",
+							ROOT_KEY, key)));
+		pfree(key);
+	}
+
 	elog(DEBUG1, "S3 root now points at checkpoint %u", checkpointNum);
 	pfree(body.data);
 	pfree(current.data);
@@ -1220,6 +1286,12 @@ s3_gc_publish(uint32 retain, uint32 folded, uint32 collected,
 	StringInfoData body;
 
 	StringInfoData current;
+
+	LWLockAcquire(&lease->lock, LW_EXCLUSIVE);
+	lease->gcPublished[0] = retain;
+	lease->gcPublished[1] = folded;
+	lease->gcPublished[2] = collected;
+	LWLockRelease(&lease->lock);
 
 	initStringInfo(&body);
 	appendStringInfo(&body, "format %d\nretain %u\nfolded %u\ncollected %u\n"
@@ -1516,6 +1588,7 @@ s3_lease_worker_main(Datum main_arg)
 	bool		renewed = false;
 
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	BackgroundWorkerUnblockSignals();
 
 	cxt = AllocSetContextCreate(TopMemoryContext, "orioledb s3 lease",
@@ -1553,4 +1626,62 @@ s3_lease_worker_main(Datum main_arg)
 		ResetLatch(MyLatch);
 	}
 	proc_exit(0);
+}
+
+/*
+ * One row about this instance and the bucket, from shared memory alone (no
+ * request is made): for monitoring.
+ */
+Datum
+orioledb_s3_status(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[12];
+	bool		nulls[12] = {0};
+	XLogRecPtr	flush = GetFlushRecPtr(NULL);
+	XLogRecPtr	shipped;
+	bool		running;
+	uint64		token;
+	TimestampTz deadline;
+	uint32		root;
+	uint32		gc[3];
+
+	if (!orioledb_s3_mode)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("orioledb.s3_mode is off")));
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	LWLockAcquire(&lease->lock, LW_SHARED);
+	token = lease->token;
+	deadline = lease->deadline;
+	root = lease->root.checkpoint;
+	memcpy(gc, lease->gcPublished, sizeof(gc));
+	LWLockRelease(&lease->lock);
+	s3_wal_shipper_state(&shipped, &running);
+
+	values[0] = CStringGetTextDatum(orioledb_s3_reader ? "reader" : "writer");
+	values[1] = Int64GetDatum((int64) token);
+	if (orioledb_s3_reader || deadline == 0)
+		nulls[2] = true;
+	else
+		values[2] = Float8GetDatum((double) (deadline - GetCurrentTimestamp()) / 1000000.0);
+	values[3] = Int64GetDatum(root);
+	values[4] = LSNGetDatum(flush);
+	if (shipped == InvalidXLogRecPtr)
+	{
+		nulls[5] = nulls[6] = true;
+	}
+	else
+	{
+		values[5] = LSNGetDatum(shipped);
+		values[6] = Int64GetDatum(flush > shipped ? (int64) (flush - shipped) : 0);
+	}
+	values[7] = BoolGetDatum(running);
+	values[8] = Int64GetDatum(gc[0]);
+	values[9] = Int64GetDatum(gc[1]);
+	values[10] = Int64GetDatum(gc[2]);
+	values[11] = Int64GetDatum((int64) s3_headers_unsealed_parts());
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }
