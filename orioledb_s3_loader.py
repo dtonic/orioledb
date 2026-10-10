@@ -5,6 +5,7 @@ import boto3
 import os
 import re
 import struct
+import sys
 import testgres
 
 from botocore.config import Config
@@ -12,7 +13,6 @@ from botocore.exceptions import ClientError, ParamValidationError
 from concurrent.futures import ThreadPoolExecutor
 from boto3.s3.transfer import TransferConfig
 from threading import Event
-from typing import Callable, Dict, Optional
 from urllib.parse import urlparse
 
 
@@ -36,7 +36,6 @@ class OrioledbS3ObjectLoader:
 		parser.add_argument('-d',
 		                    '--data-dir',
 		                    dest='data_dir',
-		                    required=True,
 		                    help="Destination data directory")
 		parser.add_argument(
 		    '--prefix',
@@ -55,6 +54,66 @@ class OrioledbS3ObjectLoader:
 		    help="Restore the state of the last checkpoint only: fetch its "
 		    "REDO WAL segment, not the archived segments after it")
 		parser.add_argument(
+		    '--as-of',
+		    dest='as_of',
+		    type=int,
+		    default=None,
+		    help="Restore a checkpoint the bucket still retains instead of "
+		    "the last one committed; implies --checkpoint-only, and the data "
+		    "directory starts only as a reader")
+		parser.add_argument(
+		    '--keep-parts',
+		    dest='keep_parts',
+		    action='store_true',
+		    help="Load into an existing data directory (a reader to make the "
+		    "writer) keeping the tree parts it has: they are copies of "
+		    "objects that never change")
+		parser.add_argument(
+		    '--restore',
+		    dest='restore',
+		    nargs=2,
+		    metavar=('FILE', 'PATH'),
+		    help="restore_command mode: put WAL file FILE (%%f) from the "
+		    "bucket at PATH (%%p): an archived segment, a segment assembled "
+		    "from chunks, or a timeline history")
+		parser.add_argument(
+		    '--local-wal',
+		    dest='local_wal',
+		    action='store_true',
+		    help="Put every WAL segment the bucket has in pg_wal instead of "
+		    "having restore_command read the bucket: for a server whose "
+		    "environment cannot run this script.  A reader then does not "
+		    "follow the writer")
+		parser.add_argument(
+		    '--restore-command',
+		    dest='restore_command',
+		    default=None,
+		    help="restore_command to write instead of this script's own "
+		    "--restore (as the server would run it)")
+		parser.add_argument(
+		    '--sweep',
+		    dest='sweep',
+		    action='store_true',
+		    help="Remove what the GC could not know of: objects of "
+		    "checkpoints it has collected that the oldest retained "
+		    "checkpoint does not refer to (a crash before a manifest, a "
+		    "build rolled back).  Prints the keys; --verbose for each")
+		# what --restore is given so it does not probe the bucket again
+		parser.add_argument('--resolved-endpoint', dest='resolved_endpoint',
+		                    help=argparse.SUPPRESS)
+		parser.add_argument('--resolved-bucket', dest='resolved_bucket',
+		                    help=argparse.SUPPRESS)
+		parser.add_argument('--resolved-prefix', dest='resolved_prefix',
+		                    default='', help=argparse.SUPPRESS)
+		parser.add_argument('--resolved-style', dest='resolved_style',
+		                    help=argparse.SUPPRESS)
+		parser.add_argument(
+		    '--segment-size',
+		    dest='segment_size',
+		    type=int,
+		    default=16 * 1024 * 1024,
+		    help="WAL segment size for --restore")
+		parser.add_argument(
 		    '--verbose',
 		    dest='verbose',
 		    action='store_true',
@@ -71,6 +130,24 @@ class OrioledbS3ObjectLoader:
 			verify = args.cert_file
 		else:
 			verify = None
+
+		if args.restore and 'AWS_ACCESS_KEY_ID' not in os.environ:
+			# restore_command runs in the data directory with the server's
+			# environment: take the credentials the server uses
+			for key, value in server_s3_settings('.').items():
+				os.environ.setdefault(key, value)
+
+		if args.resolved_bucket:
+			self.resolved = (args.resolved_endpoint, args.resolved_bucket,
+			                 args.resolved_prefix, args.resolved_style)
+			s3_client = boto3.client(
+			    "s3",
+			    endpoint_url=args.resolved_endpoint,
+			    verify=verify,
+			    config=Config(s3={'addressing_style': args.resolved_style}))
+			self.finish_args(args, s3_client, args.resolved_bucket,
+			                 args.resolved_prefix)
+			return
 
 		parsed_url = urlparse(args.endpoint)
 		bucket = parsed_url.netloc.split('.')[0]
@@ -113,140 +190,588 @@ class OrioledbS3ObjectLoader:
 		if not bucket_in_endpoint and not bucket_in_prefix:
 			raise Exception("No valid bucket name in endpoint or prefix")
 
+		if bucket_in_endpoint:
+			self.resolved = (raw_endpoint, bucket_name, prefix, 'virtual')
+		else:
+			self.resolved = (f"{parsed_url.scheme}://{parsed_url.netloc}",
+			                 bucket_name, prefix, 'path')
+		self.finish_args(args, s3_client, bucket_name, prefix)
+
+	def finish_args(self, args, s3_client, bucket_name, prefix):
 		self._error_occurred = Event()
 		self.data_dir = args.data_dir
 		self.bucket_name = bucket_name
 		self.prefix = prefix
 		self.verbose = args.verbose
-		self.checkpoint_only = args.checkpoint_only
+		self.checkpoint_only = args.checkpoint_only or args.as_of is not None
+		self.as_of = args.as_of
+		self.keep_parts = args.keep_parts
+		self.restore_args = args.restore
+		self.segment_size = args.segment_size
+		self.endpoint = args.endpoint
+		self.cert_file = args.cert_file
+		self.raw_prefix = args.prefix
+		self.sweep = args.sweep
+		self.local_wal = args.local_wal
+		self.restore_command = args.restore_command
+		if args.restore is None and args.data_dir is None and not args.sweep:
+			raise Exception("-d/--data-dir is required")
 		self.s3 = s3_client
 
 	def run(self):
-		chkp_num = self.last_checkpoint_number(self.bucket_name)
-		self.download_files_in_directory(self.bucket_name,
-		                                 'data/',
-		                                 chkp_num,
-		                                 self.data_dir,
-		                                 transform=self.transform_pg)
-		self.download_files_in_directory(self.bucket_name,
-		                                 'orioledb_data/',
-		                                 chkp_num,
-		                                 f"{self.data_dir}/orioledb_data",
-		                                 transform=self.transform_orioledb,
-		                                 filter=self.filter_orioledb)
-
-		self.download_unchanged_files(
-		    self.bucket_name, os.path.join("orioledb_data", "file_checksums"),
-		    chkp_num, None)
-
-		self.download_unchanged_small_files(
-		    self.bucket_name,
-		    os.path.join("orioledb_data", "small_file_checksums"), chkp_num,
-		    None)
+		if self.restore_args:
+			raise SystemExit(self.restore(*self.restore_args))
+		if self.sweep:
+			return self.sweep_orphans()
+		if self.keep_parts:
+			self.clear_keeping_parts()
+		root = self.read_root(self.bucket_name)
+		if root is None or int(root['checkpoint']) == 0:
+			raise Exception("The S3 bucket has no committed checkpoint")
+		# root names the last checkpoint committed, and which writer token
+		# wrote each checkpoint: objects a checkpoint writes under its number
+		# carry the token, so what a crashed run left under a number taken
+		# again is never read
+		chkp_num = int(root['checkpoint'])
+		self.epochs = root['epochs']
+		if self.as_of is not None:
+			if self.as_of > chkp_num:
+				raise Exception(f"Checkpoint {self.as_of} is past the last "
+				                f"committed one, {chkp_num}")
+			chkp_num = self.as_of
+		self.chkp_num = chkp_num
+		# the checkpoint's manifest names every object restoring it reads
+		manifest_body = self.read_object(
+		    f"manifests/{self.token_of(chkp_num)}-{chkp_num}")
+		if manifest_body is None:
+			raise Exception(f"The S3 bucket keeps no manifest of checkpoint "
+			                f"{chkp_num}")
+		manifest = parse_manifest(manifest_body.decode())
+		if not manifest['complete']:
+			raise Exception(f"The manifest of checkpoint {chkp_num} is "
+			                "incomplete")
+		self.download_manifest(manifest)
 
 		control = get_control_data(self.data_dir)
-		orioledb_control = get_orioledb_control_data(self.data_dir)
-		self.download_undo(orioledb_control['undoRegularStartLocation'],
-		                   orioledb_control['undoRegularEndLocation'],
-		                   "orioledb_undo/%02X%08Xrow")
-		self.download_undo(orioledb_control['undoSystemStartLocation'],
-		                   orioledb_control['undoSystemEndLocation'],
-		                   "orioledb_undo/%02X%08Xsystem")
 		self.download_wal(control)
+		if not self.checkpoint_only:
+			self.replay_on_start()
+			if self.local_wal:
+				self.download_rest_of_wal(control)
+			self.recover_from_bucket(int(control["Bytes per WAL segment"]))
+		self.write_token_file(root, manifest_body)
+
+	def sweep_orphans(self):
+		"""
+		The GC removes what manifests name.  An object of a checkpoint below
+		`collected` that the manifest of `collected` does not refer to is
+		named by no retained manifest: it is garbage the GC could not see.
+		Parts are left alone: a writer puts over an uncommitted part number.
+		"""
+		root = self.read_root(self.bucket_name)
+		gc = self.read_object('gc')
+		if root is None or gc is None:
+			print("nothing to sweep: no root or no GC progress yet")
+			return
+		self.epochs = root['epochs']
+		fields = dict(
+		    line.split(' ', 1) for line in gc.decode().splitlines() if ' ' in line)
+		collected = int(fields.get('collected', 0))
+		folded = int(fields.get('folded', 0))
+		if collected == 0:
+			print("nothing to sweep: the GC has collected nothing yet")
+			return
+		body = self.read_object(
+		    f"manifests/{self.token_of(collected)}-{collected}")
+		if body is None:
+			print(f"nothing to sweep: no manifest of checkpoint {collected}")
+			return
+		m = parse_manifest(body.decode())
+		removed = 0
+		offset = len(self.prefix.strip('/').split('/')) if self.prefix.strip('/') else 0
+
+		def tok_chk(text):
+			try:
+				token, chk = text.split('-', 1)
+				return int(token), int(chk.split('.', 1)[0])
+			except ValueError:
+				return None
+
+		for key in self.list_objects(self.bucket_name, ''):
+			parts = key.split('/')[offset:]
+			garbage = False
+			if parts[0] == 'manifests' and len(parts) == 2:
+				tc = tok_chk(parts[1])
+				garbage = tc is not None and tc[1] < collected
+			elif parts[0] == 'data' and len(parts) >= 2:
+				tc = tok_chk(parts[1])
+				if tc is not None and tc[1] < collected:
+					path = '/'.join(parts[2:])
+					if path.startswith('orioledb_data/small_files_'):
+						garbage = tc[1] not in m['bundles']
+					else:
+						garbage = m['files'].get(path) != tc[1]
+			elif parts[0] == 'orioledb_undo' and len(parts) == 3:
+				tc = tok_chk(parts[2])
+				garbage = tc is not None and tc[1] < collected and \
+				    m['undo'].get(parts[1]) != tc[1]
+			elif parts[0] == 'trees' and len(parts) == 5 and parts[3] == 'maps':
+				tc = tok_chk(parts[4])
+				garbage = tc is not None and tc[1] < collected and \
+				    m['trees'].get((int(parts[1]), int(parts[2]))) != tc[1]
+			elif parts[0] == 'trees' and len(parts) == 5 and parts[3] == 'dead':
+				tc = tok_chk(parts[4])
+				garbage = tc is not None and tc[1] <= folded
+			if garbage:
+				if self.verbose:
+					print(f"sweep {key}", flush=True)
+				self.s3.delete_object(Bucket=self.bucket_name, Key=key)
+				removed += 1
+		print(f"swept {removed} objects")
+
+	def clear_keeping_parts(self):
+		"""Empty the data directory but for the trees' part files."""
+		tree_file = re.compile(r'^\d+(\.\d+)?$')
+		data = os.path.join(self.data_dir, 'orioledb_data')
+		for top, dirs, files in os.walk(self.data_dir, topdown=False):
+			for name in files:
+				path = os.path.join(top, name)
+				parent = os.path.dirname(path)
+				if os.path.dirname(parent) == data and \
+				    tree_file.match(name) and \
+				    os.path.basename(parent).isdigit():
+					continue
+				os.unlink(path)
+			for name in dirs:
+				path = os.path.join(top, name)
+				if os.path.islink(path):
+					os.unlink(path)
+				elif not os.listdir(path):
+					os.rmdir(path)
+
+	def recover_from_bucket(self, segment_size):
+		"""
+		Start with an archive recovery that reads the bucket: up to the
+		terminator a writer taking over puts, or on and on for a reader
+		(standby.signal).  A writer then opens a new timeline.
+		"""
+		import shlex
+		if self.local_wal:
+			# pg_wal has it all; archive recovery still opens the timeline
+			command = '/bin/false'
+		elif self.restore_command:
+			command = self.restore_command
+		else:
+			cmd = [sys.executable, os.path.abspath(__file__),
+			       '--endpoint', self.endpoint]
+			if self.raw_prefix:
+				cmd += ['--prefix', self.raw_prefix]
+			if self.cert_file:
+				cmd += ['--cert-file', self.cert_file]
+			endpoint, bucket, prefix, style = self.resolved
+			cmd += ['--segment-size', str(segment_size),
+			        '--resolved-endpoint', endpoint, '--resolved-bucket', bucket,
+			        '--resolved-prefix', prefix, '--resolved-style', style]
+			command = ' '.join(shlex.quote(x) for x in cmd) + ' --restore %f %p'
+		if not self.local_wal:
+			# the writer's terminator check: recovery reads the bucket
+			open(os.path.join(self.data_dir, 'orioledb_data',
+			                  's3_restore_bucket'), 'w').close()
+		with open(os.path.join(self.data_dir, 'postgresql.auto.conf'),
+		          'a') as f:
+			f.write("restore_command = '%s'\n" % command.replace("'", "''"))
+			f.write("recovery_target_timeline = 'latest'\n")
+		open(os.path.join(self.data_dir, 'recovery.signal'), 'w').close()
+
+	def read_object(self, key):
+		try:
+			obj = self.s3.get_object(Bucket=self.bucket_name,
+			                         Key=os.path.join(self.prefix, key))
+		except ClientError as e:
+			if e.response['Error']['Code'] in ("404", "NoSuchKey"):
+				return None
+			raise
+		return obj['Body'].read()
+
+	def download_manifest(self, m):
+		"""
+		Every object the manifest of the checkpoint names: the PG files of
+		the checkpoint that last uploaded each, the small files from the
+		bundles that hold them, the undo it retains and the maps it wrote.  A
+		tree whose map is older is fetched by the server when it opens the
+		tree, and parts as they are read.
+		"""
+		k = self.chkp_num
+		jobs = []
+		bundled = {f"orioledb_data/small_files_{i}"
+		           for i in range(m['bundles'].get(k, 0))}
+		for path in m['data']:
+			if path in bundled:
+				continue
+			jobs.append((f"{self.checkpoint_dir(k)}/{path}",
+			             os.path.join(self.data_dir, path)))
+		for path, n in m['files'].items():
+			jobs.append((f"{self.checkpoint_dir(n)}/{path}",
+			             os.path.join(self.data_dir, path)))
+		for name, n in m['undo'].items():
+			jobs.append((f"orioledb_undo/{name}/{self.token_of(n)}-{n}",
+			             os.path.join(self.data_dir, 'orioledb_undo', name)))
+		token = self.token_of(k)
+		for datoid, relnode in m['maps']:
+			jobs.append((f"trees/{datoid}/{relnode}/maps/{token}-{k}",
+			             os.path.join(self.data_dir, "orioledb_data",
+			                          str(datoid), f"{relnode}-{k}.map")))
+		with ThreadPoolExecutor(os.cpu_count()) as executor:
+			futures = [
+			    executor.submit(self.download_file, self.bucket_name,
+			                    os.path.join(self.prefix, key), path)
+			    for key, path in jobs
+			]
+			for future in futures:
+				future.result()
+		if self._error_occurred.is_set():
+			raise Exception("Some objects of the checkpoint could not be "
+			                "downloaded")
+
+		# small files, by the checkpoint whose bundles hold them
+		wanted = {}
+		for path, n in m['small'].items():
+			wanted.setdefault(n, set()).add(path)
+		for n, names in wanted.items():
+			if n not in m['bundles']:
+				raise Exception(f"The manifest does not say how many bundles "
+				                f"checkpoint {n} wrote")
+			for i in range(m['bundles'][n]):
+				data = self.read_object(
+				    f"{self.checkpoint_dir(n)}/orioledb_data/small_files_{i}")
+				if data is None:
+					raise Exception(f"Small file bundle {i} of checkpoint {n} "
+					                "is missing")
+				self.extract_small_files(data, names)
+
+	def replay_on_start(self):
+		"""
+		A checkpoint taken at a clean stop leaves pg_control saying the
+		cluster was shut down, and a server started on it replays no WAL: the
+		commits after that checkpoint, in the archived segments and chunks put
+		here, would be skipped and written over.  Say it was running instead,
+		so the start is a crash recovery from the checkpoint to the end of the
+		WAL.
+		"""
+		DB_SHUTDOWNED, DB_IN_PRODUCTION, STATE_OFFSET = 1, 6, 16
+		path = os.path.join(self.data_dir, 'global', 'pg_control')
+		with open(path, 'rb') as f:
+			data = bytearray(f.read())
+		if struct.unpack_from('<i', data, STATE_OFFSET)[0] != DB_SHUTDOWNED:
+			return
+		# the CRC is the first word that is the CRC of all the bytes before it
+		crc_offset = None
+		for off in range(STATE_OFFSET + 4, 1024, 4):
+			if crc32c(bytes(data[:off])) == struct.unpack_from('<I', data, off)[0]:
+				crc_offset = off
+				break
+		if crc_offset is None:
+			raise Exception("Could not find the checksum of pg_control")
+		struct.pack_into('<i', data, STATE_OFFSET, DB_IN_PRODUCTION)
+		struct.pack_into('<I', data, crc_offset, crc32c(bytes(data[:crc_offset])))
+		with open(path, 'wb') as f:
+			f.write(data)
+
+	def read_root(self, bucket_name):
+		"""The bucket's root object as a dict, or None when it has none."""
+		try:
+			obj = self.s3.get_object(Bucket=bucket_name,
+			                         Key=os.path.join(self.prefix, 'root'))
+		except ClientError as e:
+			if e.response['Error']['Code'] in ("404", "NoSuchKey"):
+				return None
+			raise
+		root = {'epochs': []}
+		for line in obj['Body'].read().decode().splitlines():
+			key, _, value = line.partition(' ')
+			if key == 'epoch':
+				first, token = value.split(' ')
+				root['epochs'].append((int(first), int(token)))
+			else:
+				root[key] = value
+		return root
+
+	def token_of(self, chkp_num):
+		"""The writer token that wrote checkpoint chkp_num."""
+		token = None
+		for first, epoch_token in self.epochs:
+			if first <= chkp_num:
+				token = epoch_token
+		if token is None:
+			raise Exception(f"No writer token is known for checkpoint {chkp_num}")
+		return token
+
+	def checkpoint_dir(self, chkp_num):
+		return f"data/{self.token_of(chkp_num)}-{chkp_num}"
+
+	def extract_small_files(self, data, names):
+		numFiles = struct.unpack('i', data[0:4])[0]
+		for i in range(0, numFiles):
+			(nameOffset, dataOffset,
+			 dataLength) = struct.unpack('iii', data[4 + i * 12:16 + i * 12])
+			name = data[nameOffset:data.find(b'\0', nameOffset)].decode('ascii')
+			if name not in names:
+				continue
+			fullname = os.path.join(self.data_dir, name)
+			self.makedirs(os.path.dirname(fullname), exist_ok=True, mode=0o700)
+			with open(fullname, 'wb') as file:
+				file.write(data[dataOffset:dataOffset + dataLength])
+			os.chmod(fullname, 0o600)
+
+	def write_token_file(self, root, manifest_body):
+		"""Give the loaded data directory the token that wrote root: it starts
+		as the bucket's writer, after that writer's lease has run out."""
+		path = os.path.join(self.data_dir, 'orioledb_data', 's3_token')
+		with open(path, 'w') as f:
+			f.write(f"{root['token']} {root['bucket']}\n")
+		path = os.path.join(self.data_dir, 'orioledb_data', 's3_epochs')
+		with open(path, 'w') as f:
+			for first, token in root['epochs']:
+				f.write(f"{first} {token}\n")
+		# the WAL shipper checks the bucket has nothing past what was loaded
+		open(os.path.join(self.data_dir, 'orioledb_data', 's3_loaded'),
+		     'w').close()
+		# the next checkpoint's manifest carries this one's forward
+		with open(os.path.join(self.data_dir, 'orioledb_data', 's3_manifest'),
+		          'wb') as f:
+			f.write(manifest_body)
+		if self.as_of is not None:
+			# an older state than the bucket's: it may only be read
+			with open(os.path.join(self.data_dir, 'orioledb_data', 's3_as_of'),
+			          'w') as f:
+				f.write(f"{self.as_of}\n")
 
 	def download_wal(self, control):
 		"""
-		Fetch the checkpoint's REDO segment and, unless --checkpoint-only is
-		given, every archived segment that follows it on its timeline without
-		a gap.  The server then replays up to the end of the archive at startup,
-		not only to the checkpoint, and writes its next WAL past the last
-		archived segment instead of over it.
+		Put in pg_wal the WAL from the checkpoint's REDO to its checkpoint
+		record, and the timeline histories; restore_command fetches the rest
+		from the bucket (recover_from_bucket).  Note for the writer where the
+		chunks of the latest timeline end: it puts its terminator there.
 		"""
-		wal_file = control["Latest checkpoint's REDO WAL file"]
-		segment_size = int(control["Bytes per WAL segment"])
-		segments_per_id = 0x100000000 // segment_size
-		timeline = int(wal_file[0:8], 16)
-		log = int(wal_file[8:16], 16)
-		segment = int(wal_file[16:24], 16)
-		archived = None
+		size = int(control["Bytes per WAL segment"])
+		self.segment_size = size
+		redo_file = control["Latest checkpoint's REDO WAL file"]
+		tli = int(redo_file[0:8], 16)
+		redo_seg = self.segno_of_name(redo_file)
+		ckpt_seg = parse_lsn(control["Latest checkpoint location"]) // size
+		self.makedirs(os.path.join(self.data_dir, 'pg_wal'), exist_ok=True,
+		              mode=0o700)
+		for segno in range(redo_seg, ckpt_seg + 1):
+			name = self.segment_name(tli, segno)
+			seg = self.restore_segment(tli, segno)
+			if seg is None:
+				raise Exception(f"The S3 bucket has no WAL segment {name}")
+			self.write_wal(name, seg)
+
+		latest = tli
 		while True:
-			local_path = os.path.join(self.data_dir, f"pg_wal/{wal_file}")
-			self.download_file(self.bucket_name,
-			                   os.path.join(self.prefix, f"wal/{wal_file}"),
-			                   local_path)
-			if self.checkpoint_only:
+			history = self.read_object(f"wal/{latest + 1:08X}.history")
+			if history is None:
 				break
-			if archived is None:
-				archived = set(
-				    os.path.basename(key)
-				    for key in self.list_objects(self.bucket_name, 'wal/'))
-			segment += 1
-			if segment == segments_per_id:
-				log += 1
-				segment = 0
-			wal_file = f"{timeline:08X}{log:08X}{segment:08X}"
-			if wal_file not in archived:
+			latest += 1
+			self.write_wal(f"{latest:08X}.history", history)
+
+		chunks = self.chunks_of(latest)
+		# every key counts for where the chunks end: a terminator too
+		seqs = self.chunk_seqs(latest)
+		end = 0
+		for seq, magic, start, chunk_end in reversed(chunks):
+			if magic == CHUNK_MAGIC:
+				end = chunk_end
 				break
+		# a checkpoint-only load has none of the chunks: a writer started on
+		# it without restore_command is refused
+		next_seq = seqs[-1] + 1 if seqs and not self.checkpoint_only else 0
+		path = os.path.join(self.data_dir, 'orioledb_data', 's3_wal_seq')
+		with open(path, 'w') as f:
+			f.write(f"{latest} {next_seq} {end}\n")
 
-	def download_undo(self, startLocation, endLocation, template):
-		UNDO_FILE_SIZE = 0x4000000
-		if startLocation >= endLocation:
-			return
-		for fileNum in range(startLocation // UNDO_FILE_SIZE,
-		                     (endLocation - 1) // UNDO_FILE_SIZE + 1):
-			fileName = template % (fileNum >> 32, fileNum & 0xFFFFFFFF)
-			loader.download_file(self.bucket_name,
-			                     os.path.join(self.prefix, fileName),
-			                     os.path.join(self.data_dir, fileName))
+	def download_rest_of_wal(self, control):
+		"""Every segment after the checkpoint record the bucket has, on the
+		timeline that covers it."""
+		size = self.segment_size
+		redo_file = control["Latest checkpoint's REDO WAL file"]
+		tli = int(redo_file[0:8], 16)
+		starts = []
+		t = tli
+		while True:
+			start = self.timeline_start(t + 1)
+			if start is None:
+				break
+			t += 1
+			starts.append((t, start[1]))
+		segno = parse_lsn(control["Latest checkpoint location"]) // size + 1
+		while True:
+			use = tli
+			for t, switch in starts:
+				if switch < (segno + 1) * size:
+					use = t
+			seg = self.restore_segment(use, segno)
+			if seg is None:
+				break
+			self.write_wal(self.segment_name(use, segno), seg)
+			segno += 1
 
-	def last_checkpoint_number(self, bucket_name):
-		paginator = self.s3.get_paginator('list_objects_v2')
+	def write_wal(self, name, data):
+		path = os.path.join(self.data_dir, 'pg_wal', name)
+		with open(path, 'wb') as f:
+			f.write(data)
+		os.chmod(path, 0o600)
 
-		numbers = []
-		prefix = os.path.join(self.prefix, 'data/')
-		for page in paginator.paginate(Bucket=bucket_name,
-		                               Prefix=prefix,
-		                               Delimiter='/'):
-			if 'CommonPrefixes' in page:
-				for prefix in page['CommonPrefixes']:
-					prefix_key = prefix['Prefix'].rstrip('/')
-					subdirectory = prefix_key.split('/')[-1]
-					try:
-						number = int(subdirectory)
-						numbers += [number]
-					except ValueError:
-						pass
+	def segment_name(self, tli, segno):
+		per = 0x100000000 // self.segment_size
+		return f"{tli:08X}{segno // per:08X}{segno % per:08X}"
 
-		numbers = sorted(numbers)
+	def segno_of_name(self, name):
+		per = 0x100000000 // self.segment_size
+		return int(name[8:16], 16) * per + int(name[16:24], 16)
 
-		found = False
-		chkp_list_index = len(numbers) - 1
+	def timeline_start(self, tli):
+		"""(parent timeline, switch point) of a timeline, or None for the
+		first one."""
+		if tli <= 1:
+			return None
+		history = self.read_object(f"wal/{tli:08X}.history")
+		if history is None:
+			return None
+		last = None
+		for line in history.decode().splitlines():
+			fields = line.split()
+			if len(fields) >= 2 and fields[0].isdigit():
+				last = (int(fields[0]), parse_lsn(fields[1]))
+		return last
 
-		last_chkp_data_dir = os.path.join(self.prefix, 'data',
-		                                  str(numbers[chkp_list_index]))
+	def chunk_seqs(self, tli):
+		prefix = f"wal/{tli:08X}/chunks/"
+		return sorted(
+		    int(key.rsplit('/', 1)[1])
+		    for key in self.list_objects(self.bucket_name, prefix)
+		    if re.match(r'.*/chunks/\d+$', key))
 
-		while not found and chkp_list_index >= 0:
-			try:
-				self.s3.head_object(
-				    Bucket=bucket_name,
-				    Key=f'{last_chkp_data_dir}/global/pg_control')
-				self.s3.head_object(
-				    Bucket=bucket_name,
-				    Key=f'{last_chkp_data_dir}/orioledb_data/control')
-				found = True
-			except ClientError as e:
-				if e.response['Error']['Code'] == "404":
-					chkp_list_index -= 1
-					if chkp_list_index >= 0:
-						last_chkp_data_dir = os.path.join(
-						    self.prefix, 'data', str(numbers[chkp_list_index]))
-				else:
-					raise
+	def chunk_key(self, tli, seq):
+		return os.path.join(self.prefix, f"wal/{tli:08X}/chunks/{seq:020d}")
 
-		if chkp_list_index < 0:
-			raise Exception("Failed to find valid checkpoint in s3 bucket")
+	def chunk_cache(self, tli):
+		"""Chunks never change once put: their bodies are kept here, so a
+		restore_command called again for the segment the server is at fetches
+		only the new ones."""
+		base = self.data_dir if self.data_dir else '.'
+		# under pg_wal: not a PostgreSQL file the checkpoint backs up
+		path = os.path.join(base, 'pg_wal', 'orioledb_s3_chunks', f"{tli:08X}")
+		os.makedirs(path, mode=0o700, exist_ok=True)
+		return path
 
-		return numbers[chkp_list_index]
+	def chunks_of(self, tli):
+		"""(seq, magic, start, end) of a timeline's chunks in order; the ones
+		not cached yet are fetched in parallel, and cached ones the bucket no
+		longer has are dropped."""
+		seqs = self.chunk_seqs(tli)
+		cache = self.chunk_cache(tli)
+		present = set(seqs)
+		for name in os.listdir(cache):
+			if name.isdigit() and int(name) not in present:
+				os.unlink(os.path.join(cache, name))
+
+		def fetch(seq):
+			path = os.path.join(cache, str(seq))
+			if os.path.exists(path):
+				return
+			body = self.s3.get_object(Bucket=self.bucket_name,
+			                          Key=self.chunk_key(tli, seq))['Body'].read()
+			tmp = f"{path}.tmp{os.getpid()}"
+			with open(tmp, 'wb') as f:
+				f.write(body)
+			os.replace(tmp, path)
+
+		with ThreadPoolExecutor(16) as executor:
+			list(executor.map(fetch, seqs))
+		result = []
+		fence = 0
+		for seq in seqs:
+			with open(os.path.join(cache, str(seq)), 'rb') as f:
+				magic, _, token, start, end = struct.unpack('<IIQQQ', f.read(32))
+			if magic == TERMINATOR_MAGIC:
+				# the writer it fenced off put nothing that counts after it
+				fence = max(fence, token)
+				continue
+			if token < fence:
+				continue
+			result.append((seq, magic, start, end))
+		return result
+
+	def chunk_body(self, tli, seq):
+		with open(os.path.join(self.chunk_cache(tli), str(seq)), 'rb') as f:
+			return f.read()[32:]
+
+	def restore_segment(self, tli, segno):
+		"""
+		Segment segno of a timeline as the bucket has it: the archived one,
+		or one assembled from the chunks, zero padded.  Before a timeline's
+		switch point the segment is its parent's.  Chunks are laid in order;
+		a later chunk wins over what the ones before it put from its start
+		on (a writer that restarted ships again from where its recovery found
+		the WAL to end, over a record cut in half).  A terminator ends the
+		chunks of the writer it fenced off.  None when the bucket has nothing
+		of the segment.
+		"""
+		size = self.segment_size
+		name = self.segment_name(tli, segno)
+		data = self.read_object(f"wal/{name}")
+		if data is not None:
+			return bytearray(data)
+		lo, hi = segno * size, (segno + 1) * size
+		seg = bytearray(size)
+		pos = None
+		start_of = self.timeline_start(tli)
+		if start_of is not None and lo < start_of[1]:
+			parent = self.restore_segment(start_of[0], segno)
+			if parent is None:
+				return None
+			switch = min(start_of[1], hi)
+			seg[0:switch - lo] = parent[0:switch - lo]
+			pos = switch
+		for seq, magic, start, end in self.chunks_of(tli):
+			if magic == TERMINATOR_MAGIC:
+				continue
+			if magic != CHUNK_MAGIC:
+				raise Exception(f"chunk {seq} of timeline {tli} is not a chunk")
+			if end <= lo or start >= hi:
+				continue
+			if pos is None:
+				pos = max(start, lo)
+			if start > pos:
+				break
+			body = self.chunk_body(tli, seq)
+			zero_from = max(start, lo)
+			if pos > zero_from:
+				seg[zero_from - lo:pos - lo] = bytes(pos - zero_from)
+			a, b = max(start, lo), min(end, hi)
+			seg[a - lo:b - lo] = body[a - start:b - start]
+			pos = end
+		if pos is None:
+			return None
+		return seg
+
+	def restore(self, fname, path):
+		"""restore_command: 0 when FILE is put at PATH, 1 when the bucket
+		does not have it."""
+		if re.fullmatch(r'[0-9A-F]{8}\.history', fname):
+			data = self.read_object(f"wal/{fname}")
+		elif re.fullmatch(r'[0-9A-F]{24}', fname):
+			data = self.restore_segment(int(fname[0:8], 16),
+			                            self.segno_of_name(fname))
+		else:
+			data = None
+		if data is None:
+			return 1
+		with open(path, 'wb') as f:
+			f.write(data)
+		return 0
 
 	def list_objects(self, bucket_name, directory):
 		objects = []
@@ -341,219 +866,91 @@ class OrioledbS3ObjectLoader:
 
 		return True
 
-	def transform_orioledb(self, val: str) -> str:
-		offset = 0
-		prefix = self.prefix.strip('/')
-		if prefix != "":
-			offset = len(prefix.split('/'))
-		parts = val.split('/')
-		file_parts = parts[offset + 3].split('.')
-		result = f"{parts[offset + 2]}/{file_parts[0]}-{parts[offset + 1]}"
-		if file_parts[-1] == 'map':
-			result += '.map'
-		return result
 
-	def filter_orioledb(self, val: str) -> bool:
-		offset = 0
-		prefix = self.prefix.strip('/')
-		if prefix != "":
-			offset = len(prefix.split('/'))
-		parts = val.split('/')
-		file_parts = parts[offset + 3].split('.')
-		is_map = file_parts[-1] == 'map'
-		return is_map
+CHUNK_MAGIC = 0x3143574f
+TERMINATOR_MAGIC = 0x3154574f
 
-	def transform_pg(self, val: str) -> str:
-		offset = 0
-		prefix = self.prefix.strip('/')
-		if prefix != "":
-			offset = len(prefix.split('/'))
-		parts = val.split('/')
-		result = '/'.join(parts[offset + 2:])
-		return result
 
-	def download_files_in_directory(self,
-	                                bucket_name,
-	                                directory,
-	                                chkp_num,
-	                                local_directory,
-	                                transform: Callable[[str], str],
-	                                filter: Callable[[str], bool] = None):
-		last_chkp_dir = os.path.join(directory, str(chkp_num))
-		objects = self.list_objects(bucket_name, last_chkp_dir)
-		max_threads = os.cpu_count()
+def server_s3_settings(data_dir):
+	"""orioledb.s3_accesskey/secretkey/region as AWS_* variables, from the
+	server's configuration files and the options it was started with."""
+	names = {
+	    'orioledb.s3_accesskey': 'AWS_ACCESS_KEY_ID',
+	    'orioledb.s3_secretkey': 'AWS_SECRET_ACCESS_KEY',
+	    'orioledb.s3_region': 'AWS_DEFAULT_REGION'
+	}
+	found = {}
+	pattern = re.compile(r"(orioledb\.s3_(?:accesskey|secretkey|region))\s*=\s*"
+	                     r"'?([^'\s\"]+)'?")
+	for name in ('postgresql.conf', 'postgresql.auto.conf', 'postmaster.opts'):
+		try:
+			with open(os.path.join(data_dir, name)) as f:
+				text = f.read()
+		except OSError:
+			continue
+		for m in pattern.finditer(text):
+			found[names[m.group(1)]] = m.group(2)
+	return found
 
-		with ThreadPoolExecutor(max_threads) as executor:
-			futures = []
 
-			for file_key in objects:
-				local_file = transform(file_key)
-				if filter and not filter(file_key):
-					continue
-				local_path = f"{local_directory}/{local_file}"
-				future = executor.submit(self.download_file, bucket_name,
-				                         file_key, local_path)
-				futures.append(future)
+def parse_lsn(text):
+	hi, lo = text.split('/')
+	return (int(hi, 16) << 32) | int(lo, 16)
 
-			for future in futures:
-				future.result()
 
-				if self._error_occurred.is_set():
-					print("An error occurred. Stopping all downloads.")
-					executor.shutdown(wait=False, cancel_futures=True)
-					break
+def parse_manifest(body):
+	"""The manifest of a checkpoint (src/s3/manifest.c)."""
+	m = {
+	    'complete': True,
+	    'data': [],
+	    'files': {},
+	    'small': {},
+	    'bundles': {},
+	    'undo': {},
+	    'maps': [],
+	    'trees': {}
+	}
+	for line in body.splitlines():
+		kind, _, rest = line.partition(' ')
+		if kind == 'format' and int(rest) != 1:
+			raise Exception(f"Unknown manifest format {rest}")
+		elif kind == 'checkpoint':
+			m['checkpoint'] = int(rest)
+		elif kind == 'complete':
+			m['complete'] = m['complete'] and rest == '1'
+		elif kind == 'data':
+			m['data'].append(rest)
+		elif kind in ('file', 'small'):
+			n, _, path = rest.partition(' ')
+			m['files' if kind == 'file' else 'small'][path] = int(n)
+		elif kind == 'bundles':
+			n, count = rest.split(' ')
+			m['bundles'][int(n)] = int(count)
+		elif kind == 'undoref':
+			n, _, name = rest.partition(' ')
+			m['undo'][name] = int(n)
+		elif kind == 'map':
+			datoid, relnode, _ = rest.split(' ')
+			m['maps'].append((int(datoid), int(relnode)))
+		elif kind == 'tree':
+			datoid, relnode, spcoid, mapnum = rest.split(' ')
+			m['trees'][(int(datoid), int(relnode))] = int(mapnum)
+	return m
 
-	def download_unchanged_files(self, bucket_name: str,
-	                             file_checksums_name: str, chkp_num: int,
-	                             file_checksums: Optional[Dict[str, str]]):
-		# We won't be able to download unchanged previous files if this is
-		# the first checkpoint
-		if chkp_num <= 1:
-			return
 
-		prev_chkp_num = chkp_num - 1
-		prev_chkp_dir = os.path.join(self.prefix, "data", str(prev_chkp_num))
+_CRC32C_TABLE = []
+for _i in range(256):
+	_c = _i
+	for _ in range(8):
+		_c = (_c >> 1) ^ 0x82F63B78 if _c & 1 else _c >> 1
+	_CRC32C_TABLE.append(_c)
 
-		if file_checksums is None:
-			file_checksums_path = os.path.join(self.data_dir,
-			                                   file_checksums_name)
-			file_checksums = self.get_unchanged_file_checksums(
-			    file_checksums_path, chkp_num)
 
-		prev_file_checksums = {}
-		for filename, checkpoint in file_checksums.items():
-			# Ignore changed files
-			if int(checkpoint) == chkp_num:
-				continue
-
-			# This file needs to be downloaded from pre-previous checkpoint
-			if int(checkpoint) < prev_chkp_num:
-				prev_file_checksums[filename] = checkpoint
-				continue
-
-			remote_file = os.path.join(prev_chkp_dir, filename)
-			local_file = os.path.join(self.data_dir, filename)
-
-			self.download_file(bucket_name, remote_file, local_file)
-
-		# Some files are still missing
-		if len(prev_file_checksums) > 0:
-			# Recursively download unchanged files
-			self.download_unchanged_files(bucket_name, file_checksums_name,
-			                              prev_chkp_num, prev_file_checksums)
-
-	def download_unchanged_small_files(self, bucket_name: str,
-	                                   file_checksums_name: str, chkp_num: int,
-	                                   file_checksums: Optional[Dict[str,
-	                                                                 str]]):
-		# We won't be able to download unchanged previous files if this is
-		# the first checkpoint
-		if chkp_num <= 1:
-			return
-
-		prev_chkp_num = chkp_num - 1
-		prev_chkp_dir = os.path.join(self.prefix, "data", str(prev_chkp_num))
-
-		if file_checksums is None:
-			file_checksums_path = os.path.join(self.data_dir,
-			                                   file_checksums_name)
-			file_checksums = self.get_unchanged_file_checksums(
-			    file_checksums_path, chkp_num)
-
-		if len(file_checksums) == 0:
-			return
-
-		small_files_num = 0
-		files_restored = 0
-		while True:
-			small_filename = os.path.join("orioledb_data",
-			                              f"small_files_{small_files_num}")
-			remote_path = os.path.join(prev_chkp_dir, small_filename)
-			temp_path = os.path.join(self.data_dir,
-			                         f"{small_filename}.{prev_chkp_num}")
-
-			# Looks like the file doesn't exist, break
-			if not self.download_file(bucket_name, remote_path, temp_path):
-				break
-
-			with open(temp_path, 'rb') as file:
-				data = file.read()
-				numFiles = struct.unpack('i', data[0:4])[0]
-
-				for i in range(0, numFiles):
-					(nameOffset, dataOffset,
-					 dataLength) = struct.unpack('iii',
-					                             data[4 + i * 12:16 + i * 12])
-
-					name = data[nameOffset:data.find(b'\0', nameOffset
-					                                 )].decode('ascii')
-					fullname = os.path.join(self.data_dir, name)
-
-					if not name in file_checksums:
-						continue
-
-					if self.verbose:
-						print(f"{remote_path} -> {fullname}", flush=True)
-
-					self.makedirs(os.path.dirname(fullname),
-					              exist_ok=True,
-					              mode=0o700)
-
-					with open(fullname, 'wb') as file:
-						file.write(data[dataOffset:dataOffset + dataLength])
-					os.chmod(fullname, 0o600)
-
-					files_restored += 1
-					# Looks like we restored all unchanged files, break
-					if files_restored == len(file_checksums):
-						break
-
-			os.unlink(temp_path)
-			small_files_num += 1
-
-			# Looks like we restored all unchanged files, break
-			if files_restored == len(file_checksums):
-				break
-
-		# Not all files were restored, check the previous checkpoint recursively
-		if files_restored < len(file_checksums):
-			prev_file_checksums = {}
-			for filename, checkpoint in file_checksums.items():
-				if int(checkpoint) < prev_chkp_num:
-					prev_file_checksums[filename] = checkpoint
-
-			assert len(prev_file_checksums) > 0
-
-			# Recursively download unchanged small files
-			self.download_unchanged_small_files(bucket_name,
-			                                    file_checksums_name,
-			                                    prev_chkp_num,
-			                                    prev_file_checksums)
-
-	def get_unchanged_file_checksums(self, file_checksums_name: str,
-	                                 chkp_num: int) -> dict[str, str]:
-		res = {}
-
-		pattern_str = r"^FILE: (?P<filename>.+), CHECKSUM: (?P<checksum>.+), CHECKPOINT: (?P<checkpoint>\d+)$"
-		pattern = re.compile(pattern_str)
-		with open(file_checksums_name) as file:
-			for line in file:
-				m = pattern.search(line)
-
-				if m is None or len(m.groups()) != 3:
-					raise Exception(
-					    f"Invalid line format of the checksum file {file_checksums_name}: {line}"
-					)
-
-				line_dict = m.groupdict()
-
-				if int(line_dict["checkpoint"]) > chkp_num:
-					raise Exception(f'Unexpected checkpoint number "{line}"')
-
-				if int(line_dict["checkpoint"]) < chkp_num:
-					res[line_dict["filename"]] = line_dict["checkpoint"]
-
-		return res
+def crc32c(data: bytes) -> int:
+	crc = 0xFFFFFFFF
+	for b in data:
+		crc = _CRC32C_TABLE[(crc ^ b) & 0xFF] ^ (crc >> 8)
+	return crc ^ 0xFFFFFFFF
 
 
 def get_control_data(data_dir: str):
