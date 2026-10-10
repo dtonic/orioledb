@@ -29,6 +29,8 @@
 #include "common/hashfn.h"
 #include "common/pg_prng.h"
 #include "pgstat.h"
+#include "postmaster/bgwriter.h"
+#include "utils/timestamp.h"
 
 #define S3_HEADER_BUFFERS_PER_GROUP 4
 #define S3_HEADER_BUFFERS_PER_GROUP_NUM_BITS 2
@@ -36,7 +38,7 @@
 
 /*
  * Hash an S3HeaderTag using only the fields that participate in
- * S3HeaderTagsIsEqual: datoid, relnode, tablespace, checkpointNum, segNum.
+ * S3HeaderTagsIsEqual: datoid, relnode, tablespace, segNum.
  * reloid and ixType must be excluded so that every code path that
  * constructs a tag (including iterate_tablespace_files, which cannot know
  * reloid/ixType from the filename) always lands in the same hash group.
@@ -49,14 +51,12 @@ s3_header_tag_hash(S3HeaderTag tag)
 		Oid			datoid;
 		Oid			relnode;
 		Oid			tablespace;
-		uint32		checkpointNum;
 		int			segNum;
 	}			hashKey;
 
 	hashKey.datoid = tag.key.oids.datoid;
 	hashKey.relnode = tag.key.oids.relnode;
 	hashKey.tablespace = tag.key.oids.spcoid;
-	hashKey.checkpointNum = tag.checkpointNum;
 	hashKey.segNum = tag.segNum;
 	return hash_any((unsigned char *) &hashKey, sizeof(hashKey));
 }
@@ -66,6 +66,8 @@ typedef struct
 	int			groupCtlTrancheId;
 	int			bufferCtlTrancheId;
 	pg_atomic_uint64 numberOfLoadedParts;
+	/* parts opened by a stream and not yet sealed: local only, not evictable */
+	pg_atomic_uint64 numberOfUnsealedParts;
 } S3HeadersMeta;
 
 typedef struct
@@ -106,10 +108,29 @@ static S3HeadersBuffersGroup *groups;
 	 ((uint64) (changeCount) << S3_PART_CHANGE_COUNT_SHIFT) | \
 	 (uint64) ((dirty) ? S3_PART_DIRTY_BIT : 0))
 
-#define S3_PART_LOCKS_NUM_MASK	   UINT64CONST(0x000000000003FFFF)
+/*
+ * The lower 32 bits of a part's status word:
+ *   0-15  number of locks held on the part
+ *   16    the stream (checkpoint parity) that writes the part
+ *   17    sealed: the stream's checkpoint synced the tree, the part does
+ *         not change any more and is uploaded as it is
+ *   18-20 S3PartStatus
+ *   21    dirty: written locally since it was last uploaded
+ *   22    an upload is in flight
+ *   23    an upload is queued
+ *   24    local only: a temporary tree's part, never sealed, uploaded or
+ *         evicted
+ *   25-31 usage count
+ */
+#define S3_PART_LOCKS_NUM_MASK	   UINT64CONST(0x000000000000FFFF)
 #define S3_PART_LOCKS_ONE		   (1)
 #define S3_PART_LOCKS_NUM_SHIFT	   (0)
 #define S3_PART_GET_LOCKS_NUM(p) (((p) & S3_PART_LOCKS_NUM_MASK) >> S3_PART_LOCKS_NUM_SHIFT)
+#define S3_PART_STREAM_FLAG		   UINT64CONST(0x0000000000010000)
+#define S3_PART_GET_STREAM(p)	   (((p) & S3_PART_STREAM_FLAG) ? 1 : 0)
+#define S3_PART_SET_STREAM(p, s)   (((p) & (~S3_PART_STREAM_FLAG)) | ((s) ? S3_PART_STREAM_FLAG : 0))
+#define S3_PART_SEALED_FLAG		   UINT64CONST(0x0000000000020000)
+#define S3_PART_LOCAL_FLAG		   UINT64CONST(0x0000000001000000)
 #define S3_PART_STATUS_MASK		   UINT64CONST(0x00000000001C0000)
 #define S3_PART_STATUS_SHIFT	   (18)
 #define S3_PART_GET_STATUS(p) ((S3PartStatus) (((p) & S3_PART_STATUS_MASK) >> S3_PART_STATUS_SHIFT))
@@ -154,6 +175,7 @@ s3_headers_shmem_init(Pointer buf, bool found)
 		meta->groupCtlTrancheId = LWLockNewTrancheId();
 		meta->bufferCtlTrancheId = LWLockNewTrancheId();
 		pg_atomic_init_u64(&meta->numberOfLoadedParts, 0);
+		pg_atomic_init_u64(&meta->numberOfUnsealedParts, 0);
 
 		for (i = 0; i < groupsCount; i++)
 		{
@@ -169,7 +191,6 @@ s3_headers_shmem_init(Pointer buf, bool found)
 								 meta->bufferCtlTrancheId);
 				buffer->tag.key.oids.datoid = InvalidOid;
 				buffer->tag.key.oids.relnode = InvalidOid;
-				buffer->tag.checkpointNum = 0;
 				buffer->tag.segNum = 0;
 				buffer->usageCount = 0;
 				buffer->changeCount = 0;
@@ -195,6 +216,12 @@ s3_headers_increase_loaded_parts(uint64 inc)
 		 (unsigned long long) result, (unsigned long long) inc);
 }
 
+uint64
+s3_headers_unsealed_parts(void)
+{
+	return pg_atomic_read_u64(&meta->numberOfUnsealedParts);
+}
+
 static void
 read_from_file(S3HeaderTag tag, uint32 values[S3_HEADER_NUM_VALUES],
 			   bool *dirty)
@@ -206,7 +233,7 @@ read_from_file(S3HeaderTag tag, uint32 values[S3_HEADER_NUM_VALUES],
 
 	Assert(headerSize <= BLCKSZ);
 
-	filename = btree_filename(tag.key, tag.segNum, tag.checkpointNum);
+	filename = btree_filename(tag.key, tag.segNum, 0);
 	fd = BasicOpenFile(filename, O_RDWR | O_CREAT | PG_BINARY);
 	if (fd <= 0)
 		ereport(FATAL,
@@ -217,22 +244,14 @@ read_from_file(S3HeaderTag tag, uint32 values[S3_HEADER_NUM_VALUES],
 	rc = pg_pread(fd, (char *) values, headerSize, 0);
 	pgstat_report_wait_end();
 
+	/*
+	 * A file with no header yet holds no part: every part a tree writes is
+	 * opened first (s3_header_open_part), which marks it loaded, and a part
+	 * that is not local is in S3.
+	 */
 	*dirty = false;
 	if (rc == 0)
-	{
-		if (tag.checkpointNum <= checkpoint_state->lastCheckpointNumber)
-		{
-			MemSet(values, 0, headerSize);
-		}
-		else
-		{
-			int			i;
-
-			for (i = 0; i < S3_HEADER_NUM_VALUES; i++)
-				values[i] = S3_PART_SET_STATUS(0, S3PartStatusLoaded);
-			*dirty = true;
-		}
-	}
+		MemSet(values, 0, headerSize);
 	else if (rc != headerSize)
 		ereport(FATAL,
 				(errcode_for_file_access(),
@@ -250,7 +269,7 @@ write_to_file(S3HeaderTag tag, uint32 values[S3_HEADER_NUM_VALUES])
 
 	Assert(headerSize <= BLCKSZ);
 
-	filename = btree_filename(tag.key, tag.segNum, tag.checkpointNum);
+	filename = btree_filename(tag.key, tag.segNum, 0);
 	fd = BasicOpenFile(filename, O_RDWR | O_CREAT | PG_BINARY);
 	if (fd <= 0)
 		ereport(FATAL,
@@ -279,10 +298,6 @@ change_buffer(S3HeadersBuffersGroup *group, int index, S3HeaderTag tag)
 	uint32		prevChangeCount PG_USED_FOR_ASSERTS_ONLY;
 	S3HeaderBuffer *buffer = NULL;
 	int			i;
-	int			minLoaded = -1;
-	bool		haveLoadedPart = false;
-	bool		checkUnlink = false;
-	off_t		prevFileSize = ORIOLEDB_SEGMENT_SIZE;
 
 	buffer = &group->buffers[index];
 
@@ -308,16 +323,10 @@ change_buffer(S3HeadersBuffersGroup *group, int index, S3HeaderTag tag)
 
 	LWLockRelease(&group->groupCtlLock);
 
-
 	if (OidIsValid(tag.key.oids.datoid) && OidIsValid(tag.key.oids.relnode))
-	{
 		read_from_file(tag, newValues, &newDirty);
-	}
 	else
-	{
 		memset(newValues, 0, sizeof(uint32) * S3_HEADER_NUM_VALUES);
-		checkUnlink = true;
-	}
 
 	for (i = 0; i < S3_HEADER_NUM_VALUES; i++)
 	{
@@ -327,83 +336,24 @@ change_buffer(S3HeadersBuffersGroup *group, int index, S3HeaderTag tag)
 										  S3_PART_MAKE(newValues[i],
 													   buffer->changeCount,
 													   newDirty));
-		if (S3_PART_GET_STATUS(oldValue) == S3PartStatusLoaded && minLoaded < 0)
-			minLoaded = i;
-		if (S3_PART_GET_STATUS(oldValue) == S3PartStatusLoading ||
-			S3_PART_GET_STATUS(oldValue) == S3PartStatusEvicting)
-			haveLoadedPart = true;
-		if (S3_PART_GET_LOCKS_NUM(oldValue) > 0)
-			haveLoadedPart = true;
 		Assert(S3_PART_GET_CHANGE_COUNT(oldValue) == prevChangeCount);
 		dirty = dirty || (oldValue & S3_PART_DIRTY_BIT);
 		oldValues[i] = S3_PART_GET_LOWER(oldValue);
 	}
 
-	if (checkUnlink && !haveLoadedPart)
-	{
-		char	   *filename;
-		int			fd;
-
-		filename = btree_filename(prevTag.key, prevTag.segNum,
-								  prevTag.checkpointNum);
-		fd = BasicOpenFile(filename, O_RDWR | PG_BINARY);
-		pfree(filename);
-		if (fd > 0)
-		{
-			prevFileSize = lseek(fd, 0, SEEK_END);
-			close(fd);
-		}
-
-		if (minLoaded >= 0 && minLoaded * ORIOLEDB_S3_PART_SIZE < prevFileSize)
-			haveLoadedPart = true;
-	}
-
-	if (checkUnlink && !haveLoadedPart &&
-		prevTag.checkpointNum > checkpoint_state->lastCheckpointNumber)
-	{
-		char	   *filename;
-		int			fd;
-
-		/*
-		 * A file of the checkpoint in progress keeps its header.  Without
-		 * one, read_from_file() takes the file for a new one -- created since
-		 * the last checkpoint, every part local -- and its evicted parts
-		 * would be read as the empty file left on disk instead of being
-		 * loaded back from S3.  Only the header block is kept, so the space
-		 * of the evicted parts is given back all the same.
-		 */
+	/*
+	 * The file keeps its header whatever happened to its parts: a part that
+	 * is not local is in S3 and the header says so.  The file goes only with
+	 * its tree (cleanup_btree_files).
+	 */
+	if (OidIsValid(prevTag.key.oids.datoid) && OidIsValid(prevTag.key.oids.relnode) && dirty)
 		write_to_file(prevTag, oldValues);
-		filename = btree_filename(prevTag.key, prevTag.segNum,
-								  prevTag.checkpointNum);
-		fd = BasicOpenFile(filename, O_RDWR | PG_BINARY);
-		if (fd < 0 || ftruncate(fd, ORIOLEDB_BLCKSZ) != 0)
-			ereport(LOG,
-					(errcode_for_file_access(),
-					 errmsg("could not truncate file \"%s\": %m", filename)));
-		if (fd >= 0)
-			close(fd);
-		pfree(filename);
-	}
-	else if (checkUnlink && !haveLoadedPart)
-	{
-		char	   *filename;
-
-		filename = btree_filename(prevTag.key, prevTag.segNum,
-								  prevTag.checkpointNum);
-		unlink(filename);
-		pfree(filename);
-	}
-	else if (OidIsValid(prevTag.key.oids.datoid) && OidIsValid(prevTag.key.oids.relnode) && dirty)
-	{
-		write_to_file(prevTag, oldValues);
-	}
 
 	pg_write_barrier();
 
 	buffer->shadowTag.key.oids.datoid = InvalidOid;
 	buffer->shadowTag.key.oids.relnode = InvalidOid;
 	buffer->shadowTag.segNum = 0;
-	buffer->shadowTag.checkpointNum = 0;
 
 	LWLockRelease(&buffer->bufferCtlLock);
 }
@@ -458,50 +408,6 @@ load_header_buffer(S3HeaderTag tag)
 
 }
 
-static void
-check_unlink_file(S3HeaderTag tag)
-{
-	uint32		hash = s3_header_tag_hash(tag);
-	S3HeadersBuffersGroup *group = &groups[hash % groupsCount];
-	int			victim = 0;
-	S3HeaderTag newTag;
-
-	while (true)
-	{
-		bool		found = false;
-
-		/* First check if required buffer is already loaded */
-		LWLockAcquire(&group->groupCtlLock, LW_EXCLUSIVE);
-		for (victim = 0; victim < S3_HEADER_BUFFERS_PER_GROUP; victim++)
-		{
-			S3HeaderBuffer *buffer = &group->buffers[victim];
-
-			if (S3HeaderTagsIsEqual(buffer->tag, tag))
-			{
-				found = true;
-				break;
-			}
-		}
-		if (found)
-			break;
-		LWLockRelease(&group->groupCtlLock);
-		load_header_buffer(tag);
-	}
-
-	Assert(victim < S3_HEADER_BUFFERS_PER_GROUP);
-	/* if added because of cppcheck */
-	if (victim < S3_HEADER_BUFFERS_PER_GROUP)
-	{
-		LWLockAcquire(&group->buffers[victim].bufferCtlLock, LW_EXCLUSIVE);
-		newTag.key.oids.datoid = InvalidOid;
-		newTag.key.oids.relnode = InvalidOid;
-		newTag.checkpointNum = 0;
-		newTag.segNum = 0;
-		change_buffer(group, victim, newTag);
-	}
-}
-
-
 static uint32
 s3_header_read_value(S3HeaderTag tag, int index)
 {
@@ -554,42 +460,6 @@ s3_header_read_value(S3HeaderTag tag, int index)
 
 		if (!tagMatched)
 			load_header_buffer(tag);
-	}
-}
-
-uint32
-s3_header_get_load_id(S3HeaderTag tag)
-{
-	uint32		hash = s3_header_tag_hash(tag);
-	S3HeadersBuffersGroup *group = &groups[hash % groupsCount];
-	int			i;
-
-	while (true)
-	{
-		for (i = 0; i < S3_HEADER_BUFFERS_PER_GROUP; i++)
-		{
-			S3HeaderBuffer *buffer = &group->buffers[i];
-
-			if (S3HeaderTagsIsEqual(buffer->tag, tag))
-			{
-				/* check there is no read collision */
-				uint32		changeCount = buffer->changeCount;
-
-				pg_read_barrier();
-
-				if (!S3HeaderTagsIsEqual(buffer->tag, tag))
-					break;
-
-				pg_read_barrier();
-
-				if (buffer->changeCount != changeCount)
-					break;
-
-				return (changeCount << S3_HEADER_BUFFERS_PER_GROUP_NUM_BITS) + (uint32) i;;
-			}
-		}
-
-		load_header_buffer(tag);
 	}
 }
 
@@ -686,7 +556,7 @@ s3_header_compare_and_swap(S3HeaderTag tag, int index,
  * We allow only one part to be locked simultaneosly.
  */
 static S3HeaderTag curLockedTag = {{{InvalidOid, InvalidOid, InvalidOid,
-InvalidOid}}, 0, 0};
+InvalidOid}}, 0};
 static int	curLockedIndex = 0;
 
 /*
@@ -713,7 +583,7 @@ s3_header_lock_part(S3HeaderTag tag, int index, uint32 *loadId)
 
 		if (status == S3PartStatusNotLoaded)
 		{
-			s3_load_file_part(tag.checkpointNum, tag.key, tag.segNum, index);
+			s3_load_file_part(tag.key, tag.segNum, index);
 			value = s3_header_read_value(tag, index);
 			continue;
 		}
@@ -785,9 +655,9 @@ s3_header_mark_part_loading(S3HeaderTag tag, int index)
 				uint64		result;
 
 				result = pg_atomic_fetch_add_u64(&meta->numberOfLoadedParts, 1);
-				elog(DEBUG1, "s3_header_mark_part_loading(%u %u %u %d %d) - %llu",
+				elog(DEBUG1, "s3_header_mark_part_loading(%u %u %d %d) - %llu",
 					 tag.key.oids.datoid, tag.key.oids.relnode,
-					 tag.checkpointNum, tag.segNum, index,
+					 tag.segNum, index,
 					 (unsigned long long) result);
 			}
 			return status;
@@ -817,10 +687,10 @@ s3_header_mark_part_loaded(S3HeaderTag tag, int index)
 		 * status out from under it.
 		 */
 		if (status != S3PartStatusLoading)
-			elog(WARNING, "part %d of file %u/%u (checkpoint %u, segment %d) "
+			elog(WARNING, "part %d of file %u/%u (segment %d) "
 				 "is in status %d, expected loading",
 				 index, tag.key.oids.datoid, tag.key.oids.relnode,
-				 tag.checkpointNum, tag.segNum, (int) status);
+				 tag.segNum, (int) status);
 		Assert(status == S3PartStatusLoading);
 		newValue = S3_PART_SET_STATUS(value, S3PartStatusLoaded);
 		newValue = S3_PART_SET_USAGE_COUNT(newValue, 1);
@@ -830,8 +700,14 @@ s3_header_mark_part_loaded(S3HeaderTag tag, int index)
 	}
 }
 
+/*
+ * Release the lock taken by s3_header_lock_part().  A write (setDirty) also
+ * records the stream it belongs to: a part is written by one stream only,
+ * and the mark is what a seal looks for, so writing it at every write keeps
+ * it right after a restart stripped the flags.
+ */
 void
-s3_header_unlock_part(S3HeaderTag tag, int index, bool setDirty)
+s3_header_unlock_part(S3HeaderTag tag, int index, bool setDirty, int stream)
 {
 	uint32		value;
 
@@ -843,19 +719,111 @@ s3_header_unlock_part(S3HeaderTag tag, int index, bool setDirty)
 
 		Assert(S3_PART_GET_STATUS(value) == S3PartStatusLoaded);
 		Assert(S3_PART_GET_LOCKS_NUM(value) >= 0);
+		Assert(!setDirty || !(value & S3_PART_SEALED_FLAG));
 
 		newValue -= S3_PART_LOCKS_ONE;
-		if (setDirty)
+		if (setDirty && !(value & S3_PART_LOCAL_FLAG))
+		{
 			newValue |= S3_PART_DIRTY_FLAG;
+			newValue = S3_PART_SET_STREAM(newValue, stream);
+		}
 
 		if (s3_header_compare_and_swap(tag, index, &value, newValue))
 		{
+			/*
+			 * A part written again after a restart stripped its flags is
+			 * unsealed again: count it, or its seal would take the count
+			 * below zero.
+			 */
+			if ((newValue & S3_PART_DIRTY_FLAG) && !(value & S3_PART_DIRTY_FLAG))
+				pg_atomic_fetch_add_u64(&meta->numberOfUnsealedParts, 1);
 			curLockedTag.key.oids.datoid = InvalidOid;
 			curLockedTag.key.oids.relnode = InvalidOid;
-			curLockedTag.checkpointNum = 0;
 			curLockedTag.segNum = 0;
 			curLockedIndex = 0;
 			return;
+		}
+	}
+}
+
+/*
+ * A stream opens a part it is about to write for the first time: the part is
+ * local (loaded), dirty and unsealed.  Opening a part twice is harmless; a
+ * part reused after a crash reads the same way.  A temporary tree's part is
+ * local only and stays out of the unsealed count.
+ */
+void
+s3_header_open_part(S3HeaderTag tag, int index, int stream, bool localOnly)
+{
+	uint32		value;
+
+	value = s3_header_read_value(tag, index);
+
+	while (true)
+	{
+		uint32		newValue = value;
+		S3PartStatus status = S3_PART_GET_STATUS(value);
+
+		if (status == S3PartStatusLoading || status == S3PartStatusEvicting)
+		{
+			pg_usleep(10000L);
+			value = s3_header_read_value(tag, index);
+			continue;
+		}
+
+		newValue = S3_PART_SET_STATUS(newValue, S3PartStatusLoaded);
+		newValue &= ~(S3_PART_SEALED_FLAG | S3_PART_LOCAL_FLAG);
+		newValue |= localOnly ? S3_PART_LOCAL_FLAG : S3_PART_DIRTY_FLAG;
+		newValue = S3_PART_SET_STREAM(newValue, stream);
+		newValue = S3_PART_SET_USAGE_COUNT(newValue, 1);
+
+		if (s3_header_compare_and_swap(tag, index, &value, newValue))
+		{
+			bool		wasUnsealed = (value & S3_PART_DIRTY_FLAG) &&
+				!(value & (S3_PART_SEALED_FLAG | S3_PART_LOCAL_FLAG));
+
+			if (status == S3PartStatusNotLoaded)
+				pg_atomic_fetch_add_u64(&meta->numberOfLoadedParts, 1);
+			if (!localOnly && !wasUnsealed)
+				pg_atomic_fetch_add_u64(&meta->numberOfUnsealedParts, 1);
+			else if (localOnly && wasUnsealed)
+				pg_atomic_fetch_sub_u64(&meta->numberOfUnsealedParts, 1);
+			elog(DEBUG1, "s3_header_open_part(%u %u %d %d) stream %d",
+				 tag.key.oids.datoid, tag.key.oids.relnode,
+				 tag.segNum, index, stream);
+			return;
+		}
+	}
+}
+
+/*
+ * Seal a part of the given stream after its checkpoint synced the tree.
+ * Returns whether the part holds data not yet uploaded; the caller then
+ * schedules the upload.  A part of the other stream, or one not written
+ * since it was last uploaded, is left alone.
+ */
+bool
+s3_header_seal_part(S3HeaderTag tag, int index, int stream)
+{
+	uint32		value;
+
+	value = s3_header_read_value(tag, index);
+
+	while (true)
+	{
+		uint32		newValue = value;
+
+		if (!(value & S3_PART_DIRTY_FLAG) || S3_PART_GET_STREAM(value) != stream)
+			return false;
+		if (value & S3_PART_SEALED_FLAG)
+			return true;
+
+		newValue |= S3_PART_SEALED_FLAG;
+
+		if (s3_header_compare_and_swap(tag, index, &value, newValue))
+		{
+			pg_atomic_fetch_sub_u64(&meta->numberOfUnsealedParts, 1);
+			return true;
 		}
 	}
 }
@@ -896,6 +864,14 @@ s3_header_mark_part_writing(S3HeaderTag tag, int index)
 	while (true)
 	{
 		uint32		newValue = value;
+
+		/*
+		 * The task is done again after a worker exited in the middle of it:
+		 * an exit (FATAL) skips the cleanup that marks the part not written.
+		 */
+		if ((value & S3_PART_WRITING_FLAG) &&
+			!(value & S3_PART_SCHEDULED_FOR_WRITE_FLAG))
+			return;
 
 		Assert(value & S3_PART_DIRTY_FLAG);
 		Assert(value & S3_PART_SCHEDULED_FOR_WRITE_FLAG);
@@ -1023,7 +999,7 @@ s3_headers_error_cleanup(void)
 		!OidIsValid(curLockedTag.key.oids.relnode))
 		return;
 
-	s3_header_unlock_part(curLockedTag, curLockedIndex, false);
+	s3_header_unlock_part(curLockedTag, curLockedIndex, false, 0);
 }
 
 typedef void (*IterateFilesCallback) (S3HeaderTag tag);
@@ -1059,31 +1035,28 @@ iterate_tablespace_files(Oid tablespace, char *path, IterateFilesCallback callba
 		while (errno = 0, (dbFile = readdir(dbDir)) != NULL)
 		{
 			uint32		file_relnode,
-						file_chkp,
 						file_segno;
 			S3HeaderTag tag = {0};
 			int			pos,
 						len = strlen(dbFile->d_name);
 
-			if (sscanf(dbFile->d_name, "%10u-%10u%n",
-					   &file_relnode, &file_chkp, &pos) == 2 &&
+			if (sscanf(dbFile->d_name, "%10u%n",
+					   &file_relnode, &pos) == 1 &&
 				pos == len)
 			{
 				tag.key.oids.datoid = dbOid;
 				tag.key.oids.relnode = file_relnode;
 				tag.key.oids.spcoid = tablespace;
-				tag.checkpointNum = file_chkp;
 				tag.segNum = 0;
 				callback(tag);
 			}
-			else if (sscanf(dbFile->d_name, "%10u.%10u-%10u%n",
-							&file_relnode, &file_segno, &file_chkp, &pos) == 3 &&
+			else if (sscanf(dbFile->d_name, "%10u.%10u%n",
+							&file_relnode, &file_segno, &pos) == 2 &&
 					 pos == len)
 			{
 				tag.key.oids.datoid = dbOid;
 				tag.key.oids.relnode = file_relnode;
 				tag.key.oids.spcoid = tablespace;
-				tag.checkpointNum = file_chkp;
 				tag.segNum = file_segno;
 				callback(tag);
 			}
@@ -1185,13 +1158,12 @@ initial_parts_counting_callback(S3HeaderTag tag)
 
 	read_from_file(tag, values, &dirty);
 
-	filename = btree_filename(tag.key, tag.segNum, tag.checkpointNum);
+	filename = btree_filename(tag.key, tag.segNum, 0);
 	fd = BasicOpenFile(filename, O_RDWR | PG_BINARY);
 	if (fd <= 0)
 		ereport(FATAL,
 				(errcode_for_file_access(),
 				 errmsg("could not open data file %s: %m", filename)));
-	pfree(filename);
 
 	fileSize = lseek(fd, 0, SEEK_END);
 	totalFilesCount++;
@@ -1203,18 +1175,20 @@ initial_parts_counting_callback(S3HeaderTag tag)
 		uint32		usageCount = S3_PART_GET_USAGE_COUNT(values[i]);
 		off_t		offset = (off_t) i * (off_t) ORIOLEDB_S3_PART_SIZE + (off_t) ORIOLEDB_BLCKSZ;
 
+		/*
+		 * A local part (a temporary tree's, or one a reader wrote) is not in
+		 * the bucket under its number: what the bucket has there is another
+		 * writer's, to be fetched again.
+		 */
 		if (status == S3PartStatusNotLoaded ||
 			status == S3PartStatusLoading ||
-			status == S3PartStatusEvicting)
+			status == S3PartStatusEvicting ||
+			(values[i] & S3_PART_LOCAL_FLAG))
 		{
 
 			status = S3PartStatusNotLoaded;
 			if (fileSize > offset)
-			{
-				pgstat_report_wait_start(WAIT_EVENT_DATA_FILE_WRITE);
-				pg_pwrite_zeros(fd, Min(offset + ORIOLEDB_S3_PART_SIZE, fileSize) - offset, offset);
-				pgstat_report_wait_end();
-			}
+				punch_fd_hole(fd, offset, Min(offset + ORIOLEDB_S3_PART_SIZE, fileSize) - offset, filename);
 		}
 		else
 		{
@@ -1224,17 +1198,23 @@ initial_parts_counting_callback(S3HeaderTag tag)
 				uint64		result;
 
 				result = pg_atomic_fetch_add_u64(&meta->numberOfLoadedParts, 1);
-				elog(DEBUG1, "initial_parts_counting_callback(%u %u %u %d %d) - %llu",
+				elog(DEBUG1, "initial_parts_counting_callback(%u %u %d %d) - %llu",
 					 tag.key.oids.datoid, tag.key.oids.relnode,
-					 tag.checkpointNum, tag.segNum, i,
+					 tag.segNum, i,
 					 (unsigned long long) result);
 				totalOccupiedSize += Min(ORIOLEDB_S3_PART_SIZE, fileSize - offset);
 			}
 		}
+		/*
+		 * Dirty, sealed, stream and upload flags do not survive a restart: a
+		 * part not uploaded before the crash holds nothing a committed
+		 * checkpoint refers to, and it is written again before it matters.
+		 */
 		values[i] = S3_PART_SET_STATUS(usageCount << S3_PART_USAGE_COUNT_SHIFT, status);
 	}
 
 	close(fd);
+	pfree(filename);
 
 	write_to_file(tag, values);
 }
@@ -1254,6 +1234,36 @@ initial_parts_conting(void)
 
 }
 
+static uint64 unsealedCount;
+
+static void
+unsealed_counting_callback(S3HeaderTag tag)
+{
+	for (int i = 0; i < S3_HEADER_NUM_VALUES; i++)
+	{
+		uint32		value = s3_header_read_value(tag, i);
+
+		if ((value & S3_PART_DIRTY_FLAG) &&
+			!(value & (S3_PART_SEALED_FLAG | S3_PART_LOCAL_FLAG)))
+			unsealedCount++;
+	}
+}
+
+/*
+ * Count the unsealed parts again from the headers: the count kept as parts
+ * open and seal still holds the parts of a tree dropped, or a build aborted,
+ * before its parts were sealed.  A part opened or sealed during the count
+ * may be missed; the next count has it.
+ */
+static uint64
+recount_unsealed_parts(void)
+{
+	unsealedCount = 0;
+	iterate_files(unsealed_counting_callback);
+	pg_atomic_write_u64(&meta->numberOfUnsealedParts, unsealedCount);
+	return unsealedCount;
+}
+
 static void
 eviction_callback(S3HeaderTag tag)
 {
@@ -1262,21 +1272,23 @@ eviction_callback(S3HeaderTag tag)
 	off_t		fileSize;
 	int			i;
 	int			numParts;
-	bool		haveLoadedParts = false;
 
-	filename = btree_filename(tag.key, tag.segNum, tag.checkpointNum);
+	filename = btree_filename(tag.key, tag.segNum, 0);
 	fd = BasicOpenFile(filename, O_RDWR | PG_BINARY);
-	pfree(filename);
 
 	if (fd <= 0)
+	{
+		pfree(filename);
 		return;
+	}
 
 	fileSize = lseek(fd, 0, SEEK_END);
 
-	/* Only the header is left: everything was evicted already */
+	/* Only the header is here: nothing was written past it */
 	if (fileSize <= ORIOLEDB_BLCKSZ)
 	{
 		close(fd);
+		pfree(filename);
 		return;
 	}
 
@@ -1312,7 +1324,7 @@ eviction_callback(S3HeaderTag tag)
 
 			if (S3_PART_GET_STATUS(value) == S3PartStatusLoaded &&
 				S3_PART_GET_LOCKS_NUM(value) == 0 && usageCount == 0 &&
-				(value & (S3_PART_DIRTY_FLAG | S3_PART_WRITING_FLAG)) == 0)
+				(value & (S3_PART_DIRTY_FLAG | S3_PART_WRITING_FLAG | S3_PART_LOCAL_FLAG)) == 0)
 			{
 				newValue = S3_PART_SET_STATUS(newValue, S3PartStatusEvicting);
 			}
@@ -1329,10 +1341,10 @@ eviction_callback(S3HeaderTag tag)
 					off_t		offset = (off_t) i * (off_t) ORIOLEDB_S3_PART_SIZE + (off_t) ORIOLEDB_BLCKSZ;
 					uint64		result;
 
-					elog(DEBUG1, "S3 evict %u %u %u %d %d",
+					elog(DEBUG1, "S3 evict %u %u %d %d",
 						 tag.key.oids.datoid, tag.key.oids.relnode,
-						 tag.checkpointNum, tag.segNum, i);
-					pg_pwrite_zeros(fd, Min(offset + ORIOLEDB_S3_PART_SIZE, fileSize) - offset, offset);
+						 tag.segNum, i);
+					punch_fd_hole(fd, offset, Min(offset + ORIOLEDB_S3_PART_SIZE, fileSize) - offset, filename);
 
 					result = pg_atomic_fetch_sub_u64(&meta->numberOfLoadedParts, 1);
 					elog(DEBUG1, "eviction_callback(%llu 1)",
@@ -1340,29 +1352,49 @@ eviction_callback(S3HeaderTag tag)
 
 					s3_header_mark_not_loaded(tag, i);
 				}
-				else if (S3_PART_GET_STATUS(newValue) != S3PartStatusNotLoaded)
-					haveLoadedParts = true;
 				break;
 			}
 		}
 	}
 
-	if (!haveLoadedParts)
-		check_unlink_file(tag);
-
 	close(fd);
+	pfree(filename);
 }
 
 void
 s3_headers_try_eviction_cycle(void)
 {
 	uint64		desiredNumParts = (uint64) s3_desired_size * (uint64) (1024 * 1024) / (uint64) ORIOLEDB_S3_PART_SIZE;
+	uint64		maxUnsealedParts = (uint64) s3_max_unsealed_size * (uint64) (1024 * 1024) / (uint64) ORIOLEDB_S3_PART_SIZE;
+	static TimestampTz lastRequest = 0;
 
 	Assert(orioledb_s3_mode);
+
+	/*
+	 * Unsealed parts cannot be evicted: only the checkpoint of the stream
+	 * that writes them seals them.  Past the bound, count them again and ask
+	 * for one, at most once a minute so a load that outruns the checkpointer
+	 * does not queue requests.
+	 */
+	if (pg_atomic_read_u64(&meta->numberOfUnsealedParts) > maxUnsealedParts)
+	{
+		TimestampTz now = GetCurrentTimestamp();
+
+		if (TimestampDifferenceExceeds(lastRequest, now, 60 * 1000))
+		{
+			lastRequest = now;
+			if (recount_unsealed_parts() > maxUnsealedParts)
+			{
+				elog(LOG, "requesting a checkpoint: %llu MB of local S3 parts are not sealed yet (orioledb.s3_max_unsealed_size = %d MB)",
+					 (unsigned long long) (pg_atomic_read_u64(&meta->numberOfUnsealedParts) * ORIOLEDB_S3_PART_SIZE / (1024 * 1024)),
+					 s3_max_unsealed_size);
+				RequestCheckpoint(CHECKPOINT_FORCE);
+			}
+		}
+	}
 
 	if (pg_atomic_read_u64(&meta->numberOfLoadedParts) < desiredNumParts)
 		return;
 
 	iterate_files(eviction_callback);
-
 }

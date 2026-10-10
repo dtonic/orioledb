@@ -237,19 +237,17 @@ typedef struct
 	OBTreeKeyCmp cmp;
 } BTreeOps;
 
-#define MAX_NUM_DIRTY_PARTS			4
-
 /*
- * Pending data file parts to be synchronized with S3.
+ * The S3 stream of a tree: which of its parts were opened since the stream
+ * was last sealed, and the queue location of the last upload scheduled for
+ * it.  A tree has two streams, one per checkpoint parity (see
+ * get_checkpoint_number()); a part is written by one stream only and sealed
+ * when that stream's checkpoint has synced the tree.
  */
 typedef struct
 {
-	struct
-	{
-		uint32		chkpNum;
-		int32		segNum;
-		int32		partNum;
-	}			dirtyParts[MAX_NUM_DIRTY_PARTS];
+	uint64		sealFrom;		/* first part opened since the last seal, or
+								 * InvalidFileExtentOff */
 	S3TaskLocation writeMaxLocation;
 } BTreeS3PartsInfo;
 
@@ -310,7 +308,14 @@ struct BTreeDescr
 	SeqBufDescPrivate freeBuf;
 	SeqBufDescPrivate nextChkp[2];
 	SeqBufDescPrivate tmpBuf[2];
-	BTreeS3PartsInfo buildPartsInfo[2];
+	/* S3 mode: the parts a tree build opened; sealed when the build closes */
+	uint64		buildNextPart;
+	uint64		buildSealFrom;
+	S3TaskLocation buildWriteMaxLocation;
+	/* where each part the build left ends, for the GC (TopMemoryContext) */
+	uint64	   *buildPartEnds;
+	int			buildPartEndsNum;
+	int			buildPartEndsAlloc;
 	OXid		createOxid;
 	BTreeOps   *ops;
 

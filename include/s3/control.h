@@ -14,8 +14,10 @@
 #ifndef __S3_CONTROL_H__
 #define __S3_CONTROL_H__
 
-extern bool s3_check_control(const char **errmsgp, const char **errdetailp);
-extern void s3_put_lock_file(void);
-extern void s3_delete_lock_file(void);
+#include "checkpoint/control.h"
+
+extern bool s3_check_control(CheckpointControl *control, uint64 rootControlId,
+							 uint32 rootCheckpoint,
+							 const char **errmsgp, const char **errdetailp);
 
 #endif							/* __S3_CONTROL_H__ */

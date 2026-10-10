@@ -52,6 +52,7 @@
 #include "btree/iterator.h"
 #include "btree/page_chunks.h"
 #include "btree/scan.h"
+#include "s3/gc.h"
 #include "btree/undo.h"
 #include "tableam/descr.h"
 #include "tableam/key_range.h"
@@ -277,6 +278,29 @@ struct BTreeSeqScan
 };
 
 static dlist_head listOfScans = DLIST_STATIC_INIT(listOfScans);
+
+/*
+ * In S3 mode, tell the GC the oldest checkpoint whose maps this backend's
+ * scans read.
+ */
+static void
+note_oldest_scan(void)
+{
+	dlist_iter	iter;
+	uint32		oldest = 0;
+
+	if (!orioledb_s3_mode)
+		return;
+	dlist_foreach(iter, &listOfScans)
+	{
+		BTreeSeqScan *scan = dlist_container(BTreeSeqScan, listNode, iter.cur);
+
+		if (scan->checkpointNumberSet &&
+			(oldest == 0 || scan->checkpointNumber < oldest))
+			oldest = scan->checkpointNumber;
+	}
+	s3_gc_note_scans(oldest);
+}
 
 static void release_seq_scan_registration(BTreeSeqScan *scan);
 static void scan_make_iterator(BTreeSeqScan *scan, OTuple startKey, OTuple keyRangeHigh);
@@ -2509,6 +2533,7 @@ init_checkpoit_number(BTreeSeqScan *scan)
 			scan->registeredMetaPageBlkno = desc->rootInfo.metaPageBlkno;
 			scan->registeredMetaPageChangeCount = desc->rootInfo.metaPageChangeCount;
 			scan->checkpointNumberSet = true;
+			note_oldest_scan();
 			break;
 		}
 		(void) pg_atomic_fetch_sub_u32(&metaPage->numSeqScans[checkpointNumberBefore % NUM_SEQ_SCANS_ARRAY_SIZE], 1);
@@ -3484,6 +3509,7 @@ free_btree_seq_scan_internal(BTreeSeqScan *scan, bool fromResowner)
 	{
 		release_seq_scan_registration(scan);
 		scan->checkpointNumberSet = false;
+		note_oldest_scan();
 	}
 
 	if (scan->dsmSeg)

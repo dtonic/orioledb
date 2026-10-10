@@ -1526,6 +1526,17 @@ o_move_tree_meta(Oid datoid, Oid relnode, Oid old_tablespace,
 void
 cleanup_btree(OIndexKey ix_key, bool files, bool fsync)
 {
+	cleanup_btree_extended(ix_key, files, fsync, false);
+}
+
+/*
+ * keepPartFloor: the tree is emptied in place and lives on under its
+ * relnode; in S3 mode it numbers its parts on from where it was.
+ */
+void
+cleanup_btree_extended(OIndexKey ix_key, bool files, bool fsync,
+					   bool keepPartFloor)
+{
 	SharedRootInfoKey key;
 	SharedRootInfo *shared = NULL;
 
@@ -1534,6 +1545,15 @@ cleanup_btree(OIndexKey ix_key, bool files, bool fsync)
 	key.tablespace = ix_key.oids.spcoid;
 
 	shared = o_find_shared_root_info(&key);
+
+	if (keepPartFloor && orioledb_s3_mode)
+	{
+		uint64		next = 0;
+
+		if (shared && !shared->placeholder)
+			next = pg_atomic_read_u64(&((BTreeMetaPage *) O_GET_IN_MEMORY_PAGE(shared->rootInfo.metaPageBlkno))->s3NextPart);
+		s3_keep_part_floor(ix_key, next);
+	}
 
 	if (shared)
 	{

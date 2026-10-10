@@ -461,17 +461,20 @@ StaticAssertDecl(sizeof(OrioleDBPageHeader) == sizeof(OrioleDBOndiskPageHeader),
 #define O_PAGE_GET_CHANGE_COUNT(p) (O_PAGE_HEADER(p)->pageChangeCount)
 
 /*
- * In S3 mode the 48-bit offset of a file extent holds the block offset in its
- * low 32 bits and, in the 16 bits above, the number of the checkpoint whose
- * data file holds the block.  The number is part of the object name the block
- * is read back from, so a checkpoint number past S3_CHKP_NUM_MAX cannot be
- * written (see s3_extent_offset()).
+ * S3 mode stores a tree in parts of ORIOLEDB_S3_PART_SIZE bytes of its own
+ * append-only address space; a file extent's 48-bit offset is the block
+ * offset in that space and nothing else.  Part P holds the blocks
+ * [P * S3_PART_BLOCKS, (P + 1) * S3_PART_BLOCKS) of the tree, and segment
+ * file P / S3_PARTS_PER_SEGMENT holds it locally.
  */
-#define S3_OFFSET_MASK		(UINT64CONST(0x00FFFFFFFF))
-#define S3_CHKP_NUM_MASK	(UINT64CONST(0xFFFF00000000))
-#define S3_CHKP_NUM_SHIFT	(32)
-#define S3_CHKP_NUM_MAX		(UINT64CONST(0xFFFF))
-#define S3_GET_CHKP_NUM(offset) (((offset) & S3_CHKP_NUM_MASK) >> S3_CHKP_NUM_SHIFT)
+#define S3_PART_BLOCKS(blocksize)	(ORIOLEDB_S3_PART_SIZE / (blocksize))
+/*
+ * In a list of dead extents (S3 mode), an entry of this length gives the
+ * blocks per part of the tree in its offset, and an entry of length 0 the end
+ * of a part that is complete.
+ */
+#define S3_DEAD_UNIT_LEN		0xFFFF
+#define S3_PARTS_PER_SEGMENT		(ORIOLEDB_SEGMENT_SIZE / ORIOLEDB_S3_PART_SIZE)
 
 #define InvalidFileExtentLen (0)
 #define InvalidFileExtentOff (UINT64CONST(0xFFFFFFFFFFFF))
@@ -536,9 +539,17 @@ extern bool orioledb_table_description_compress;
 extern char *max_bridge_ctid_string;
 extern BlockNumber max_bridge_ctid_blkno;
 extern bool orioledb_s3_mode;
+extern bool orioledb_s3_reader;
+
+/*
+ * A reader opens the bucket's committed checkpoint and only reads it: it
+ * writes nothing to the bucket, and what it writes locally stays local.
+ */
+#define S3_WRITER_MODE (orioledb_s3_mode && !orioledb_s3_reader)
 extern bool orioledb_checksums_enabled;
 extern int	s3_num_workers;
 extern int	s3_desired_size;
+extern int	s3_max_unsealed_size;
 extern int	s3_queue_size_guc;
 extern char *s3_host;
 extern bool s3_use_https;

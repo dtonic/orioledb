@@ -38,6 +38,7 @@ typedef struct
 	SharedRootInfoKey key;
 
 	CheckpointFileHeader file_header;
+	S3TreeCursors s3Cursors;
 	S3TaskLocation maxLocation[2];
 	EvictedSeqBufData freeBuf;
 

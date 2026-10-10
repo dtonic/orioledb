@@ -456,8 +456,18 @@ init_meta_page(OInMemoryBlkno blkno, uint32 leafPagesNum)
 	memset(p + O_PAGE_HEADER_SIZE, 0, ORIOLEDB_BLCKSZ - O_PAGE_HEADER_SIZE);
 	pg_atomic_init_u32(&metaPage->leafPagesNum, leafPagesNum);
 	pg_atomic_init_u64(&metaPage->numFreeBlocks, 0);
-	pg_atomic_init_u64(&metaPage->datafileLength[0], 0);
-	pg_atomic_init_u64(&metaPage->datafileLength[1], 0);
+	if (orioledb_s3_mode)
+	{
+		/* no open part in either stream; parts are numbered from 0 */
+		pg_atomic_init_u64(&metaPage->datafileLength[0], InvalidFileExtentOff);
+		pg_atomic_init_u64(&metaPage->datafileLength[1], InvalidFileExtentOff);
+	}
+	else
+	{
+		pg_atomic_init_u64(&metaPage->datafileLength[0], 0);
+		pg_atomic_init_u64(&metaPage->datafileLength[1], 0);
+	}
+	pg_atomic_init_u64(&metaPage->s3NextPart, 0);
 	pg_atomic_init_u64(&metaPage->ctid, 0);
 	pg_atomic_init_u64(&metaPage->bridge_ctid, 0);
 	for (i = 0; i < NUM_SEQ_SCANS_ARRAY_SIZE; i++)
@@ -487,11 +497,7 @@ init_meta_page(OInMemoryBlkno blkno, uint32 leafPagesNum)
 		}
 
 		metaPage->partsInfo[i].writeMaxLocation = 0;
-		for (j = 0; j < MAX_NUM_DIRTY_PARTS; j++)
-		{
-			metaPage->partsInfo[i].dirtyParts[j].segNum = -1;
-			metaPage->partsInfo[i].dirtyParts[j].partNum = -1;
-		}
+		metaPage->partsInfo[i].sealFrom = InvalidFileExtentOff;
 	}
 	metaPage->punchHolesChkpNum = checkpoint_state->lastCheckpointNumber;
 	metaPage->toBeFreedOnSeqScanRelease = false;

@@ -127,6 +127,8 @@ get_ea_counters(OrioleDBPageDesc *desc)
 	}
 
 extern void cleanup_btree(OIndexKey ix_key, bool files, bool fsync);
+extern void cleanup_btree_extended(OIndexKey ix_key, bool files, bool fsync,
+								   bool keepPartFloor);
 extern bool o_drop_shared_root_info(Oid datoid, Oid relnode, Oid tablespace);
 extern void o_tableam_descr_init(void);
 extern void o_invalidate_descrs(Oid datoid, Oid reloid, Oid relfilenode);

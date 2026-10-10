@@ -27,7 +27,17 @@ typedef struct
 	SeqBufDescShared nextChkp[2];
 	SeqBufDescShared tmpBuf[2];
 	pg_atomic_uint64 numFreeBlocks;
+
+	/*
+	 * Local mode: datafileLength[0] is the length of the data file in blocks.
+	 * S3 mode: the write cursor of each stream, the block offset the stream's
+	 * next extent starts at, or InvalidFileExtentOff when the stream has no
+	 * open part; s3NextPart is the number the next part opened by either
+	 * stream takes.  All of it is in the tree's own address space and only
+	 * ever grows.
+	 */
 	pg_atomic_uint64 datafileLength[2];
+	pg_atomic_uint64 s3NextPart;
 	LWLock		metaLock;
 	LWLock		copyBlknoLock;
 

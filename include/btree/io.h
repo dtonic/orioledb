@@ -36,6 +36,8 @@ extern void write_tree_pages(BTreeDescr *desc, int maxLevel, bool evict);
 extern void unlock_io(int ionum);
 extern void wait_for_io_completion(int ionum);
 extern bool cleanup_btree_files(OIndexKey key, bool fsync);
+extern uint64 s3_part_floor(OIndexKey key);
+extern void s3_keep_part_floor(OIndexKey key, uint64 inMemoryNext);
 extern bool fsync_btree_files(OIndexKey key);
 extern int	OFileRead(File file, char *buffer, int amount, off_t offset,
 					  uint32 wait_event_info);
@@ -50,6 +52,9 @@ extern char *btree_smgr_filename(BTreeDescr *desc, off_t offset,
 extern void btree_smgr_writeback(BTreeDescr *desc, uint32 chkpNum,
 								 off_t offset, int amount);
 extern void btree_smgr_sync(BTreeDescr *desc, uint32 chkpNum, off_t length);
+extern void btree_s3_seal_stream(BTreeDescr *desc, BTreeMetaPage *metaPage,
+								 int stream);
+extern void btree_s3_seal_build(BTreeDescr *desc, uint64 cursor);
 extern void btree_smgr_punch_hole(BTreeDescr *desc, uint32 chkpNum,
 								  off_t offset, int length);
 extern void punch_fd_hole(int fd, off_t offset, off_t length,
