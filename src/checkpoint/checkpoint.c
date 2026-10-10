@@ -1226,6 +1226,16 @@ wait_recovery_undo_loc_flushed(uint32 chkpnum, bool shutdown)
 				continue;
 			}
 
+			/*
+			 * At a shutdown restartpoint the startup process and every
+			 * recovery worker are gone, and a worker that ran left the flag
+			 * above on exit: one without it never started (the index build
+			 * leader lowers the index pool in its own process only when the
+			 * workers do not fit in max_worker_processes), and owes nothing.
+			 */
+			if (shutdown)
+				continue;
+
 			if (worker_ptrs[i].flushedUndoLocCompletedCheckpointNumber <
 				recovery_undo_loc_flush->immediateRequestCheckpointNumber)
 			{
