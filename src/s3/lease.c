@@ -1111,6 +1111,20 @@ lease_ensure(int minSecs)
 }
 
 /*
+ * Before an object a fenced writer must not put (a WAL segment of the
+ * archive): the lease is ours for a while yet, or the instance stops.  A
+ * writer taken over waits for the lease to run out on the store's clock, and
+ * this one stops putting before that, as it does before committing root.
+ */
+void
+s3_lease_hold(void)
+{
+	LWLockAcquire(&lease->lock, LW_EXCLUSIVE);
+	lease_ensure(s3_lease_duration / 2);
+	LWLockRelease(&lease->lock);
+}
+
+/*
  * Commit checkpoint K: point root at it.  Everything K needs is uploaded.
  */
 void

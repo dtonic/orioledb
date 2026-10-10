@@ -939,6 +939,55 @@ class S3Test(S3BaseTest):
 			new_node.stop()
 			new_node.cleanup()
 
+	def test_s3_archive_is_fenced_by_the_lease(self):
+		"""A writer whose lease another writer took puts no archived segment:
+		before each it makes sure the lease is still its own for a while, and
+		stops when it is not.  Without the WAL shipper the archive is the only
+		way WAL reaches the bucket."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			orioledb.s3_wal_shipping = off
+			orioledb.s3_lease_duration = 15
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		writer = self.s3_body('writer')
+		writer['token'] = str(int(writer['token']) + 1)
+		writer['owner'] = 'another-writer'
+		writer['expires_at'] = str(int(time.time()) + 3600)
+		self.client.put_object(
+		    Bucket=self.bucket_name, Key='writer',
+		    Body=''.join(f"{k} {v}\n" for k, v in writer.items()).encode())
+		# the renewals stop: only the archive's own check can notice
+		lease_pids = [
+		    int(line.split()[0]) for line in os.popen(
+		        f"ps -o pid=,args= --ppid {node.pid}").read().splitlines()
+		    if 'orioledb s3 lease' in line]
+		self.assertEqual(len(lease_pids), 1)
+		os.kill(lease_pids[0], signal.SIGSTOP)
+		try:
+			time.sleep(16)
+			node.safe_psql("INSERT INTO o_test VALUES (1);")
+			segment = node.execute(
+			    "SELECT pg_walfile_name(pg_current_wal_lsn());")[0][0]
+			node.safe_psql("SELECT pg_switch_wal();")
+			deadline = time.time() + 30
+			while node.status() == NodeStatus.Running and time.time() < deadline:
+				time.sleep(0.5)
+		finally:
+			try:
+				os.kill(lease_pids[0], signal.SIGCONT)
+			except ProcessLookupError:
+				pass
+		self.assertNotEqual(node.status(), NodeStatus.Running)
+		self.assertNotIn("Contents", self.client.list_objects(
+		    Bucket=self.bucket_name, Prefix=f'wal/{segment}'))
+
 	def test_s3_reader_becomes_the_writer(self):
 		"""A reader keeps its parts when it is loaded again to write: once the
 		writer is gone, it takes the bucket over with every commit."""
