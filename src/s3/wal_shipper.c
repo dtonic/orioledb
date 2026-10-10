@@ -89,7 +89,6 @@
 #define RESTORE_BUCKET_FILENAME	ORIOLEDB_DATA_DIR "/s3_restore_bucket"
 #define CHUNK_MAX_BYTES			(16 * 1024 * 1024)
 #define CHUNK_GC_INTERVAL_MS	10000
-#define CHUNK_GC_SCAN_MAX		100000
 
 bool		s3_wal_shipping = true;
 int			s3_wal_chunk_delay = 1;
@@ -126,6 +125,14 @@ typedef struct
 } ShippedChunk;
 
 static ShippedChunk *shipped = NULL;
+
+/*
+ * The chunks a previous run left, [recoveredFrom, recoveredTo): their ends
+ * are not known without reading them, so the archived prefix is found by
+ * bisection when the GC comes round.
+ */
+static uint64 recoveredFrom = 0,
+			recoveredTo = 0;
 static int	shippedHead = 0,
 			shippedTail = 0,
 			shippedCap = 0;
@@ -783,9 +790,12 @@ segment_archived(TimeLineID tli, XLogRecPtr lsn)
  * chunk stays whatever covers it: a takeover lists the timeline's chunks to
  * find where to put its terminator.
  */
+static void recovered_gc(TimeLineID tli);
+
 static void
 chunks_gc(TimeLineID tli)
 {
+	recovered_gc(tli);
 	while (shippedHead < shippedTail - 1 &&
 		   segment_archived(tli, shipped[shippedHead].end - 1))
 	{
@@ -807,30 +817,77 @@ chunks_gc(TimeLineID tli)
 }
 
 /*
- * The chunks a previous run left: walk back from the next one until a chunk
- * is gone (removed already, or never there).
+ * The chunks a previous run left: from the first one listed (those before it
+ * are gone) up to where this run starts.
  */
 static void
 chunks_gc_recover(TimeLineID tli, uint64 nextSeq)
 {
-	uint64		seq = nextSeq;
-	int			found = 0;
-	ChunkHeader header;
-	uint64		first;
+	char	   *prefix = psprintf("wal/%08X/chunks/", tli);
+	List	   *keys = s3_list_objects(prefix, NULL);
+	uint64		first = nextSeq;
+	ListCell   *lc;
 
-	while (seq > 0 && found < CHUNK_GC_SCAN_MAX &&
-		   read_chunk_header(tli, seq - 1, &header))
+	foreach(lc, keys)
 	{
-		seq--;
-		found++;
+		uint64		seq = strtou64((char *) lfirst(lc) + strlen(prefix), NULL, 10);
+
+		first = Min(first, seq);
 	}
-	first = seq;
-	for (seq = first; seq < nextSeq; seq++)
+	list_free_deep(keys);
+	pfree(prefix);
+	recoveredFrom = first;
+	recoveredTo = nextSeq;
+}
+
+/*
+ * Whether a recovered chunk's WAL is in an archived segment.  A chunk that is
+ * gone was removed as such.
+ */
+static bool
+recovered_archived(TimeLineID tli, uint64 seq)
+{
+	ChunkHeader header;
+
+	if (!read_chunk_header(tli, seq, &header))
+		return true;
+	if (header.magic != CHUNK_MAGIC)
+		return false;
+	return segment_archived(tli, header.endLsn - 1);
+}
+
+/*
+ * Remove the archived prefix of the recovered chunks.  Ends grow with the
+ * sequence number, so the prefix is found by bisection.  The newest chunk of
+ * the timeline stays.
+ */
+static void
+recovered_gc(TimeLineID tli)
+{
+	uint64		lo = recoveredFrom,
+				hi = recoveredTo;	/* [lo, hi): the first not archived is in */
+	uint64		upto;
+
+	if (recoveredFrom >= recoveredTo)
+		return;
+	while (lo < hi)
 	{
-		if (!read_chunk_header(tli, seq, &header) ||
-			header.magic != CHUNK_MAGIC)
-			continue;
-		shipped_push(seq, header.endLsn);
+		uint64		mid = lo + (hi - lo) / 2;
+
+		if (recovered_archived(tli, mid))
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	upto = lo;
+	if (shippedHead >= shippedTail && upto >= recoveredTo)
+		upto = recoveredTo - 1;
+	while (recoveredFrom < upto)
+	{
+		uint64		to = Min(upto, recoveredFrom + 1000);
+
+		(void) s3_schedule_wal_chunks_delete(tli, recoveredFrom, to);
+		recoveredFrom = to;
 	}
 }
 
@@ -1119,15 +1176,16 @@ s3_wal_shipper_main(Datum main_arg)
 			lastReply = GetCurrentTimestamp();
 		}
 
+		/* also under a load that never lets the stream run dry */
+		if (GetCurrentTimestamp() >= TimestampTzPlusMilliseconds(lastGc,
+																 CHUNK_GC_INTERVAL_MS))
+		{
+			chunks_gc(tli);
+			lastGc = GetCurrentTimestamp();
+		}
+
 		if (len == 0)
 		{
-			if (shippedHead < shippedTail - 1 &&
-				GetCurrentTimestamp() >= TimestampTzPlusMilliseconds(lastGc,
-																	CHUNK_GC_INTERVAL_MS))
-			{
-				chunks_gc(tli);
-				lastGc = GetCurrentTimestamp();
-			}
 			(void) WaitLatchOrSocket(MyLatch,
 									 WL_LATCH_SET | WL_SOCKET_READABLE |
 									 WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

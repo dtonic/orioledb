@@ -6,6 +6,7 @@ import shutil
 import runpy
 import signal
 import struct
+import subprocess
 import sys
 from tempfile import mkstemp
 
@@ -1092,6 +1093,44 @@ class S3Test(S3BaseTest):
 			                 new_node.execute("SELECT count(*) FROM o_test"))
 			new_node.stop()
 			new_node.cleanup()
+
+	def test_s3_chunks_are_removed_under_load(self):
+		"""Chunks go once archived while commits keep coming, and the
+		instance restarts over the chunks its previous run left."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id serial PRIMARY KEY, pad text) USING orioledb;
+		""")
+		script = os.path.join(node.base_dir, 'insert.sql')
+		with open(script, 'w') as f:
+			f.write("INSERT INTO o_test (pad) VALUES (repeat('x', 500));\n")
+		bench = subprocess.Popen(
+		    [testgres.get_bin_path('pgbench'),
+		     '-n', '-f', script, '-c', '16', '-j', '4', '-T', '90',
+		     '-h', node.host, '-p', str(node.port), default_dbname()],
+		    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+		try:
+			peak = 0
+			deadline = time.time() + 80
+			removed = False
+			while time.time() < deadline and not removed:
+				node.safe_psql("SELECT pg_switch_wal();")
+				time.sleep(2)
+				count = len(self.chunk_keys())
+				removed = peak > 50 and count < peak / 2
+				peak = max(peak, count)
+			self.assertTrue(removed)
+		finally:
+			bench.kill()
+			bench.wait()
+		node.stop(['-m', 'immediate'])
+		node.start()
+		self.assertGreater(node.execute("SELECT count(*) FROM o_test")[0][0], 0)
+		node.stop()
 
 	def test_s3_load_sees_commits_behind_a_long_transaction(self):
 		"""A transaction open across a checkpoint holds its xmin: the ones that
