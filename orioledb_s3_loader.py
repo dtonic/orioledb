@@ -6,13 +6,15 @@ import os
 import re
 import struct
 import sys
+import time
 import testgres
 
 from botocore.config import Config
 from botocore.exceptions import ClientError, ParamValidationError
 from concurrent.futures import ThreadPoolExecutor
 from boto3.s3.transfer import TransferConfig
-from threading import Event
+from email.utils import parsedate_to_datetime
+from threading import Event, Thread
 from urllib.parse import urlparse
 
 
@@ -240,6 +242,14 @@ class OrioledbS3ObjectLoader:
 				                f"committed one, {chkp_num}")
 			chkp_num = self.as_of
 		self.chkp_num = chkp_num
+		# held while the objects are read, so the GC leaves them
+		self.pin = ReaderPin(self, chkp_num)
+		try:
+			self.load_checkpoint(root, chkp_num)
+		finally:
+			self.pin.release()
+
+	def load_checkpoint(self, root, chkp_num):
 		# the checkpoint's manifest names every object restoring it reads
 		manifest_body = self.read_object(
 		    f"manifests/{self.token_of(chkp_num)}-{chkp_num}")
@@ -869,6 +879,100 @@ class OrioledbS3ObjectLoader:
 
 CHUNK_MAGIC = 0x3143574f
 TERMINATOR_MAGIC = 0x3154574f
+
+
+PIN_TTL = 600
+
+
+class ReaderPin:
+	"""
+	A pin in the bucket's readers object, as a reader's: the GC keeps every
+	checkpoint from the lowest unexpired pin on.  Put by a conditional
+	replace (every reader edits the object), renewed every third of its TTL
+	while held, and checked against the GC's published retention point after
+	it is put: pinned before the GC reads the pins, it is counted; pinned
+	after, the retention point it sees is the GC's.  Anything that reads a
+	checkpoint's objects outside a server takes one the same way.
+	"""
+
+	def __init__(self, loader, chkp):
+		self.loader = loader
+		self.chkp = chkp
+		self.id = "loader-" + os.urandom(8).hex()
+		self.stop = Event()
+		self.put(chkp)
+		retain = self.retain()
+		if chkp < retain:
+			self.remove()
+			raise Exception(f"The S3 bucket no longer keeps checkpoint {chkp}: "
+			                f"its GC keeps checkpoints from {retain} on")
+		self.thread = Thread(target=self.renew, daemon=True)
+		self.thread.start()
+
+	def key(self):
+		return os.path.join(self.loader.prefix, 'readers')
+
+	def edit(self, line):
+		s3 = self.loader.s3
+		for _ in range(100):
+			try:
+				obj = s3.get_object(Bucket=self.loader.bucket_name, Key=self.key())
+				body = obj['Body'].read().decode()
+				etag = obj['ETag']
+				now = int(parsedate_to_datetime(
+				    obj['ResponseMetadata']['HTTPHeaders']['date']).timestamp())
+			except ClientError as e:
+				if e.response['Error']['Code'] not in ("404", "NoSuchKey"):
+					raise
+				body, etag = "", None
+				now = int(parsedate_to_datetime(
+				    e.response['ResponseMetadata']['HTTPHeaders']['date']).timestamp())
+			kept = []
+			for other in body.splitlines():
+				fields = other.split()
+				if len(fields) == 3 and fields[0] != self.id and \
+				    int(fields[2]) >= now:
+					kept.append(other)
+			if line is not None:
+				kept.append(line(now))
+			new = "".join(f"{x}\n" for x in kept).encode()
+			cond = {'IfMatch': etag} if etag else {'IfNoneMatch': '*'}
+			try:
+				s3.put_object(Bucket=self.loader.bucket_name, Key=self.key(),
+				              Body=new, **cond)
+				return
+			except ClientError as e:
+				if e.response['Error']['Code'] not in (
+				    "PreconditionFailed", "ConditionalRequestConflict", "412",
+				    "409", "NoSuchKey", "404"):
+					raise
+			time.sleep(0.1)
+		raise Exception("could not write the loader's pin to the S3 bucket")
+
+	def put(self, chkp):
+		self.edit(lambda now: f"{self.id} {chkp} {now + PIN_TTL}")
+
+	def remove(self):
+		self.edit(None)
+
+	def retain(self):
+		body = self.loader.read_object('gc')
+		if body is None:
+			return 0
+		for line in body.decode().splitlines():
+			key, _, value = line.partition(' ')
+			if key == 'retain':
+				return int(value)
+		return 0
+
+	def renew(self):
+		while not self.stop.wait(PIN_TTL / 3):
+			self.put(self.chkp)
+
+	def release(self):
+		self.stop.set()
+		self.thread.join()
+		self.remove()
 
 
 def server_s3_settings(data_dir):

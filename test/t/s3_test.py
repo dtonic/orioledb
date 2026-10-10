@@ -12,6 +12,7 @@ from tempfile import mkstemp
 from threading import Thread
 from unittest.mock import patch
 
+import botocore.client
 import testgres
 from testgres.defaults import default_dbname
 from testgres.enums import NodeStatus
@@ -1265,6 +1266,40 @@ class S3Test(S3BaseTest):
 			self.assertEqual([(30000, 90000)], count)
 			reader.stop()
 			reader.cleanup()
+		node.stop()
+
+	def test_s3_gc_spares_a_loading_checkpoint(self):
+		"""The loader pins the checkpoint it reads, as a reader does: the
+		writer goes on and its GC passes while the load is under way, and
+		every object the load reads after that is still there."""
+		node = self.gc_world()
+		paused = []
+
+		def go_on_writing():
+			for v in range(1, 4):
+				node.safe_psql(f"UPDATE o_test SET v = {v};")
+				node.safe_psql("CHECKPOINT;")
+			time.sleep(5)
+
+		real = botocore.client.BaseClient._make_api_call
+
+		def call(client, operation, params):
+			if operation == 'GetObject' and not paused and \
+			    '/maps/' in params.get('Key', ''):
+				paused.append(True)
+				go_on_writing()
+			return real(client, operation, params)
+
+		loaded = int(self.s3_body('root')['checkpoint'])
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			# a load reads every object its manifest names, or fails
+			with patch('botocore.client.BaseClient._make_api_call', call):
+				self.loader.download(new_node.data_dir, checkpoint_only=True)
+			self.assertEqual(paused, [True])
+			# the GC wanted to go past it meanwhile
+			self.assertGreater(int(self.s3_body('gc')['retain']), loaded)
+			self.assertNotIn('loader-', self.s3_object('readers').decode())
+			new_node.cleanup()
 		node.stop()
 
 	def part_relnodes(self):
