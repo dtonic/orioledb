@@ -856,9 +856,14 @@ RustFS, 같은 Docker 호스트, 릴리스 빌드(p9). 100만 행 표에 8연결
   체크포인트를 버킷에서 받으면 그 사이 끝난 트랜잭션이 진행 중으로 보여 복구가 죽었다(xidmap 구간을 체크포인트와 함께
   올린다). shipper 가 조각을 한 건씩 지우는 동안 동기 커밋이 멈췄다(32연결 33~53 ms → 9~10 ms).
 
+### Reader promotion: not a goal (2026-10-10)
+
+reader 를 writer 로 승격하는 기능은 두지 않는다. writer 에 문제가 생기면 writer 를 다시 띄운다: 제자리 재시작은 죽은
+프로세스의 리스가 끝나기를 기다리는 시간을 포함해 약 20~30초, 버킷에서의 재구축도 20초 안팎이다(위 측정). reader 는
+읽기 전용 인스턴스로만 쓴다.
+
 ### Not done
 
-- 쓰기 중인 reader 의 제자리 승격(`pg_promote`): reader 의 쓰기가 로컬 전용이라 재시작이 필요하다.
 - 실제 AWS S3 에서의 검증(조건부 PUT, 404 삭제 응답, 서명된 `x-amz-meta-token`).
 
 ## Open questions
