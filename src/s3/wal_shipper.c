@@ -121,6 +121,7 @@ static S3WalShipperShared *shipper = NULL;
 typedef struct
 {
 	uint64		seq;
+	XLogRecPtr	start;
 	XLogRecPtr	end;
 } ShippedChunk;
 
@@ -133,12 +134,13 @@ static ShippedChunk *shipped = NULL;
  */
 static uint64 recoveredFrom = 0,
 			recoveredTo = 0;
+static List *recoveredTerminators = NIL;	/* their seqs, ascending */
 static int	shippedHead = 0,
 			shippedTail = 0,
 			shippedCap = 0;
 
 static void
-shipped_push(uint64 seq, XLogRecPtr end)
+shipped_push(uint64 seq, XLogRecPtr start, XLogRecPtr end)
 {
 	if (shippedTail == shippedCap)
 	{
@@ -159,6 +161,7 @@ shipped_push(uint64 seq, XLogRecPtr end)
 		}
 	}
 	shipped[shippedTail].seq = seq;
+	shipped[shippedTail].start = start;
 	shipped[shippedTail].end = end;
 	shippedTail++;
 }
@@ -191,6 +194,17 @@ s3_wal_chunk_key(TimeLineID tli, uint64 seq)
 }
 
 #define chunk_key(tli, seq) s3_wal_chunk_key(tli, seq)
+
+/*
+ * A terminator's place, kept apart so that the chunk GC can leave it without
+ * reading every chunk: a terminator removed would free its key for the
+ * writer it fenced.
+ */
+static char *
+terminator_mark_key(TimeLineID tli, uint64 seq)
+{
+	return psprintf("wal/%08X/terminators/%020llu", tli, (unsigned long long) seq);
+}
 
 /*
  * The local hint of where the chunks of this timeline end: "<tli> <next seq>
@@ -313,13 +327,108 @@ read_chunk_header(TimeLineID tli, uint64 seq, ChunkHeader *header)
 }
 
 /*
+ * The WAL of a timeline as the bucket holds it, read for the divergence
+ * check: a segment from its archived object when there is one, else from the
+ * chunks, walked back from the newest this data directory knows of.  Chunks
+ * whose WAL an archived segment holds may be gone, but then the segment is
+ * there.
+ */
+typedef struct
+{
+	TimeLineID	tli;
+	uint64		nextSeq;		/* the chunks before it */
+	XLogRecPtr	end;			/* where they end */
+	XLogSegNo	segno;			/* the archived segment in seg, if any */
+	StringInfoData seg;
+	bool		haveSeg;
+	XLogRecPtr	chunksFrom;		/* the chunks read back: [chunksFrom, end) */
+	StringInfoData chunks;
+	uint64		chunksSeq;		/* the next chunk to read back */
+} BucketWal;
+
+/* Bytes [lsn, lsn + n) of the bucket's WAL into dst; false when it has not */
+static bool
+bucket_wal_bytes(BucketWal *bw, XLogRecPtr lsn, char *dst, Size n)
+{
+	while (n > 0)
+	{
+		XLogSegNo	segno;
+		uint32		off;
+		Size		take;
+
+		XLByteToSeg(lsn, segno, wal_segment_size);
+		off = XLogSegmentOffset(lsn, wal_segment_size);
+		take = Min(n, wal_segment_size - off);
+		if (!bw->haveSeg || bw->segno != segno)
+		{
+			char		name[MAXFNAMELEN];
+			char	   *key;
+
+			XLogFileName(name, bw->tli, segno, wal_segment_size);
+			key = psprintf("wal/%s", name);
+			resetStringInfo(&bw->seg);
+			bw->haveSeg = s3_get_object(key, &bw->seg, true) == S3_RESPONSE_OK &&
+				bw->seg.len == wal_segment_size;
+			bw->segno = segno;
+			pfree(key);
+		}
+		if (bw->haveSeg)
+			memcpy(dst, bw->seg.data + off, take);
+		else
+		{
+			/* the chunks: read back until they cover lsn */
+			while (bw->chunksFrom > lsn)
+			{
+				ChunkHeader header;
+				StringInfoData body;
+				XLogRecPtr	upto;
+
+				if (bw->chunksSeq == 0)
+					return false;
+				initStringInfo(&body);
+				if (!read_chunk(bw->tli, bw->chunksSeq - 1, &header, &body) ||
+					header.magic != CHUNK_MAGIC)
+				{
+					pfree(body.data);
+					return false;
+				}
+				bw->chunksSeq--;
+				/* a later chunk wins where two overlap */
+				upto = Min(header.endLsn, bw->chunksFrom);
+				if (upto < bw->chunksFrom || header.startLsn >= upto)
+				{
+					pfree(body.data);
+					return false;
+				}
+				{
+					StringInfoData joined;
+
+					initStringInfo(&joined);
+					appendBinaryStringInfo(&joined, body.data, upto - header.startLsn);
+					appendBinaryStringInfo(&joined, bw->chunks.data, bw->chunks.len);
+					pfree(bw->chunks.data);
+					bw->chunks = joined;
+				}
+				pfree(body.data);
+				bw->chunksFrom = header.startLsn;
+			}
+			if (lsn + take > bw->end)
+				return false;
+			memcpy(dst, bw->chunks.data + (lsn - bw->chunksFrom), take);
+		}
+		dst += take;
+		lsn += take;
+		n -= take;
+	}
+	return true;
+}
+
+/*
  * Copy n bytes of record data from WAL position *pos on, skipping page
- * headers; wal holds the WAL from walStart to walEnd.  False when it ends
- * first.
+ * headers.  False when the bucket does not have them.
  */
 static bool
-wal_record_bytes(const char *wal, XLogRecPtr walStart, XLogRecPtr walEnd,
-				 XLogRecPtr *pos, char *dst, Size n)
+wal_record_bytes(BucketWal *bw, XLogRecPtr *pos, char *dst, Size n)
 {
 	XLogRecPtr	p = *pos;
 
@@ -332,13 +441,9 @@ wal_record_bytes(const char *wal, XLogRecPtr walStart, XLogRecPtr walEnd,
 		else if (p % XLOG_BLCKSZ == 0)
 			p += SizeOfXLogShortPHD;
 		take = Min(n, XLOG_BLCKSZ - p % XLOG_BLCKSZ);
-		if (p < walStart || p + take > walEnd)
+		if (p + take > bw->end || !bucket_wal_bytes(bw, p, dst, take))
 			return false;
-		if (dst)
-		{
-			memcpy(dst, wal + (p - walStart), take);
-			dst += take;
-		}
+		dst += take;
 		p += take;
 		n -= take;
 	}
@@ -346,7 +451,31 @@ wal_record_bytes(const char *wal, XLogRecPtr walStart, XLogRecPtr walEnd,
 	return true;
 }
 
-#define DIVERGENCE_SCAN_MAX		1024
+/* where n bytes of record data from p end, page headers skipped */
+static XLogRecPtr
+wal_advance(XLogRecPtr p, Size n)
+{
+	while (n > 0)
+	{
+		Size		take;
+
+		if (XLogSegmentOffset(p, wal_segment_size) == 0)
+			p += SizeOfXLogLongPHD;
+		else if (p % XLOG_BLCKSZ == 0)
+			p += SizeOfXLogShortPHD;
+		take = Min(n, XLOG_BLCKSZ - p % XLOG_BLCKSZ);
+		p += take;
+		n -= take;
+	}
+	return p;
+}
+
+typedef enum
+{
+	REPLAY_PASSED,				/* a whole record past where recovery ended */
+	REPLAY_NOT_PASSED,
+	REPLAY_UNKNOWN				/* the bucket's WAL there could not be read */
+} ReplayCheck;
 
 /*
  * Whether the chunks of this timeline hold a whole, valid record at
@@ -354,88 +483,75 @@ wal_record_bytes(const char *wal, XLogRecPtr walStart, XLogRecPtr walEnd,
  * hold only WAL it flushed, and recovery replays every whole record it
  * flushed: a whole record past it was put by a run this directory does not
  * continue -- a copy of the data directory started after the run it was
- * copied from went on, both with the same writer token.  The chunks before
- * nextSeq, ending at end, are walked back to replayEnd; when they cannot be
- * read back that far (removed once archived), nothing is said.
+ * copied from went on, both with the same writer token.  The bucket's WAL
+ * from replayEnd up to end (where the chunks before nextSeq end) is read from
+ * archived segments, or from the chunks where none is archived.
  */
-static bool
+static ReplayCheck
 chunks_pass_replay(TimeLineID tli, uint64 nextSeq, XLogRecPtr end,
 				   XLogRecPtr replayEnd)
 {
-	XLogRecPtr	pos = replayEnd;
-	XLogRecPtr	from = end;
-	XLogRecPtr	recPos;
-	StringInfoData wal;
-	uint64		seq = nextSeq;
+	BucketWal	bw;
+	XLogRecPtr	pos;
 	XLogRecord	rec;
 	char	   *data;
 	pg_crc32c	crc;
-	bool		result = false;
+	ReplayCheck result;
+
+	memset(&bw, 0, sizeof(bw));
+	bw.tli = tli;
+	bw.nextSeq = nextSeq;
+	bw.end = end;
+	bw.chunksFrom = end;
+	bw.chunksSeq = nextSeq;
+	initStringInfo(&bw.seg);
+	initStringInfo(&bw.chunks);
 
 	/* records start MAXALIGNed */
-	pos = pos + (MAXIMUM_ALIGNOF - 1) - (pos + (MAXIMUM_ALIGNOF - 1)) % MAXIMUM_ALIGNOF;
-	initStringInfo(&wal);
-	while (from > pos)
+	pos = replayEnd + (MAXIMUM_ALIGNOF - 1) -
+		(replayEnd + (MAXIMUM_ALIGNOF - 1)) % MAXIMUM_ALIGNOF;
+
+	/*
+	 * Not even a record header past it: what this data directory's own run
+	 * left, a record cut short.
+	 */
+	if (wal_advance(pos, SizeOfXLogRecord) > end)
 	{
-		ChunkHeader header;
-		StringInfoData body;
-		XLogRecPtr	upto;
-
-		if (seq == 0 || nextSeq - seq >= DIVERGENCE_SCAN_MAX)
-			goto unknown;
-		seq--;
-		initStringInfo(&body);
-		if (!read_chunk(tli, seq, &header, &body) ||
-			header.magic != CHUNK_MAGIC)
-		{
-			pfree(body.data);
-			goto unknown;
-		}
-		/* a later chunk wins where two overlap */
-		upto = Min(header.endLsn, from);
-		if (upto < from || header.startLsn >= upto)
-		{
-			pfree(body.data);
-			goto unknown;
-		}
-		{
-			StringInfoData joined;
-
-			initStringInfo(&joined);
-			appendBinaryStringInfo(&joined, body.data, upto - header.startLsn);
-			appendBinaryStringInfo(&joined, wal.data, wal.len);
-			pfree(wal.data);
-			wal = joined;
-		}
-		pfree(body.data);
-		from = header.startLsn;
-	}
-
-	recPos = pos;
-	if (!wal_record_bytes(wal.data, from, end, &recPos, (char *) &rec,
-						  SizeOfXLogRecord) ||
-		rec.xl_tot_len < SizeOfXLogRecord)
+		result = REPLAY_NOT_PASSED;
 		goto done;
+	}
+	if (!wal_record_bytes(&bw, &pos, (char *) &rec, SizeOfXLogRecord))
+	{
+		result = REPLAY_UNKNOWN;
+		goto done;
+	}
+	if (rec.xl_tot_len < SizeOfXLogRecord)
+	{
+		result = REPLAY_NOT_PASSED;
+		goto done;
+	}
+	/* the record does not end before the bucket's WAL does: cut short */
+	if (wal_advance(pos, rec.xl_tot_len - SizeOfXLogRecord) > end)
+	{
+		result = REPLAY_NOT_PASSED;
+		goto done;
+	}
 	data = palloc(rec.xl_tot_len - SizeOfXLogRecord);
-	if (wal_record_bytes(wal.data, from, end, &recPos, data,
-						 rec.xl_tot_len - SizeOfXLogRecord))
+	if (!wal_record_bytes(&bw, &pos, data, rec.xl_tot_len - SizeOfXLogRecord))
+		result = REPLAY_UNKNOWN;
+	else
 	{
 		INIT_CRC32C(crc);
 		COMP_CRC32C(crc, data, rec.xl_tot_len - SizeOfXLogRecord);
 		COMP_CRC32C(crc, (char *) &rec, offsetof(XLogRecord, xl_crc));
 		FIN_CRC32C(crc);
-		result = EQ_CRC32C(crc, rec.xl_crc);
+		result = EQ_CRC32C(crc, rec.xl_crc) ? REPLAY_PASSED : REPLAY_NOT_PASSED;
 	}
 	pfree(data);
-	goto done;
 
-unknown:
-	ereport(LOG,
-			(errmsg("could not read the S3 WAL chunks of timeline %u back to %X/%08X "
-					"to check them against local recovery",
-					tli, LSN_FORMAT_ARGS(replayEnd))));
 done:
-	pfree(wal.data);
+	pfree(bw.seg.data);
+	pfree(bw.chunks.data);
 	return result;
 }
 
@@ -606,6 +722,12 @@ s3_wal_place_terminator(uint64 token)
 		if (code == S3_RESPONSE_OK)
 			break;
 	}
+	{
+		char	   *mark = terminator_mark_key(tli, seq);
+
+		(void) s3_put_object_conditional(mark, "", 0, NULL, true, NULL);
+		pfree(mark);
+	}
 
 	/*
 	 * Chunks that came after the load, or a timeline started after it, are
@@ -668,7 +790,10 @@ put_history(TimeLineID tli)
 		ereport(ERROR,
 				(errmsg("the history of timeline %u is not in pg_wal", tli)));
 	key = psprintf("wal/%s", name);
-	(void) s3_put_object_fenced(key, data, size, NULL);
+	/* a takeover's second wall: the lease is still ours */
+	while (s3_put_object_fenced_until(key, data, size, NULL,
+									  s3_lease_hold()) != S3_RESPONSE_OK)
+		;
 	pfree(key);
 	pfree(data);
 }
@@ -771,24 +896,50 @@ segments_reach_bucket(void)
 }
 
 /*
- * Whether the segment holding lsn is in the archive.  A checkpoint removes
- * or recycles a segment, and its archive status file with it, only once it
- * is archived: a segment removed already is.
+ * Whether the segment holding lsn is in the bucket, as an object of its own.
+ * Asked of the bucket itself: the local signs (an archive status file, a
+ * segment the checkpoint removed) are also there for a segment
+ * restore_command fetched -- assembled from chunks, never put as an object --
+ * and the removed segment number does not tell timelines apart.  They only
+ * spare the request for a segment certainly not archived yet.  The last
+ * segment found is remembered, as the chunks of one segment are asked about
+ * in a row.
  */
 static bool
 segment_archived(TimeLineID tli, XLogRecPtr lsn)
 {
+	static TimeLineID foundTli = 0;
+	static XLogSegNo foundSegno = 0;
 	char		xlogfname[MAXFNAMELEN];
 	char		path[MAXPGPATH];
 	struct stat st;
 	XLogSegNo	segno;
+	char	   *key;
+	bool		found;
 
 	XLByteToSeg(lsn, segno, wal_segment_size);
-	if (segno <= XLogGetLastRemovedSegno())
+	if (foundTli == tli && foundSegno == segno)
 		return true;
 	XLogFileName(xlogfname, tli, segno, wal_segment_size);
 	snprintf(path, sizeof(path), XLOGDIR "/archive_status/%s.done", xlogfname);
-	return stat(path, &st) == 0;
+	if (segno > XLogGetLastRemovedSegno() && stat(path, &st) != 0)
+		return false;
+	key = psprintf("wal/%s", xlogfname);
+	found = s3_object_exists(key);
+	pfree(key);
+	if (found)
+	{
+		foundTli = tli;
+		foundSegno = segno;
+	}
+	return found;
+}
+
+/* a chunk may span two segments: both have to be in the bucket */
+static bool
+chunk_archived(TimeLineID tli, XLogRecPtr start, XLogRecPtr end)
+{
+	return segment_archived(tli, start) && segment_archived(tli, end - 1);
 }
 
 /*
@@ -804,7 +955,8 @@ chunks_gc(TimeLineID tli)
 {
 	recovered_gc(tli);
 	while (shippedHead < shippedTail - 1 &&
-		   segment_archived(tli, shipped[shippedHead].end - 1))
+		   chunk_archived(tli, shipped[shippedHead].start,
+						  shipped[shippedHead].end))
 	{
 		uint64		from = shipped[shippedHead].seq;
 		uint64		to = from + 1;
@@ -814,7 +966,8 @@ chunks_gc(TimeLineID tli)
 		while (shippedHead < shippedTail - 1 &&
 			   shipped[shippedHead].seq == to &&
 			   to - from < 1000 &&
-			   segment_archived(tli, shipped[shippedHead].end - 1))
+			   chunk_archived(tli, shipped[shippedHead].start,
+							  shipped[shippedHead].end))
 		{
 			shippedHead++;
 			to++;
@@ -845,11 +998,49 @@ chunks_gc_recover(TimeLineID tli, uint64 nextSeq)
 	pfree(prefix);
 	recoveredFrom = first;
 	recoveredTo = nextSeq;
+
+	prefix = psprintf("wal/%08X/terminators/", tli);
+	keys = s3_list_objects(prefix, NULL);
+	foreach(lc, keys)
+	{
+		uint64	   *seq = MemoryContextAlloc(TopMemoryContext, sizeof(uint64));
+
+		*seq = strtou64((char *) lfirst(lc) + strlen(prefix), NULL, 10);
+		recoveredTerminators = lappend(recoveredTerminators, seq);
+	}
+	list_free_deep(keys);
+	pfree(prefix);
+}
+
+/* schedule [from, to) but the terminators in it */
+static void
+recovered_delete(TimeLineID tli, uint64 from, uint64 to)
+{
+	ListCell   *lc;
+
+	foreach(lc, recoveredTerminators)
+	{
+		uint64		t = *(uint64 *) lfirst(lc);
+
+		if (t < from || t >= to)
+			continue;
+		if (from < t)
+			(void) s3_schedule_wal_chunks_delete(tli, from, t);
+		from = t + 1;
+	}
+	if (from < to)
+		(void) s3_schedule_wal_chunks_delete(tli, from, to);
 }
 
 /*
- * Whether a recovered chunk's WAL is in an archived segment.  A chunk that is
- * gone was removed as such.
+ * Whether a recovered chunk may go: its WAL is in archived segments.  A chunk
+ * that is gone was removed as such.  A terminator is passed over (the
+ * chunks after it may go) but stays: removed, its key would be free for the
+ * writer it fenced (recovered_delete).  The chunks' ends do not grow
+ * with their numbers across a restart (a run ships again from where its
+ * recovery ended), but a chunk whose WAL is archived has every chunk before
+ * it holding archived WAL or WAL no restore reads (a later chunk wins where
+ * two overlap), so the prefix the bisection finds may go.
  */
 static bool
 recovered_archived(TimeLineID tli, uint64 seq)
@@ -859,8 +1050,8 @@ recovered_archived(TimeLineID tli, uint64 seq)
 	if (!read_chunk_header(tli, seq, &header))
 		return true;
 	if (header.magic != CHUNK_MAGIC)
-		return false;
-	return segment_archived(tli, header.endLsn - 1);
+		return true;
+	return chunk_archived(tli, header.startLsn, header.endLsn);
 }
 
 /*
@@ -893,7 +1084,7 @@ recovered_gc(TimeLineID tli)
 	{
 		uint64		to = Min(upto, recoveredFrom + 1000);
 
-		(void) s3_schedule_wal_chunks_delete(tli, recoveredFrom, to);
+		recovered_delete(tli, recoveredFrom, to);
 		recoveredFrom = to;
 	}
 }
@@ -964,6 +1155,7 @@ s3_wal_shipper_main(Datum main_arg)
 	MemoryContext cxt;
 	TimestampTz lastReply = 0;
 	TimestampTz lastGc = 0;
+	bool		leaseChecked = false;
 
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	BackgroundWorkerUnblockSignals();
@@ -1010,6 +1202,7 @@ s3_wal_shipper_main(Datum main_arg)
 			put_history(tli);
 		}
 	}
+walk:
 	while (read_chunk_header(tli, nextSeq, &existing))
 	{
 		/* our own terminator: a load that started without a new timeline */
@@ -1036,6 +1229,48 @@ s3_wal_shipper_main(Datum main_arg)
 		start = existing.endLsn;
 		nextSeq++;
 	}
+
+	/*
+	 * The hint is not made durable after every chunk: after a crash of the
+	 * machine it may name a chunk the GC has removed since (its WAL was
+	 * archived), with later chunks of this data directory's run still there.
+	 * Go on from the first of them; the check against where recovery ended,
+	 * below, still tells a copy of the data directory.
+	 */
+	{
+		char	   *after = chunk_key(tli, nextSeq);
+		char	   *prefix = psprintf("wal/%08X/chunks/", tli);
+		List	   *keys = s3_list_objects(prefix, after);
+		uint64		next = 0;
+		bool		found = false;
+
+		if (keys != NIL)
+		{
+			next = strtou64((char *) linitial(keys) + strlen(prefix), NULL, 10);
+			found = next > nextSeq && read_chunk_header(tli, next, &existing);
+		}
+		list_free_deep(keys);
+		pfree(prefix);
+		pfree(after);
+		if (found)
+		{
+			if (!s3_lease_own_token(existing.token))
+				s3_stop_instance("the S3 bucket has WAL past this data directory",
+								 psprintf("WAL chunk %llu of timeline %u was put by writer "
+										  "token " UINT64_FORMAT ": load the data directory "
+										  "from the bucket again.",
+										  (unsigned long long) next, tli, existing.token));
+			ereport(LOG,
+					(errmsg("WAL chunks %llu to %llu of timeline %u are gone, going on from chunk %llu",
+							(unsigned long long) nextSeq, (unsigned long long) next - 1,
+							tli, (unsigned long long) next)));
+			nextSeq = next;
+			if (existing.magic == CHUNK_MAGIC)
+				start = existing.startLsn;
+			goto walk;
+		}
+	}
+
 	/*
 	 * A chunk may end inside a record: recovery stopped at the last whole
 	 * one, and the WAL written since starts there.  Ship from there, over the
@@ -1045,12 +1280,21 @@ s3_wal_shipper_main(Datum main_arg)
 	replayEnd = pg_atomic_read_u64(&shipper->replayEndLsn);
 	if (!XLogRecPtrIsInvalid(replayEnd) && replayEnd < start)
 	{
-		if (chunks_pass_replay(tli, nextSeq, start, replayEnd))
+		ReplayCheck check = chunks_pass_replay(tli, nextSeq, start, replayEnd);
+
+		if (check == REPLAY_PASSED)
 			s3_stop_instance("the S3 bucket has WAL past this data directory",
 							 psprintf("The WAL chunks of timeline %u hold a whole record "
 									  "at %X/%08X, where recovery of this data directory "
 									  "ended: another copy of it went on writing.  Load "
 									  "the data directory from the bucket again.",
+									  tli, LSN_FORMAT_ARGS(replayEnd)));
+		if (check == REPLAY_UNKNOWN)
+			s3_stop_instance("could not check the S3 bucket's WAL against this data directory",
+							 psprintf("Neither an archived segment nor the WAL chunks of "
+									  "timeline %u have the WAL at %X/%08X, where recovery "
+									  "of this data directory ended.  Load the data "
+									  "directory from the bucket again.",
 									  tli, LSN_FORMAT_ARGS(replayEnd)));
 		start = replayEnd;
 	}
@@ -1162,12 +1406,18 @@ s3_wal_shipper_main(Datum main_arg)
 		{
 			XLogRecPtr	end = chunkStart + chunk.len;
 
+			/* the run's first chunk: the lease is still ours */
+			if (!leaseChecked)
+			{
+				(void) s3_lease_hold();
+				leaseChecked = true;
+			}
 			if (!put_chunk(tli, nextSeq, chunkStart, end, chunk.data))
 				ereport(ERROR,
 						(errmsg("WAL chunk %llu of timeline %u belongs to another writer",
 								(unsigned long long) nextSeq, tli)));
 			if (segments_reach_bucket())
-				shipped_push(nextSeq, end);
+				shipped_push(nextSeq, chunkStart, end);
 			nextSeq++;
 			flushed = end;
 			set_flushed(flushed);

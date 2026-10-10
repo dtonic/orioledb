@@ -1895,6 +1895,186 @@ class S3Test(S3BaseTest):
 				last.cleanup()
 			copy.cleanup()
 
+	def copy_while_stopped(self, node, copy):
+		"""A crash-consistent copy of node's data directory into copy's."""
+		pids = [node.pid] + [
+		    int(p) for p in os.popen(
+		        f"ps -o pid= --ppid {node.pid}").read().split()]
+		for pid in pids:
+			os.kill(pid, signal.SIGSTOP)
+		try:
+			shutil.rmtree(copy.data_dir)
+			shutil.copytree(node.data_dir, copy.data_dir, symlinks=True)
+		finally:
+			for pid in pids:
+				os.kill(pid, signal.SIGCONT)
+		os.unlink(os.path.join(copy.data_dir, 'postmaster.pid'))
+
+	def test_s3_copy_is_stopped_after_its_chunks_are_archived(self):
+		"""The writer goes on long after the copy was taken: the chunks the
+		copy would have to read back to where its recovery ended are archived
+		and gone.  The copy reads that WAL from the archived segments and
+		still stops; if it could read it from nowhere it stops too, rather
+		than ship."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_lease_duration = 15
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		with self.initNode(self.getBasePort() + 1, 'tgsc') as copy:
+			self.copy_while_stopped(node, copy)
+			first = len(self.chunk_keys())
+			for i in range(11, 31):
+				node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+				# no checkpoint: the bucket's root stays the copy's
+				if i % 5 == 0:
+					node.safe_psql("SELECT pg_switch_wal();")
+			# the copy's chunks are gone
+			deadline = time.time() + 60
+			while time.time() < deadline and \
+			    min(int(k.rsplit('/', 1)[1]) for k in self.chunk_keys()) < first:
+				time.sleep(1)
+			self.assertGreaterEqual(
+			    min(int(k.rsplit('/', 1)[1]) for k in self.chunk_keys()), first)
+			os.kill(node.pid, signal.SIGKILL)
+
+			copy.append_conf(port=copy.port)
+			try:
+				copy.start()
+			except StartNodeException:
+				pass
+			deadline = time.time() + 120
+			stopped = False
+			while time.time() < deadline and not stopped:
+				with open(copy.pg_log_file) as f:
+					log = f.read()
+				stopped = "another copy of it went on writing" in log or \
+				    "could not check the S3 bucket's WAL" in log
+				time.sleep(1)
+			self.assertTrue(stopped)
+			try:
+				copy.stop(['-m', 'immediate'])
+			except Exception:
+				pass
+
+			with self.initNode(self.getBasePort() + 2, 'tgsd') as last:
+				self.loader.download(last.data_dir)
+				last.append_conf(port=last.port)
+				last.start()
+				self.assertEqual([(30, )],
+				                 last.execute("SELECT count(*) FROM o_test"))
+				last.stop()
+				last.cleanup()
+			copy.cleanup()
+
+	def test_s3_restart_goes_on_past_a_lagging_hint(self):
+		"""The hint of where this directory's chunks end is not made durable
+		after every chunk: after a machine crash it may name a chunk the GC
+		has removed since.  The restart lists the chunks and goes on from the
+		first left, instead of shipping under them."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			wal_keep_size = 0
+			min_wal_size = 32MB
+			max_wal_size = 64MB
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		seq_file = os.path.join(node.data_dir, 'orioledb_data', 's3_wal_seq')
+		with open(seq_file) as f:
+			old_hint = f.read()
+		old_seq = int(old_hint.split()[1])
+		for i in range(1, 21):
+			node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+			if i % 5 == 0:
+				node.safe_psql("SELECT pg_switch_wal();")
+				node.safe_psql("CHECKPOINT;")
+		deadline = time.time() + 60
+		while time.time() < deadline and \
+		    min(int(k.rsplit('/', 1)[1]) for k in self.chunk_keys()) <= old_seq:
+			time.sleep(1)
+		self.assertGreater(
+		    min(int(k.rsplit('/', 1)[1]) for k in self.chunk_keys()), old_seq)
+		node.stop(['-m', 'immediate'])
+		# what a crash of the machine may leave: the hint of long ago
+		with open(seq_file, 'w') as f:
+			f.write(old_hint)
+		node.start()
+		node.safe_psql("INSERT INTO o_test VALUES (21);")
+		self.assertEqual([(21, )], node.execute("SELECT count(*) FROM o_test"))
+		node.stop(['-m', 'immediate'])
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(21, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
+
+	def test_s3_restore_refuses_a_gap_in_the_chunks(self):
+		"""A chunk missing between two that are there is WAL that was
+		acknowledged and is not in the bucket: restoring the segment up to the
+		gap would end recovery there and leave the rest out without a word.
+		Recovery stops instead."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		before = set(self.chunk_keys())
+		for i in range(1, 11):
+			node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+		node.stop(['-m', 'immediate'])
+		# one of the chunks the commits after the checkpoint went to
+		keys = sorted(k for k in self.chunk_keys()
+		              if k.startswith('wal/00000001/') and k not in before)
+		self.assertGreater(len(keys), 4)
+		self.client.delete_object(Bucket=self.bucket_name,
+		                          Key=keys[len(keys) // 2])
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			try:
+				new_node.start()
+			except StartNodeException:
+				pass
+			# recovery stops at the gap; it never promotes
+			deadline = time.time() + 60
+			while True:
+				with open(new_node.pg_log_file) as f:
+					log = f.read()
+				if "could not restore file" in log:
+					break
+				self.assertLess(time.time(), deadline)
+				time.sleep(0.5)
+			self.assertNotIn("database system is ready to accept connections",
+			                 log)
+			try:
+				new_node.stop(['-m', 'immediate'])
+			except Exception:
+				pass
+			new_node.cleanup()
+
 	def test_s3_truncate_in_place_numbers_parts_on(self):
 		"""TRUNCATE of a table whose trees the same transaction made empties
 		them in place, files and maps with them.  The trees go on numbering

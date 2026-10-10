@@ -1112,16 +1112,21 @@ lease_ensure(int minSecs)
 
 /*
  * Before an object a fenced writer must not put (a WAL segment of the
- * archive): the lease is ours for a while yet, or the instance stops.  A
- * writer taken over waits for the lease to run out on the store's clock, and
- * this one stops putting before that, as it does before committing root.
+ * archive): the lease is ours for a while yet, or the instance stops.
+ * Returns until when: the put is given up then (s3_put_object_fenced_until)
+ * and done again under a renewed lease.  A writer taken over waits for the
+ * lease to run out on the store's clock, which is past that.
  */
-void
+TimestampTz
 s3_lease_hold(void)
 {
+	TimestampTz deadline;
+
 	LWLockAcquire(&lease->lock, LW_EXCLUSIVE);
 	lease_ensure(s3_lease_duration / 2);
+	deadline = lease->deadline;
 	LWLockRelease(&lease->lock);
+	return deadline;
 }
 
 /*

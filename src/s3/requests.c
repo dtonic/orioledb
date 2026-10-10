@@ -314,6 +314,21 @@ request_handle(struct curl_slist **slist)
 	return curl;
 }
 
+/*
+ * When set, no request attempt runs past it, and a failure is not retried
+ * once it is reached: the caller holds something (the writer lease) only
+ * until then.
+ */
+static TimestampTz requestDeadline = 0;
+static long fenced_put(char *objectname, Pointer data, uint64 dataSize,
+					   char *dataChecksum);
+
+static bool
+request_deadline_passed(void)
+{
+	return requestDeadline != 0 && GetCurrentTimestamp() >= requestDeadline;
+}
+
 static long
 s3_request(const char *method, char *objectname,
 		   Pointer data, uint64 dataSize, char *dataChecksum,
@@ -437,6 +452,12 @@ s3_request(const char *method, char *objectname,
 		curl_easy_setopt(curl, CURLOPT_HEADERDATA, &headers);
 		if (timeout > 0)
 			curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
+		if (requestDeadline != 0)
+		{
+			long		left = (long) ((requestDeadline - GetCurrentTimestamp()) / 1000);
+
+			curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, Max(left, 1L));
+		}
 
 		sc = curl_easy_perform(curl);
 		http_code = 0;
@@ -458,7 +479,7 @@ s3_request(const char *method, char *objectname,
 		 * A body the store received cut short (BadDigest, IncompleteBody) was
 		 * damaged on the way and refused: send it again.
 		 */
-		if (!retry || !IsUnderPostmaster ||
+		if (!retry || !IsUnderPostmaster || request_deadline_passed() ||
 			!(s3_request_is_transient(sc, http_code) ||
 			  (http_code == 400 && body->data &&
 			   (strstr(body->data, "<Code>BadDigest</Code>") != NULL ||
@@ -1084,12 +1105,21 @@ s3_object_holds(char *objectname, Pointer data, uint64 dataSize)
 {
 	StringInfoData body;
 	bool		same;
+	long		code;
+	int			sc;
 
 	initStringInfo(&body);
-	if (s3_get_object(objectname, &body, true) == S3_RESPONSE_NOT_FOUND)
+	code = s3_request("GET", objectname, NULL, 0, NULL, NULL, false, true, 0,
+					  &body, NULL, NULL, &sc, NULL, NULL);
+	if (sc == 0 && code == S3_RESPONSE_OK)
+		same = body.len == dataSize && memcmp(body.data, data, dataSize) == 0;
+	else if (code == S3_RESPONSE_NOT_FOUND || request_deadline_passed())
 		same = false;
 	else
-		same = body.len == dataSize && memcmp(body.data, data, dataSize) == 0;
+		ereport(FATAL, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+						errmsg("could not get object from S3"),
+						errdetail("object \"%s\", return code = %d, http code = %ld",
+								  objectname, sc, code)));
 	pfree(body.data);
 	return same;
 }
@@ -1108,6 +1138,37 @@ long
 s3_put_object_fenced(char *objectname, Pointer data, uint64 dataSize,
 					 char *dataChecksum)
 {
+	return s3_put_object_fenced_until(objectname, data, dataSize,
+									  dataChecksum, 0);
+}
+
+/*
+ * The same, but given up at deadline (0: never): returns 0 then, having put
+ * nothing past it.
+ */
+long
+s3_put_object_fenced_until(char *objectname, Pointer data, uint64 dataSize,
+						   char *dataChecksum, TimestampTz deadline)
+{
+	long		result;
+
+	requestDeadline = deadline;
+	PG_TRY();
+	{
+		result = fenced_put(objectname, data, dataSize, dataChecksum);
+	}
+	PG_FINALLY();
+	{
+		requestDeadline = 0;
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static long
+fenced_put(char *objectname, Pointer data, uint64 dataSize,
+		   char *dataChecksum)
+{
 	StringInfoData buf;
 	char		token[32];
 	uint64		mine = s3_lease_token();
@@ -1122,6 +1183,11 @@ s3_put_object_fenced(char *objectname, Pointer data, uint64 dataSize,
 		char	   *author = NULL;
 		uint64		authorToken = 0;
 
+		if (request_deadline_passed())
+		{
+			pfree(buf.data);
+			return 0;
+		}
 		if (attempt > 0)
 			s3_request_backoff(attempt - 1, 0);
 		http_code = s3_request("PUT", objectname, data, dataSize, dataChecksum,
@@ -1129,6 +1195,8 @@ s3_put_object_fenced(char *objectname, Pointer data, uint64 dataSize,
 							   token, NULL);
 		if (sc == 0 && http_code == S3_RESPONSE_OK)
 			break;
+		if (sc != 0 && request_deadline_passed())
+			continue;
 		if (sc != 0 || (http_code != S3_RESPONSE_CONDITION_FAILED &&
 						http_code != S3_RESPONSE_CONDITION_CONFLICT))
 			ereport(FATAL, (errcode(ERRCODE_CONNECTION_EXCEPTION),
@@ -1138,7 +1206,8 @@ s3_put_object_fenced(char *objectname, Pointer data, uint64 dataSize,
 
 		http_code = s3_request("HEAD", objectname, NULL, 0, NULL, NULL, false,
 							   true, 0, &buf, NULL, NULL, &sc, NULL, &author);
-		if (http_code == S3_RESPONSE_NOT_FOUND)
+		if (http_code == S3_RESPONSE_NOT_FOUND ||
+			(sc != 0 && request_deadline_passed()))
 			continue;
 		if (sc != 0 || http_code != S3_RESPONSE_OK)
 			ereport(FATAL, (errcode(ERRCODE_CONNECTION_EXCEPTION),
@@ -1173,6 +1242,24 @@ s3_put_object_fenced(char *objectname, Pointer data, uint64 dataSize,
 
 	pfree(buf.data);
 	return S3_RESPONSE_OK;
+}
+
+/*
+ * Whether the object is in the bucket.  An answer the store does not give
+ * (an outage past the retries, a refusal) counts as no.
+ */
+bool
+s3_object_exists(char *objectname)
+{
+	StringInfoData buf;
+	long		http_code;
+	int			sc;
+
+	initStringInfo(&buf);
+	http_code = s3_request("HEAD", objectname, NULL, 0, NULL, NULL, false,
+						   true, 0, &buf, NULL, NULL, &sc, NULL, NULL);
+	pfree(buf.data);
+	return sc == 0 && http_code == S3_RESPONSE_OK;
 }
 
 /*

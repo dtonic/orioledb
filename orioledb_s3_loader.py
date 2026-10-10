@@ -727,8 +727,14 @@ class OrioledbS3ObjectLoader:
 			path = os.path.join(cache, str(seq))
 			if os.path.exists(path):
 				return
-			body = self.s3.get_object(Bucket=self.bucket_name,
-			                          Key=self.chunk_key(tli, seq))['Body'].read()
+			try:
+				body = self.s3.get_object(
+				    Bucket=self.bucket_name,
+				    Key=self.chunk_key(tli, seq))['Body'].read()
+			except ClientError as e:
+				if e.response['Error']['Code'] in ("404", "NoSuchKey"):
+					raise ChunkGone(tli, seq)
+				raise
 			tmp = f"{path}.tmp{os.getpid()}"
 			with open(tmp, 'wb') as f:
 				f.write(body)
@@ -765,6 +771,17 @@ class OrioledbS3ObjectLoader:
 		chunks of the writer it fenced off.  None when the bucket has nothing
 		of the segment.
 		"""
+		# a chunk listed and gone before it was read was removed once its
+		# segment was archived: ask for the segment again
+		for _ in range(10):
+			try:
+				return self.assemble_segment(tli, segno)
+			except ChunkGone:
+				continue
+		raise RestoreRefused(f"the WAL chunks of segment "
+		                     f"{self.segment_name(tli, segno)} keep going")
+
+	def assemble_segment(self, tli, segno):
 		size = self.segment_size
 		name = self.segment_name(tli, segno)
 		data = self.read_object(f"wal/{name}")
@@ -791,7 +808,12 @@ class OrioledbS3ObjectLoader:
 			if pos is None:
 				pos = max(start, lo)
 			if start > pos:
-				break
+				# a chunk missing between two that are there: the WAL
+				# after it was acknowledged and is not here; ending the
+				# segment at the gap would end recovery before it
+				raise RestoreRefused(
+				    f"WAL chunks of timeline {tli} miss {pos:X} to {start:X} "
+				    f"(before chunk {seq})")
 			body = self.chunk_body(tli, seq)
 			zero_from = max(start, lo)
 			if pos > zero_from:
@@ -805,7 +827,16 @@ class OrioledbS3ObjectLoader:
 
 	def restore(self, fname, path):
 		"""restore_command: 0 when FILE is put at PATH, 1 when the bucket
-		does not have it."""
+		does not have it, and above 125 when it cannot tell: PostgreSQL then
+		stops recovery rather than take the file as the end of the WAL."""
+		try:
+			return self.restore_file(fname, path)
+		except Exception as e:
+			print(f"orioledb_s3_loader: cannot restore {fname}: {e}",
+			      file=sys.stderr)
+			return 128
+
+	def restore_file(self, fname, path):
 		if re.fullmatch(r'[0-9A-F]{8}\.history', fname):
 			data = self.read_object(f"wal/{fname}")
 		elif re.fullmatch(r'[0-9A-F]{24}', fname):
@@ -915,6 +946,14 @@ class OrioledbS3ObjectLoader:
 
 CHUNK_MAGIC = 0x3143574f
 TERMINATOR_MAGIC = 0x3154574f
+
+
+class ChunkGone(Exception):
+	"""A chunk listed and gone before it was read."""
+
+
+class RestoreRefused(Exception):
+	"""The bucket's WAL cannot be put together without leaving some out."""
 
 
 PIN_TTL = 600

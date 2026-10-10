@@ -14,6 +14,7 @@
 #define __S3_LEASE_H__
 
 #include "access/xlogdefs.h"
+#include "datatype/timestamp.h"
 
 extern int	s3_lease_duration;
 extern int	s3_reader_pin_ttl;
@@ -40,7 +41,7 @@ extern void s3_stop_instance(const char *message, const char *detail);
 extern uint64 s3_checkpoint_token(uint32 chkpNum);
 extern bool s3_checkpoint_token_known(uint32 chkpNum, uint64 *token);
 extern void s3_lease_lost(const char *detail);
-extern void s3_lease_hold(void);
+extern TimestampTz s3_lease_hold(void);
 extern void s3_root_commit(uint32 checkpointNum, XLogRecPtr redoLsn,
 						   XLogRecPtr checkpointLsn);
 

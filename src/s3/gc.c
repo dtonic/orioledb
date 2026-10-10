@@ -818,16 +818,25 @@ collect_checkpoint(S3Manifest *m, S3Manifest *r, HTAB *dropped, HTAB *deleted)
 	foreach(lc, m->retired)
 	{
 		S3ManifestRetired *t = lfirst(lc);
+		char	   *prefix = psprintf("wal/%08X/chunks/", t->timeline);
+		List	   *keys = s3_list_objects(prefix, NULL);
+		ListCell   *kc;
 
-		for (uint64 seq = 0; seq <= t->lastSeq; seq++)
+		/*
+		 * The ones the bucket still has; the terminator stays, or its key
+		 * would be free for the writer it fenced.
+		 */
+		foreach(kc, keys)
 		{
-			char	   *key = psprintf("wal/%08X/chunks/%020llu", t->timeline,
-									   (unsigned long long) seq);
+			char	   *key = lfirst(kc);
+			uint64		seq = strtou64(key + strlen(prefix), NULL, 10);
 
 			gc_check_stop();
-			gc_delete(key);
-			pfree(key);
+			if (seq < t->lastSeq)
+				gc_delete(key);
 		}
+		list_free_deep(keys);
+		pfree(prefix);
 	}
 
 	/*

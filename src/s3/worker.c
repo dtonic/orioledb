@@ -550,8 +550,9 @@ s3process_task(uint64 taskLocation)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not read file \"%s\"", filename)));
-		s3_lease_hold();
-		(void) s3_put_object_fenced(objectname, data, size, NULL);
+		while (s3_put_object_fenced_until(objectname, data, size, NULL,
+										  s3_lease_hold()) != S3_RESPONSE_OK)
+			;
 		pfree(data);
 		pfree(filename);
 		pfree(objectname);
@@ -574,9 +575,10 @@ s3process_task(uint64 taskLocation)
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("could not read file \"%s\"", filename)));
-		/* a key not taken yet is no fence: the lease is */
-		s3_lease_hold();
-		(void) s3_put_object_fenced(objectname, data, size, NULL);
+		/* a key not taken yet is no fence: the lease is, while it lasts */
+		while (s3_put_object_fenced_until(objectname, data, size, NULL,
+										  s3_lease_hold()) != S3_RESPONSE_OK)
+			;
 		pfree(data);
 		pfree(filename);
 		pfree(objectname);
