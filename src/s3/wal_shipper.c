@@ -49,6 +49,7 @@
 #include "s3/lease.h"
 #include "s3/requests.h"
 #include "s3/wal_shipper.h"
+#include "s3/worker.h"
 
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -176,11 +177,13 @@ s3_wal_shipper_shmem_init(Pointer ptr, bool found)
 	}
 }
 
-static char *
-chunk_key(TimeLineID tli, uint64 seq)
+char *
+s3_wal_chunk_key(TimeLineID tli, uint64 seq)
 {
 	return psprintf("wal/%08X/chunks/%020llu", tli, (unsigned long long) seq);
 }
+
+#define chunk_key(tli, seq) s3_wal_chunk_key(tli, seq)
 
 /*
  * The local hint of where the chunks of this timeline end: "<tli> <next seq>
@@ -775,10 +778,10 @@ segment_archived(TimeLineID tli, XLogRecPtr lsn)
 }
 
 /*
- * Remove the chunks whose WAL an archived segment has.  A restore reads the
- * segments first and chunks only past them.  The newest chunk stays whatever
- * covers it: a takeover lists the timeline's chunks to find where to put its
- * terminator.
+ * Remove the chunks whose WAL an archived segment has, by the S3 workers.  A
+ * restore reads the segments first and chunks only past them.  The newest
+ * chunk stays whatever covers it: a takeover lists the timeline's chunks to
+ * find where to put its terminator.
  */
 static void
 chunks_gc(TimeLineID tli)
@@ -786,11 +789,20 @@ chunks_gc(TimeLineID tli)
 	while (shippedHead < shippedTail - 1 &&
 		   segment_archived(tli, shipped[shippedHead].end - 1))
 	{
-		char	   *key = chunk_key(tli, shipped[shippedHead].seq);
+		uint64		from = shipped[shippedHead].seq;
+		uint64		to = from + 1;
 
-		s3_delete_object(key);
-		pfree(key);
+		/* a run of consecutive chunks is one task */
 		shippedHead++;
+		while (shippedHead < shippedTail - 1 &&
+			   shipped[shippedHead].seq == to &&
+			   to - from < 1000 &&
+			   segment_archived(tli, shipped[shippedHead].end - 1))
+		{
+			shippedHead++;
+			to++;
+		}
+		(void) s3_schedule_wal_chunks_delete(tli, from, to);
 	}
 }
 

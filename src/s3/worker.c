@@ -25,6 +25,7 @@
 #include "s3/manifest.h"
 #include "s3/queue.h"
 #include "s3/requests.h"
+#include "s3/wal_shipper.h"
 #include "s3/worker.h"
 
 #include "access/xlog_internal.h"
@@ -647,6 +648,21 @@ s3process_task(uint64 taskLocation)
 		if ((result == S3_RESPONSE_OK) && task->typeSpecific.writeRootFile.delete)
 			unlink(filename);
 	}
+	else if (task->type == S3TaskTypeDeleteWalChunks)
+	{
+		uint64		from = task->typeSpecific.deleteWalChunks.fromSeq,
+					to = task->typeSpecific.deleteWalChunks.toSeq;
+		int			count = (int) (to - from);
+		char	  **keys = palloc(sizeof(char *) * Max(count, 1));
+
+		for (int i = 0; i < count; i++)
+			keys[i] = s3_wal_chunk_key(task->typeSpecific.deleteWalChunks.timeline,
+									   from + i);
+		s3_delete_objects(keys, count);
+		for (int i = 0; i < count; i++)
+			pfree(keys[i]);
+		pfree(keys);
+	}
 	else if (task->type == S3TaskTypeWritePGFile)
 	{
 		char	   *filename = task->typeSpecific.writePGFile.filename;
@@ -935,6 +951,27 @@ s3_schedule_wal_file_write(char *filename, bool archived)
 
 	pfree(task);
 
+	return location;
+}
+
+/*
+ * Schedule the removal of WAL chunks [fromSeq, toSeq) of a timeline: the
+ * shipper hands it over rather than waiting on the deletes itself, as every
+ * commit waits on the shipper.
+ */
+S3TaskLocation
+s3_schedule_wal_chunks_delete(uint32 timeline, uint64 fromSeq, uint64 toSeq)
+{
+	S3Task	   *task;
+	S3TaskLocation location;
+
+	task = (S3Task *) palloc0(sizeof(S3Task));
+	task->type = S3TaskTypeDeleteWalChunks;
+	task->typeSpecific.deleteWalChunks.timeline = timeline;
+	task->typeSpecific.deleteWalChunks.fromSeq = fromSeq;
+	task->typeSpecific.deleteWalChunks.toSeq = toSeq;
+	location = s3_queue_put_task((Pointer) task, sizeof(S3Task));
+	pfree(task);
 	return location;
 }
 

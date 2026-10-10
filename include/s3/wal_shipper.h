@@ -25,6 +25,7 @@ extern void s3_wal_shipper_init(void);
 extern void register_s3_wal_shipper(void);
 extern void s3_wal_shipper_set_catch_up(XLogRecPtr lsn);
 extern bool s3_wal_ship_rest(TimeLineID tli);
+extern char *s3_wal_chunk_key(TimeLineID tli, uint64 seq);
 extern bool s3_wal_shipper_wait(XLogRecPtr lsn);
 extern void s3_wal_place_terminator(uint64 token);
 extern PGDLLEXPORT void s3_wal_shipper_main(Datum main_arg);

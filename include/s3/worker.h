@@ -29,7 +29,8 @@ typedef enum
 	S3TaskTypeWriteEmptyDir,
 	S3TaskTypeWriteRootFile,
 	S3TaskTypeWritePGFile,
-	S3TaskTypeWriteArchiveFile	/* a complete WAL file: put once, fenced */
+	S3TaskTypeWriteArchiveFile,	/* a complete WAL file: put once, fenced */
+	S3TaskTypeDeleteWalChunks	/* WAL chunks an archived segment holds */
 } S3TaskType;
 
 /*
@@ -81,6 +82,12 @@ typedef struct
 			uint32		chkpNum;
 			char		filename[FLEXIBLE_ARRAY_MEMBER];
 		}			writePGFile;
+		struct
+		{
+			uint32		timeline;
+			uint64		fromSeq;	/* first chunk */
+			uint64		toSeq;		/* past the last */
+		}			deleteWalChunks;
 	}			typeSpecific;
 } S3Task;
 
@@ -108,6 +115,9 @@ extern S3TaskLocation s3_schedule_downlink_load(struct BTreeDescr *desc,
 												uint64 downlink);
 extern S3TaskLocation s3_schedule_root_file_write(char *filename, bool delete);
 extern S3TaskLocation s3_schedule_pg_file_write(uint32 chkpNum, char *filename);
+extern S3TaskLocation s3_schedule_wal_chunks_delete(uint32 timeline,
+													uint64 fromSeq,
+													uint64 toSeq);
 extern void s3_load_file_part(OIndexKey key, int32 segNum, int32 partNum);
 extern void s3_load_map_file(uint32 chkpNum, OIndexKey key);
 
