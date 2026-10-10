@@ -47,6 +47,8 @@ extern long s3_get_object_etag(char *objectname, StringInfo str,
 							   bool missing_ok, char **etag);
 extern void s3_delete_object(char *objectname);
 extern bool s3_object_exists(char *objectname);
+extern void (*s3_request_wait_hook) (void);
+extern void s3_check_bucket_versioning(void);
 extern void s3_delete_objects(char **objectnames, int count);
 extern List *s3_list_objects(const char *prefix, const char *startAfter);
 

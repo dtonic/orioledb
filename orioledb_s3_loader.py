@@ -612,6 +612,12 @@ class OrioledbS3ObjectLoader:
 			seg = self.restore_segment(tli, segno)
 			if seg is None:
 				raise Exception(f"The S3 bucket has no WAL segment {name}")
+			if self.checkpoint_only and segno == ckpt_seg:
+				# the segment goes on past the checkpoint record: a load of
+				# the checkpoint alone stops there
+				seg = end_after_record(
+				    seg, parse_lsn(control["Latest checkpoint location"]) % size,
+				    int(control["WAL block size"]))
 			self.write_wal(name, seg)
 
 		latest = tli
@@ -1050,6 +1056,32 @@ class ReaderPin:
 		self.remove()
 
 
+def end_after_record(seg, pos, block_size):
+	"""SEG with zeros after the WAL record at offset POS of it, if that
+	record ends in it.  Each page starts with a header (a long one on the
+	segment's first page), which a record runs over."""
+	short_header, long_header = 24, 40
+
+	def skip(p, n):
+		data = b''
+		while n > 0:
+			if p % block_size == 0:
+				p += long_header if p == 0 else short_header
+			take = min(n, block_size - p % block_size)
+			data += bytes(seg[p:p + take])
+			p += take
+			n -= take
+		return p, data
+
+	_, head = skip(pos, 4)
+	end, _ = skip(pos, struct.unpack('<I', head)[0])
+	if end > len(seg):
+		return seg
+	seg = bytearray(seg)
+	seg[end:] = bytes(len(seg) - end)
+	return seg
+
+
 def server_s3_settings(data_dir):
 	"""orioledb.s3_accesskey/secretkey/region as AWS_* variables, from the
 	server's configuration files and the options it was started with."""
@@ -1177,7 +1209,24 @@ def get_orioledb_control_data(data_dir: str):
 	return dict
 
 
+def resolve_localhost_names():
+	"""The server's curl takes every name under .localhost for the loopback
+	(RFC 6761), so a bucket in the host such as bucket.localhost works there;
+	connect the same way."""
+	from urllib3.util import connection
+	create_connection = connection.create_connection
+
+	def create(address, *args, **kwargs):
+		host, port = address
+		if host.endswith('.localhost'):
+			host = '127.0.0.1'
+		return create_connection((host, port), *args, **kwargs)
+
+	connection.create_connection = create
+
+
 if __name__ == '__main__':
+	resolve_localhost_names()
 	loader = OrioledbS3ObjectLoader()
 	loader.parse_args()
 	loader.run()

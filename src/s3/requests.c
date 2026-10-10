@@ -16,6 +16,7 @@
 
 #include <stdbool.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 #include "orioledb.h"
 
@@ -257,6 +258,12 @@ s3_request_is_transient(int sc, long http_code)
  * served while waiting, so a process told to stop does not sit out an
  * outage.
  */
+/*
+ * Called while a request waits to be retried: the WAL shipper answers its
+ * stream's keepalives from it, or the walsender would time out on it.
+ */
+void		(*s3_request_wait_hook) (void) = NULL;
+
 static void
 s3_request_backoff(int attempt, long http_code)
 {
@@ -270,11 +277,20 @@ s3_request_backoff(int attempt, long http_code)
 
 	if (IsUnderPostmaster)
 	{
-		(void) WaitLatch(MyLatch,
-						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						 delay, PG_WAIT_EXTENSION);
-		ResetLatch(MyLatch);
-		CHECK_FOR_INTERRUPTS();
+		/* in slices, so a waiting process can keep up its own duties */
+		while (delay > 0)
+		{
+			long		slice = Min(delay, 5000L);
+
+			(void) WaitLatch(MyLatch,
+							 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							 slice, PG_WAIT_EXTENSION);
+			ResetLatch(MyLatch);
+			CHECK_FOR_INTERRUPTS();
+			delay -= slice;
+			if (s3_request_wait_hook)
+				s3_request_wait_hook();
+		}
 	}
 	else
 		pg_usleep(delay * 1000L);
@@ -353,7 +369,10 @@ s3_request(const char *method, char *objectname,
 	else
 		checksumstringbuf = dataChecksum;
 
-	if (s3_prefix && objectname[0] != '?')
+	/* a path from the store's root: a bucket-level request */
+	if (objectname[0] == '/')
+		objectpath = objectname + 1;
+	else if (s3_prefix && objectname[0] != '?')
 	{
 		int			prefix_len = strlen(s3_prefix);
 
@@ -494,7 +513,7 @@ s3_request(const char *method, char *objectname,
 		s3_request_backoff(attempt, http_code);
 	}
 
-	if (objectpath != objectname)
+	if (objectpath != objectname && objectpath != objectname + 1)
 		pfree(objectpath);
 	if (checksumstringbuf != dataChecksum)
 		pfree(checksumstringbuf);
@@ -559,6 +578,66 @@ xml_next(const char *body, const char *tag, const char **pos)
 }
 
 /*
+ * Where a bucket-level request (a listing, the versioning state) goes.  An
+ * object's key is orioledb.s3_prefix/<name> after orioledb.s3_host, and that
+ * prefix holds either key prefix only (the bucket is in the host: a virtual
+ * host, or a host given with the bucket's path) or, first, the bucket itself
+ * (path-style addressing with the host alone).  The store's root answers a
+ * listing with its buckets in the second case: then the bucket is the
+ * prefix's first segment.
+ */
+static bool bucketResolved = false;
+static char bucketPath[MAXPGPATH];	/* "" or "/<bucket>/" */
+static char keyPrefix[MAXPGPATH];	/* "" or "<key prefix>/" */
+
+static void
+resolve_bucket_address(void)
+{
+	StringInfoData query;
+	StringInfoData body;
+	long		http_code;
+	int			sc;
+	int			len;
+
+	if (bucketResolved)
+		return;
+	bucketPath[0] = '\0';
+	keyPrefix[0] = '\0';
+	len = s3_prefix ? strlen(s3_prefix) : 0;
+	while (len > 0 && s3_prefix[len - 1] == '/')
+		len--;
+	if (len == 0)
+	{
+		bucketResolved = true;
+		return;
+	}
+	snprintf(keyPrefix, sizeof(keyPrefix), "%.*s/", len, s3_prefix);
+
+	initStringInfo(&query);
+	appendStringInfoString(&query, "?list-type=2&max-keys=1&prefix=");
+	append_uri_encoded(&query, keyPrefix);
+	initStringInfo(&body);
+	http_code = s3_request("GET", query.data, NULL, 0, NULL, NULL, false,
+						   true, 0, &body, NULL, NULL, &sc, NULL, NULL);
+	if (!(sc == 0 && http_code == S3_RESPONSE_OK &&
+		  strstr(body.data, "<ListBucketResult") != NULL))
+	{
+		const char *slash = memchr(s3_prefix, '/', len);
+		int			bucketLen = slash ? (int) (slash - s3_prefix) : len;
+
+		snprintf(bucketPath, sizeof(bucketPath), "/%.*s/", bucketLen, s3_prefix);
+		if (slash)
+			snprintf(keyPrefix, sizeof(keyPrefix), "%.*s/",
+					 len - bucketLen - 1, slash + 1);
+		else
+			keyPrefix[0] = '\0';
+	}
+	pfree(query.data);
+	pfree(body.data);
+	bucketResolved = true;
+}
+
+/*
  * The keys under prefix that sort after startAfter (NULL: all of them), in
  * order, without orioledb.s3_prefix: ListObjectsV2, page by page.
  */
@@ -567,19 +646,10 @@ s3_list_objects(const char *prefix, const char *startAfter)
 {
 	List	   *keys = NIL;
 	char	   *token = NULL;
-	int			skip = 0;
-	StringInfoData fullPrefix;
+	int			skip;
 
-	initStringInfo(&fullPrefix);
-	if (s3_prefix && s3_prefix[0])
-	{
-		int			prefix_len = strlen(s3_prefix);
-
-		if (s3_prefix[prefix_len - 1] == '/')
-			prefix_len--;
-		appendStringInfo(&fullPrefix, "%.*s/", prefix_len, s3_prefix);
-		skip = fullPrefix.len;
-	}
+	resolve_bucket_address();
+	skip = strlen(keyPrefix);
 
 	for (;;)
 	{
@@ -593,7 +663,7 @@ s3_list_objects(const char *prefix, const char *startAfter)
 
 		/* the parameters in their canonical order */
 		initStringInfo(&query);
-		appendStringInfoString(&query, "?");
+		appendStringInfo(&query, "%s?", bucketPath);
 		if (token)
 		{
 			appendStringInfoString(&query, "continuation-token=");
@@ -601,19 +671,20 @@ s3_list_objects(const char *prefix, const char *startAfter)
 			appendStringInfoChar(&query, '&');
 		}
 		appendStringInfoString(&query, "list-type=2&prefix=");
-		append_uri_encoded(&query, fullPrefix.data);
+		append_uri_encoded(&query, keyPrefix);
 		append_uri_encoded(&query, prefix);
 		if (startAfter && !token)
 		{
 			appendStringInfoString(&query, "&start-after=");
-			append_uri_encoded(&query, fullPrefix.data);
+			append_uri_encoded(&query, keyPrefix);
 			append_uri_encoded(&query, startAfter);
 		}
 
 		initStringInfo(&body);
 		http_code = s3_request("GET", query.data, NULL, 0, NULL, NULL, false,
 							   true, 0, &body, NULL, NULL, &sc, NULL, NULL);
-		if (sc != 0 || http_code != S3_RESPONSE_OK)
+		if (sc != 0 || http_code != S3_RESPONSE_OK ||
+			strstr(body.data, "<ListBucketResult") == NULL)
 			ereport(FATAL,
 					(errcode(ERRCODE_CONNECTION_EXCEPTION),
 					 errmsg("could not list objects in S3"),
@@ -640,8 +711,43 @@ s3_list_objects(const char *prefix, const char *startAfter)
 		if (token == NULL)
 			break;
 	}
-	pfree(fullPrefix.data);
 	return keys;
+}
+
+/*
+ * Refuse a bucket with versioning on or suspended: a delete there leaves a
+ * marker and the old version, so the GC frees nothing, and a conditional
+ * put's "the key is free" is judged against the delete markers.
+ */
+void
+s3_check_bucket_versioning(void)
+{
+	StringInfoData query;
+	StringInfoData body;
+	long		http_code;
+	int			sc;
+
+	resolve_bucket_address();
+	initStringInfo(&query);
+	appendStringInfo(&query, "%s?versioning=", bucketPath);
+	initStringInfo(&body);
+	http_code = s3_request("GET", query.data, NULL, 0, NULL, NULL, false,
+						   true, 0, &body, NULL, NULL, &sc, NULL, NULL);
+	if (sc == 0 && http_code == S3_RESPONSE_OK)
+	{
+		if (strstr(body.data, "<Status>Enabled</Status>") ||
+			strstr(body.data, "<Status>Suspended</Status>"))
+			ereport(FATAL,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("the S3 bucket has versioning on or suspended"),
+					 errhint("Use a bucket whose versioning was never enabled.")));
+	}
+	else
+		ereport(WARNING,
+				(errmsg("could not read the versioning state of the S3 bucket"),
+				 errdetail("return code = %d, http code = %ld", sc, http_code)));
+	pfree(query.data);
+	pfree(body.data);
 }
 
 #define DELETE_CONCURRENCY	16
@@ -1265,12 +1371,27 @@ s3_object_exists(char *objectname)
 /*
  * Put the whole file as S3 object.
  */
+#define S3_MAX_SINGLE_PUT	(UINT64CONST(5) * 1024 * 1024 * 1024)
+
 long
 s3_put_file(char *objectname, char *filename, bool ifNoneMatch)
 {
 	Pointer		data;
 	uint64		dataSize = 0;
 	long		res = -1;
+	struct stat st;
+
+	/*
+	 * One PUT carries at most 5 GB.  A PostgreSQL data file is split at
+	 * RELSEG_SIZE (1 GB by default): only a build with a larger one gets here.
+	 */
+	if (stat(filename, &st) == 0 && (uint64) st.st_size > S3_MAX_SINGLE_PUT)
+		ereport(FATAL,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("file \"%s\" is too large to put to S3 in one request",
+						filename),
+				 errdetail("It holds %lld bytes; S3 takes at most 5 GB per PUT.",
+						   (long long) st.st_size)));
 
 	data = read_file(filename, &dataSize);
 	if (data)

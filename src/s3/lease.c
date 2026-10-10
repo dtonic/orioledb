@@ -743,6 +743,9 @@ s3_lease_acquire(void)
 		ereport(FATAL,
 				(errmsg("invalid \"%s\" object in the S3 bucket", ROOT_KEY)));
 
+	/* a versioned bucket keeps everything the GC deletes */
+	s3_check_bucket_versioning();
+
 	/* the data directory is the bucket's, and not behind it */
 	if (rootExists)
 	{

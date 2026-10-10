@@ -798,6 +798,19 @@ put_history(TimeLineID tli)
 	pfree(data);
 }
 
+static void send_reply(WalReceiverConn *conn, XLogRecPtr flushed,
+					   bool requestReply);
+
+static WalReceiverConn *replyConn = NULL;
+
+/* while a put waits to be retried: tell the walsender we are alive */
+static void
+reply_while_waiting(void)
+{
+	if (replyConn)
+		send_reply(replyConn, pg_atomic_read_u64(&shipper->flushedLsn), false);
+}
+
 static void
 send_reply(WalReceiverConn *conn, XLogRecPtr flushed, bool requestReply)
 {
@@ -808,8 +821,11 @@ send_reply(WalReceiverConn *conn, XLogRecPtr flushed, bool requestReply)
 	/* written means in the bucket too: remote_write waits for the put */
 	pq_sendint64(&buf, flushed);
 	pq_sendint64(&buf, flushed);
-	/* never applied: remote_apply would wait for nothing that comes */
-	pq_sendint64(&buf, InvalidXLogRecPtr);
+	/*
+	 * Applied too: the bucket is where the WAL is kept, and nothing applies
+	 * it here; remote_apply then waits as remote_write does, not for ever.
+	 */
+	pq_sendint64(&buf, flushed);
 	pq_sendint64(&buf, GetCurrentTimestamp());
 	pq_sendbyte(&buf, requestReply ? 1 : 0);
 	walrcv_send(conn, buf.data, buf.len);
@@ -1324,6 +1340,8 @@ walk:
 				(errmsg("WAL shipper could not start streaming at %X/%08X",
 						LSN_FORMAT_ARGS(start))));
 
+	replyConn = conn;
+	s3_request_wait_hook = reply_while_waiting;
 	before_shmem_exit(shipper_exit, (Datum) 0);
 	pg_atomic_write_u32(&shipper->running, 1);
 	ereport(LOG,

@@ -2509,14 +2509,22 @@ o_after_checkpoint_cleanup_hook(XLogRecPtr checkPointRedo, int flags)
 	if (GetRecoveryState() != RECOVERY_STATE_DONE)
 		return;
 
-	if (XLogInsertAllowed())
+	if (XLogInsertAllowed() && s3_wal_shipping)
+	{
+		/*
+		 * The shipper puts the checkpoint record up: root waits for it
+		 * below, and no segment is switched for it.
+		 */
+	}
+	else if (XLogInsertAllowed())
 	{
 		XLogRecPtr	switchpoint;
 		XLogSegNo	xlogsegno;
 		char		xlogfilename[MAXFNAMELEN];
 
 		/*
-		 * Wait till archiver finishes with the checkpoint record.
+		 * Without the shipper the checkpoint record reaches the bucket in an
+		 * archived segment: switch, and wait for the archiver.
 		 */
 		switchpoint = RequestXLogSwitch(false);
 		XLByteToPrevSeg(switchpoint, xlogsegno, wal_segment_size);

@@ -1785,8 +1785,17 @@ class S3Test(S3BaseTest):
 		terminator is put after its last chunk, found by listing, and every
 		commit it acknowledged is recovered.  Put where the hint said, in the
 		gap, it ended the restore there."""
+		self.terminator_after_the_last_chunk(path_style=False)
+
+	def test_s3_terminator_goes_after_the_last_chunk_path_style(self):
+		"""The same with the bucket given as the prefix's first segment: the
+		listing goes to the bucket, not the store's root (which answers with
+		its buckets, and so with no chunk at all)."""
+		self.terminator_after_the_last_chunk(path_style=True)
+
+	def terminator_after_the_last_chunk(self, path_style):
 		node = self.node
-		node.append_conf(self.s3_conf())
+		node.append_conf(self.s3_conf(path_style=path_style))
 		node.append_conf("""
 			synchronous_standby_names = 's3'
 			orioledb.s3_lease_duration = 10
@@ -2617,10 +2626,16 @@ class S3Test(S3BaseTest):
 			new_node.stop()
 			new_node.cleanup()
 
-	def s3_conf(self):
-		return f"""
-			orioledb.s3_mode = true
+	def s3_conf(self, path_style=False):
+		# path_style: the host alone, the bucket as the prefix's first segment
+		location = f"""
+			orioledb.s3_host = '{self.host}:{self.port}'
+			orioledb.s3_prefix = '{self.bucket_name}'
+		""" if path_style else f"""
 			orioledb.s3_host = '{self.host}:{self.port}/{self.bucket_name}'
+		"""
+		return location + f"""
+			orioledb.s3_mode = true
 			orioledb.s3_region = '{self.region}'
 			orioledb.s3_accesskey = '{self.access_key_id}'
 			orioledb.s3_secretkey = '{self.secret_access_key}'
