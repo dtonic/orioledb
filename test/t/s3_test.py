@@ -11,6 +11,7 @@ import subprocess
 import sys
 from tempfile import mkstemp
 
+import threading
 from threading import Thread
 from unittest.mock import patch
 
@@ -793,13 +794,18 @@ class S3Test(S3BaseTest):
 			self.assertEqual([(20003, 100002)],
 			                 reader.execute("SELECT count(*), max(id) FROM o_test"))
 
+			self.assertEqual(self.s3_body('writer')['token'],
+			                 writer_before['token'])
+			# with the writer stopped, whatever changes in the bucket is the
+			# reader's doing: its pin, nothing else
+			node.stop()
 			before = self.bucket_objects()
 			reader.execute("SELECT count(*) FROM o_test WHERE length(pad) = 500")
 			reader.stop()
 			after = self.bucket_objects()
-			# what changed is the writer's, never the reader's
-			self.assertEqual(self.s3_body('writer')['token'],
-			                 writer_before['token'])
+			changed = {k for k in set(before) | set(after)
+			           if before.get(k) != after.get(k)}
+			self.assertTrue(changed <= {'readers'}, changed)
 			self.assertEqual(self.s3_body('root')['token'],
 			                 root_before['token'])
 			with open(reader.pg_log_file) as f:
@@ -807,7 +813,6 @@ class S3Test(S3BaseTest):
 			self.assertIn("reading the S3 bucket without writing to it", log)
 			self.assertNotIn("took the S3 writer lease", log)
 			reader.cleanup()
-		node.stop()
 
 	def test_s3_takeover_reads_what_came_after_the_load(self):
 		"""A data directory loaded while the writer still committed is behind
@@ -1227,6 +1232,50 @@ class S3Test(S3BaseTest):
 		self.assertGreater(int(self.kv('root')['checkpoint']), chkp)
 		node.stop()
 
+	def test_s3_puts_whose_answer_is_lost(self):
+		"""A PUT that went through but whose answer was lost is retried and
+		judged by what the bucket holds: a chunk, a part, a manifest, root and
+		the lease each come out as if answered, the writer keeps its lease,
+		and a load from the bucket has every acknowledged commit."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_gc_interval = 1
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, pad text) USING orioledb;
+		""")
+		ambiguous = AmbiguousPut()
+		with patch('moto.s3.responses.S3Response.put_object',
+		           new=lambda response: ambiguous(response)):
+			for r in range(3):
+				for i in range(20):
+					node.safe_psql(f"INSERT INTO o_test VALUES ({r * 1000 + i}, "
+					               f"repeat('x', 300));")
+				node.safe_psql(f"INSERT INTO o_test SELECT g, repeat('y', 300) "
+				               f"FROM generate_series({r * 1000 + 100}, "
+				               f"{r * 1000 + 900}) g;")
+				node.safe_psql("CHECKPOINT;")
+			node.safe_psql("INSERT INTO o_test VALUES (99999, 'last');")
+		self.assertTrue(all(ambiguous.landed.values()), ambiguous.landed)
+		self.assertEqual([(2464, )], node.execute("SELECT count(*) FROM o_test"))
+		with open(node.pg_log_file) as f:
+			self.assertNotIn("lost the S3 writer lease", f.read())
+		node.stop(['-m', 'immediate'])
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(2464, 'last')],
+			                 new_node.execute("SELECT count(*), max(pad) FILTER "
+			                                  "(WHERE id = 99999) FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
+
 	def test_s3_chunks_are_removed_once_archived(self):
 		"""A chunk is removed once an archived segment holds its WAL; a
 		restore takes the segments and the chunks after them."""
@@ -1289,7 +1338,7 @@ class S3Test(S3BaseTest):
 		     '-h', node.host, '-p', str(node.port), default_dbname()],
 		    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 		try:
-			peak = 0
+			early = None
 			deadline = time.time() + 80
 			removed = False
 			while time.time() < deadline and not removed:
@@ -1298,9 +1347,13 @@ class S3Test(S3BaseTest):
 				node.safe_psql("SELECT pg_switch_wal();")
 				node.safe_psql("CHECKPOINT;")
 				time.sleep(2)
-				count = len(self.chunk_keys())
-				removed = peak > 50 and count < peak / 2
-				peak = max(peak, count)
+				keys = set(self.chunk_keys())
+				if early is None:
+					early = keys or None
+					continue
+				# the chunks seen first are gone while commits still come
+				removed = not early & keys
+				self.assertIsNone(bench.poll())
 			self.assertTrue(removed)
 		finally:
 			bench.kill()
@@ -1676,6 +1729,7 @@ class S3Test(S3BaseTest):
 		every object the load reads after that is still there."""
 		node = self.gc_world()
 		paused = []
+		pausing = threading.Lock()
 
 		def go_on_writing():
 			for v in range(1, 4):
@@ -1686,10 +1740,12 @@ class S3Test(S3BaseTest):
 		real = botocore.client.BaseClient._make_api_call
 
 		def call(client, operation, params):
-			if operation == 'GetObject' and not paused and \
-			    '/maps/' in params.get('Key', ''):
-				paused.append(True)
-				go_on_writing()
+			# the load reads maps in parallel: one of them pauses it
+			if operation == 'GetObject' and '/maps/' in params.get('Key', ''):
+				with pausing:
+					if not paused:
+						paused.append(True)
+						go_on_writing()
 			return real(client, operation, params)
 
 		loaded = int(self.s3_body('root')['checkpoint'])
@@ -2214,18 +2270,7 @@ class S3Test(S3BaseTest):
 		node.safe_psql("CHECKPOINT;")
 		with self.initNode(self.getBasePort() + 1, 'tgsc') as copy:
 			# a crash-consistent copy: every process stopped while it is taken
-			pids = [node.pid] + [
-			    int(p) for p in os.popen(
-			        f"ps -o pid= --ppid {node.pid}").read().split()]
-			for pid in pids:
-				os.kill(pid, signal.SIGSTOP)
-			try:
-				shutil.rmtree(copy.data_dir)
-				shutil.copytree(node.data_dir, copy.data_dir, symlinks=True)
-			finally:
-				for pid in pids:
-					os.kill(pid, signal.SIGCONT)
-			os.unlink(os.path.join(copy.data_dir, 'postmaster.pid'))
+			self.copy_while_stopped(node, copy)
 			for i in range(11, 21):
 				node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
 			os.kill(node.pid, signal.SIGKILL)
@@ -2258,18 +2303,28 @@ class S3Test(S3BaseTest):
 			copy.cleanup()
 
 	def copy_while_stopped(self, node, copy):
-		"""A crash-consistent copy of node's data directory into copy's."""
-		pids = [node.pid] + [
-		    int(p) for p in os.popen(
-		        f"ps -o pid= --ppid {node.pid}").read().split()]
-		for pid in pids:
-			os.kill(pid, signal.SIGSTOP)
+		"""A crash-consistent copy of node's data directory into copy's:
+		the postmaster is stopped first, so no process starts while its
+		children are listed and stopped."""
+		os.kill(node.pid, signal.SIGSTOP)
+		pids = [node.pid]
 		try:
+			children = [int(p) for p in os.popen(
+			    f"ps -o pid= --ppid {node.pid}").read().split()]
+			for pid in children:
+				try:
+					os.kill(pid, signal.SIGSTOP)
+					pids.append(pid)
+				except ProcessLookupError:
+					pass
 			shutil.rmtree(copy.data_dir)
 			shutil.copytree(node.data_dir, copy.data_dir, symlinks=True)
 		finally:
 			for pid in pids:
-				os.kill(pid, signal.SIGCONT)
+				try:
+					os.kill(pid, signal.SIGCONT)
+				except ProcessLookupError:
+					pass
 		os.unlink(os.path.join(copy.data_dir, 'postmaster.pid'))
 
 	def test_s3_copy_is_stopped_after_its_chunks_are_archived(self):
