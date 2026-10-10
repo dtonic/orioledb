@@ -470,10 +470,12 @@ StaticAssertDecl(sizeof(OrioleDBPageHeader) == sizeof(OrioleDBOndiskPageHeader),
 #define S3_PART_BLOCKS(blocksize)	(ORIOLEDB_S3_PART_SIZE / (blocksize))
 /*
  * In a list of dead extents (S3 mode), an entry of this length gives the
- * blocks per part of the tree in its offset, and an entry of length 0 the end
- * of a part that is complete.
+ * blocks per part of the tree in its offset, an entry of length 0 the end
+ * of a part that is complete, and one of S3_DEAD_PARTS_BELOW_LEN that every
+ * part below its offset is gone (a tree emptied in place).
  */
 #define S3_DEAD_UNIT_LEN		0xFFFF
+#define S3_DEAD_PARTS_BELOW_LEN	0xFFFE
 #define S3_PARTS_PER_SEGMENT		(ORIOLEDB_SEGMENT_SIZE / ORIOLEDB_S3_PART_SIZE)
 
 #define InvalidFileExtentLen (0)

@@ -28,6 +28,7 @@
 #include "catalog/sys_trees.h"
 #include "postgres_ext.h"
 #include "recovery/recovery.h"
+#include "s3/manifest.h"
 #include "tableam/handler.h"
 #include "tableam/toast.h"
 #include "tableam/tree.h"
@@ -1552,7 +1553,9 @@ cleanup_btree_extended(OIndexKey ix_key, bool files, bool fsync,
 
 		if (shared && !shared->placeholder)
 			next = pg_atomic_read_u64(&((BTreeMetaPage *) O_GET_IN_MEMORY_PAGE(shared->rootInfo.metaPageBlkno))->s3NextPart);
-		s3_keep_part_floor(ix_key, next);
+		next = s3_keep_part_floor(ix_key, next);
+		if (next > 0)
+			s3_tree_parts_gone(ix_key.oids.datoid, ix_key.oids.relnode, next);
 	}
 
 	if (shared)

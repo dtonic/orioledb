@@ -34,7 +34,9 @@ struct CheckpointFileHeader
 /*
  * S3 mode: where a tree's two streams stand.  datafileLength of the
  * CheckpointFileHeader holds the tree's next part number; these follow the
- * header in the tree's map, and travel with an evicted tree.
+ * header in the tree's map, and travel with an evicted tree.  A tree loaded
+ * from its map starts both streams on fresh parts instead (see
+ * evictable_tree_init_meta()).
  */
 typedef struct
 {

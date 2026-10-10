@@ -17,6 +17,7 @@
 
 extern int	s3_gc_interval;
 extern int	s3_gc_max_pin_lag;
+extern int	s3_gc_keep_time;
 extern char *s3_compact_database;
 extern int	s3_compact_interval;
 extern double s3_compact_threshold;

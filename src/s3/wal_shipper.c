@@ -327,6 +327,22 @@ read_chunk_header(TimeLineID tli, uint64 seq, ChunkHeader *header)
 }
 
 /*
+ * Where chunk seq of a timeline ends, and whether it is a terminator: false
+ * when the bucket does not have it.
+ */
+bool
+s3_wal_chunk_end(TimeLineID tli, uint64 seq, bool *terminator, XLogRecPtr *end)
+{
+	ChunkHeader header;
+
+	if (!read_chunk_header(tli, seq, &header))
+		return false;
+	*terminator = header.magic == TERMINATOR_MAGIC;
+	*end = header.endLsn;
+	return true;
+}
+
+/*
  * The WAL of a timeline as the bucket holds it, read for the divergence
  * check: a segment from its archived object when there is one, else from the
  * chunks, walked back from the newest this data directory knows of.  Chunks

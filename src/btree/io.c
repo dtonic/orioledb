@@ -33,6 +33,7 @@
 #include "recovery/recovery.h"
 #include "s3/headers.h"
 #include "s3/manifest.h"
+#include "s3/requests.h"
 #include "s3/worker.h"
 #include "tableam/descr.h"
 #include "tableam/handler.h"
@@ -3996,6 +3997,34 @@ s3_part_floor(OIndexKey key)
 	return floor;
 }
 
+/*
+ * One past the highest part of the tree the bucket holds: where a tree whose
+ * map lost its header numbers on, so that no part the bucket has is put
+ * again with other blocks.
+ */
+uint64
+s3_bucket_next_part(OIndexKey key)
+{
+	char	   *prefix = psprintf("trees/%u/%u/parts/", key.oids.datoid,
+								  key.oids.relnode);
+	List	   *keys = s3_list_objects(prefix, NULL);
+	ListCell   *lc;
+	uint64		next = 0;
+
+	foreach(lc, keys)
+	{
+		const char *name = (const char *) lfirst(lc) + strlen(prefix);
+		char	   *end;
+		uint64		part = strtou64(name, &end, 10);
+
+		if (end != name && *end == '\0')
+			next = Max(next, part + 1);
+	}
+	list_free_deep(keys);
+	pfree(prefix);
+	return next;
+}
+
 static void
 map_next_part_callback(const char *filename, uint32 segno, char *ext,
 					   void *arg)
@@ -4014,7 +4043,7 @@ map_next_part_callback(const char *filename, uint32 segno, char *ext,
 	close(fd);
 }
 
-void
+uint64
 s3_keep_part_floor(OIndexKey key, uint64 inMemoryNext)
 {
 	uint64		floor = Max(s3_part_floor(key), inMemoryNext);
@@ -4029,7 +4058,7 @@ s3_keep_part_floor(OIndexKey key, uint64 inMemoryNext)
 	{
 		pfree(tmp);
 		pfree(filename);
-		return;
+		return 0;
 	}
 	len = snprintf(buf, sizeof(buf), UINT64_FORMAT "\n", floor);
 	fd = BasicOpenFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
@@ -4041,6 +4070,7 @@ s3_keep_part_floor(OIndexKey key, uint64 inMemoryNext)
 	durable_rename(tmp, filename, ERROR);
 	pfree(tmp);
 	pfree(filename);
+	return floor;
 }
 
 static void

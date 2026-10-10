@@ -4472,18 +4472,14 @@ checkpoint_btree_loop(BTreeDescr **descrPtr,
 				header->o_header.checkpointNum = 0;
 				if (FileExtentIsValid(page_desc->fileExtent))
 				{
-					if (orioledb_s3_mode)
-					{
-						page_desc->fileExtent.len = InvalidFileExtentLen;
-						page_desc->fileExtent.off = InvalidFileExtentOff;
-					}
-					else
-					{
-						/* the offset will not be used in current checkpoint */
-						free_extent_for_checkpoint(descr, &page_desc->fileExtent,
-												   chkpNum);
-						MARK_DIRTY(descr, blkno);
-					}
+					/*
+					 * The offset will not be used in current checkpoint.  In
+					 * S3 mode the extent is recorded dead from it on, as at
+					 * every other place a checkpoint stops referring to one.
+					 */
+					free_extent_for_checkpoint(descr, &page_desc->fileExtent,
+											   chkpNum);
+					MARK_DIRTY(descr, blkno);
 				}
 			}
 
@@ -6274,6 +6270,7 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 	BTreeMetaPage *meta_page;
 	uint32		chkp_num = *map_chkp_num;
 	bool		result = false;
+	bool		header_lost = false;
 
 	Assert(TREE_HAS_OIDS(desc));
 	Assert(evicted_data);
@@ -6351,10 +6348,18 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 			*map_chkp_num = prev_chkp_tag.num;
 			ferror = OFileRead(prev_chkp_file, (Pointer) &file_header,
 							   sizeof(file_header), 0, WAIT_EVENT_SLRU_READ) != sizeof(file_header);
-			if (!ferror && orioledb_s3_mode &&
-				OFileRead(prev_chkp_file, (Pointer) &s3Cursors, sizeof(s3Cursors),
-						  sizeof(file_header), WAIT_EVENT_SLRU_READ) != sizeof(s3Cursors))
-				S3_TREE_CURSORS_INIT(s3Cursors);	/* a map written at a build */
+
+			/*
+			 * S3 mode: the map's stream cursors are not taken.  The map's
+			 * checkpoint sealed its own stream before writing it, so every
+			 * block the map names is in a sealed part.  What the other
+			 * stream wrote since it was last sealed is for the next
+			 * checkpoint, which never committed if we load from here (a tree
+			 * in memory since then has evicted data instead).  Those blocks
+			 * are named by nothing: both streams start on fresh parts, so the
+			 * parts that hold them are never sealed nor uploaded, rather than
+			 * one going on and uploading a part whose first blocks never die.
+			 */
 			if (ferror)
 			{
 				ereport(FATAL, (errcode_for_file_access(),
@@ -6388,6 +6393,7 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 				file_header.leafPagesNum = 1;
 				file_header.ctid = 0;
 				file_header.bridgeCtid = 0;
+				header_lost = true;
 			}
 			else if (!DiskDownlinkIsValid(file_header.rootDownlink) &&
 					 file_header.datafileLength == 0 &&
@@ -6406,6 +6412,7 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 				file_header.leafPagesNum = 1;
 				file_header.ctid = 0;
 				file_header.bridgeCtid = 0;
+				header_lost = true;
 			}
 		}
 
@@ -6449,15 +6456,24 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 	if (orioledb_s3_mode)
 	{
 		int			i;
+		uint64		next;
 
 		for (i = 0; i < 2; i++)
 		{
 			pg_atomic_write_u64(&meta_page->datafileLength[i], s3Cursors.cursor[i]);
 			meta_page->partsInfo[i].sealFrom = s3Cursors.sealFrom[i];
 		}
-		pg_atomic_write_u64(&meta_page->s3NextPart,
-							Max(file_header.datafileLength,
-								s3_part_floor((OIndexKey) {.oids = desc->oids})));
+		next = Max(file_header.datafileLength,
+				   s3_part_floor((OIndexKey) {.oids = desc->oids}));
+
+		/*
+		 * A map with its header lost does not say how many parts the tree
+		 * handed out: number on past every part the bucket has, never over
+		 * one of them.
+		 */
+		if (header_lost)
+			next = Max(next, s3_bucket_next_part((OIndexKey) {.oids = desc->oids}));
+		pg_atomic_write_u64(&meta_page->s3NextPart, next);
 	}
 	else
 		pg_atomic_write_u64(&meta_page->datafileLength[0], file_header.datafileLength);

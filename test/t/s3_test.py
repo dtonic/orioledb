@@ -1,3 +1,4 @@
+import collections
 import logging
 import os
 import time
@@ -19,6 +20,7 @@ from testgres.defaults import default_dbname
 from testgres.enums import NodeStatus
 from testgres.exceptions import StartNodeException, QueryException
 
+from .base_test import wait_checkpointer_stopevent
 from .s3_base_test import S3BaseTest, s3_test_attrs, mock_put_object, \
  mock_put_object_conflict, mock_moto_unkown_error, FlakyPutObject
 
@@ -1059,6 +1061,48 @@ class S3Test(S3BaseTest):
 		        Bucket=self.bucket_name, Prefix='wal/').get("Contents", [])
 		    if '/chunks/' in x["Key"])
 
+	def test_s3_gc_removes_chunks_when_segments_are_not_archived(self):
+		"""With archiving off no segment is archived, so the shipper keeps
+		every chunk; the GC removes the ones before the segment of R's REDO,
+		and a restore still has what it needs."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			archive_mode = off
+			synchronous_standby_names = 's3'
+			orioledb.s3_gc_interval = 1
+			orioledb.s3_gc_keep_checkpoints = 1
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+		""")
+		early = None
+		for r in range(4):
+			for i in range(10):
+				node.safe_psql(f"INSERT INTO o_test VALUES ({r * 10 + i});")
+			node.safe_psql("SELECT pg_switch_wal();")
+			node.safe_psql("CHECKPOINT;")
+			if early is None:
+				early = set(self.chunk_keys())
+		self.assertTrue(early)
+		deadline = time.time() + 90
+		while time.time() < deadline and early & set(self.chunk_keys()):
+			time.sleep(1)
+		self.assertEqual(set(), early & set(self.chunk_keys()))
+		node.safe_psql("INSERT INTO o_test VALUES (1000);")
+		node.stop(['-m', 'immediate'])
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(41, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
+
 	def test_s3_chunks_are_removed_once_archived(self):
 		"""A chunk is removed once an archived segment holds its WAL; a
 		restore takes the segments and the chunks after them."""
@@ -1316,6 +1360,118 @@ class S3Test(S3BaseTest):
 			new_node.stop()
 			new_node.cleanup()
 
+	def test_s3_gc_removes_parts_written_before_a_crash(self):
+		"""Blocks the next checkpoint's stream wrote while a checkpoint ran
+		are no longer referenced once a crash goes back to that checkpoint;
+		their parts still go."""
+		node = self.gc_world("""
+			orioledb.enable_stopevents = true
+			orioledb.debug_disable_pools_limit = true
+			orioledb.main_buffers = 1MB
+		""")
+		node.safe_psql("UPDATE o_test SET v = v + 1;")
+		con = node.connect()
+		con.execute("SELECT pg_stopevent_set('checkpoint_step', "
+		            "'$.action == \"walkDownwards\" && "
+		            "$.treeName == \"o_test_pkey\" && $.lokey.id > 15000');")
+		con.commit()
+		checkpoint = Thread(target=lambda: node.safe_psql("CHECKPOINT;"))
+		checkpoint.start()
+		wait_checkpointer_stopevent(node)
+		# the checkpoint holds halfway: what it passed goes to the next stream
+		node.safe_psql("UPDATE o_test SET v = v + 1;")
+		node.safe_psql("UPDATE o_test SET v = v + 1;")
+		con.execute("SELECT pg_stopevent_reset('checkpoint_step');")
+		con.commit()
+		con.close()
+		checkpoint.join()
+		node.stop(['-m', 'immediate'])
+		node.start()
+		total = node.execute("SELECT sum(v) FROM o_test")[0][0]
+
+		seen = set(self.part_etags())
+		rounds = []
+		for v in range(4):
+			node.safe_psql("UPDATE o_test SET v = v + 1;")
+			node.safe_psql("CHECKPOINT;")
+			now = set(self.part_etags())
+			rounds.append(now - seen)
+			seen |= now
+		# the table's tree: every round rewrites each of its blocks
+		tree = collections.Counter(k.split('/')[2]
+		                           for k in rounds[-1]).most_common(1)[0][0]
+		recent = rounds[-1] | rounds[-2]
+
+		def left():
+			return {k for k in self.part_etags()
+			        if k.split('/')[2] == tree} - recent
+
+		deadline = time.time() + 90
+		while time.time() < deadline and left():
+			time.sleep(1)
+		self.assertEqual(set(), left())
+		self.assertEqual([(30000, total + 4 * 30000)],
+		                 node.execute("SELECT count(*), sum(v) FROM o_test"))
+		node.stop()
+
+	def test_s3_gc_folds_the_lists_of_a_checkpoint_with_no_manifest(self):
+		"""A checkpoint that finished locally but never got its manifest up
+		has its dead lists in the bucket all the same; the GC folds them, so
+		the blocks that died there do not live on."""
+		node = self.gc_world("orioledb.s3_lease_duration = 15")
+		parts = self.part_etags()
+		tree = collections.Counter(k.split('/')[2]
+		                           for k in parts).most_common(1)[0][0]
+		first = {k for k in parts if k.split('/')[2] == tree}
+		node.safe_psql("UPDATE o_test SET v = v + 1;")
+		flaky = FlakyPutObject(10**9, prefix='manifests/')
+		with patch('moto.s3.responses.S3Response.put_object',
+		           new=lambda response: flaky(response)):
+			checkpoint = Thread(target=lambda: node.execute("CHECKPOINT;"))
+			checkpoint.daemon = True
+			checkpoint.start()
+			deadline = time.time() + 60
+			while flaky.failed < 3 and time.time() < deadline:
+				time.sleep(0.2)
+			self.assertGreaterEqual(flaky.failed, 3)
+			node.stop(['-m', 'immediate'])
+			checkpoint.join(10)
+		node.start()
+		for v in range(2, 5):
+			node.safe_psql(f"UPDATE o_test SET v = {v};")
+			node.safe_psql("CHECKPOINT;")
+		deadline = time.time() + 90
+		while time.time() < deadline and first & set(self.part_etags()):
+			time.sleep(1)
+		self.assertEqual(set(), first & set(self.part_etags()))
+		self.assertEqual([(30000, 120000)],
+		                 node.execute("SELECT count(*), sum(v) FROM o_test"))
+		node.stop()
+
+	def test_s3_gc_keeps_checkpoints_by_time(self):
+		"""orioledb.s3_gc_keep_time keeps the checkpoints committed within it
+		restorable however many came after; then they go."""
+		node = self.gc_world("orioledb.s3_gc_keep_time = 20")
+		start = time.time()
+		parts = self.part_etags()
+		tree = collections.Counter(k.split('/')[2]
+		                           for k in parts).most_common(1)[0][0]
+		first = {k for k in parts if k.split('/')[2] == tree}
+		for v in range(1, 4):
+			node.safe_psql(f"UPDATE o_test SET v = {v};")
+			node.safe_psql("CHECKPOINT;")
+		while time.time() < start + 12:
+			self.assertEqual(first, first & set(self.part_etags()))
+			time.sleep(1)
+		deadline = time.time() + 60
+		while time.time() < deadline and first & set(self.part_etags()):
+			time.sleep(1)
+		self.assertGreater(time.time(), start + 20)
+		self.assertEqual(set(), first & set(self.part_etags()))
+		self.assertEqual([(30000, 90000)],
+		                 node.execute("SELECT count(*), sum(v) FROM o_test"))
+		node.stop()
+
 	def test_s3_gc_spares_a_reader_pin(self):
 		"""A reader's pin keeps the GC below the checkpoint it opened."""
 		node = self.gc_world()
@@ -1388,6 +1544,41 @@ class S3Test(S3BaseTest):
 
 	def part_relnodes(self):
 		return {k.split('/')[2] for k in self.part_etags()}
+
+	def test_s3_gc_removes_the_objects_of_an_aborted_build(self):
+		"""A build puts its parts up before its transaction commits.  One that
+		rolls back leaves a tree no manifest ever names; the GC removes what
+		it put up all the same."""
+		node = self.gc_world()
+		before = self.part_relnodes()
+		con = node.connect()
+		con.begin()
+		con.execute("CREATE INDEX o_test_v ON o_test (v, pad);")
+		deadline = time.time() + 60
+		while time.time() < deadline and not self.part_relnodes() - before:
+			time.sleep(0.5)
+		built = self.part_relnodes() - before
+		self.assertTrue(built)
+		con.rollback()
+		con.close()
+
+		def left():
+			keys = self.client.list_objects_v2(Bucket=self.bucket_name,
+			                                   Prefix='trees/')
+			return {k["Key"] for k in keys.get("Contents", [])
+			        if k["Key"].split('/')[2] in built}
+
+		for _ in range(3):
+			node.safe_psql("UPDATE o_test SET v = v + 1;")
+			node.safe_psql("CHECKPOINT;")
+		deadline = time.time() + 90
+		while time.time() < deadline and left():
+			time.sleep(1)
+		self.assertEqual(set(), left())
+		self.assertTrue(before <= self.part_relnodes())
+		self.assertEqual([(30000, 90000)],
+		                 node.execute("SELECT count(*), sum(v) FROM o_test"))
+		node.stop()
 
 	def test_s3_gc_removes_a_dropped_tree(self):
 		"""Once the checkpoint that first left a dropped tree out of the
@@ -2147,6 +2338,62 @@ class S3Test(S3BaseTest):
 		                 node.execute("SELECT count(*), min(v) FROM o_test"))
 		node.stop()
 
+	def test_s3_gc_removes_parts_a_truncate_in_place_left(self):
+		"""The parts a tree had before TRUNCATE emptied it in place are named
+		by nothing after: the GC removes them, and keeps the ones after."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			orioledb.s3_gc_interval = 1
+			orioledb.s3_gc_keep_checkpoints = 1
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int, v text) USING orioledb;
+		""")
+		con = node.connect()
+		con.begin()
+		con.execute("""
+			TRUNCATE o_test;
+			INSERT INTO o_test SELECT g, repeat('a', 200)
+				FROM generate_series(1, 20000) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		before = self.part_etags()
+		tree = collections.Counter(k.split('/')[2]
+		                           for k in before).most_common(1)[0][0]
+		old = {k for k in before if k.split('/')[2] == tree}
+		con.execute("""
+			TRUNCATE o_test;
+			INSERT INTO o_test SELECT g, repeat('b', 200)
+				FROM generate_series(1, 20000) g;
+		""")
+		con.commit()
+		con.close()
+		for _ in range(3):
+			node.safe_psql("CHECKPOINT;")
+		new = {k for k in self.part_etags()
+		       if k.split('/')[2] == tree} - old
+		self.assertTrue(new)
+		deadline = time.time() + 90
+		while time.time() < deadline and old & set(self.part_etags()):
+			time.sleep(1)
+		self.assertEqual(set(), old & set(self.part_etags()))
+		self.assertTrue(new <= set(self.part_etags()))
+		self.assertEqual([(20000, 'b' * 200)],
+		                 node.execute("SELECT count(*), min(v) FROM o_test"))
+		node.stop()
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(20000, 'b' * 200)],
+			                 new_node.execute("SELECT count(*), min(v) FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
+
 	def test_s3_restarted_shipper_does_not_rewind(self):
 		"""Where recovery ended is where the first shipper of a run starts;
 		one started again later in the run starts where the chunks are, not
@@ -2408,6 +2655,43 @@ class S3Test(S3BaseTest):
 			SELECT count(*), count(*) FILTER (WHERE value = repeat('d', 300))
 			FROM o_test;
 		"""))
+		node.stop()
+
+	def test_s3_a_lost_map_header_puts_no_part_again(self):
+		"""A map whose header is lost loads its tree empty and does not say
+		how many parts the tree handed out; the tree numbers on past every
+		part the bucket has instead of putting one of them again."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, pad text) USING orioledb;
+			INSERT INTO o_test SELECT g, repeat('x', 200) FROM generate_series(1, 20000) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		before = self.part_etags()
+		tree = collections.Counter(k.split('/')[2]
+		                           for k in before).most_common(1)[0][0]
+		datoid = next(k.split('/')[1] for k in before if k.split('/')[2] == tree)
+		node.stop()
+		maps = [f for f in os.listdir(f"{node.data_dir}/orioledb_data/{datoid}")
+		        if f.startswith(f"{tree}-") and f.endswith('.map')]
+		self.assertTrue(maps)
+		for f in maps:
+			with open(f"{node.data_dir}/orioledb_data/{datoid}/{f}", 'r+b') as m:
+				m.write(bytes(44))
+		node.start()
+		node.safe_psql("INSERT INTO o_test SELECT g, repeat('y', 200) "
+		               "FROM generate_series(1, 20000) g ON CONFLICT DO NOTHING;")
+		node.safe_psql("CHECKPOINT;")
+		after = self.part_etags()
+		self.assertEqual(before, {k: after.get(k) for k in before})
+		old = max(int(k.split('/')[-1]) for k in before if k.split('/')[2] == tree)
+		new = [int(k.split('/')[-1]) for k in set(after) - set(before)
+		       if k.split('/')[2] == tree]
+		self.assertTrue(new)
+		self.assertGreater(min(new), old)
 		node.stop()
 
 	def test_s3_unsealed_parts_request_a_checkpoint(self):

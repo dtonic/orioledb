@@ -132,7 +132,7 @@ s3_build_part_end(Oid datoid, Oid relnode, Oid spcoid, uint64 blocksPerPart,
 	FileExtent	unit = {.off = blocksPerPart,.len = S3_DEAD_UNIT_LEN};
 
 	(void) MakePGDirectory(dir);
-	fd = BasicOpenFile(path, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+	fd = BasicOpenFile(path, O_WRONLY | O_CREAT | O_APPEND | PG_BINARY);
 	if (fd < 0 ||
 		write(fd, &unit, sizeof(unit)) != sizeof(unit))
 		ereport(ERROR,
@@ -151,6 +151,61 @@ s3_build_part_end(Oid datoid, Oid relnode, Oid spcoid, uint64 blocksPerPart,
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not fsync file \"%s\": %m", path)));
+	close(fd);
+	pfree(dir);
+	pfree(path);
+}
+
+/*
+ * A tree is dropped, or the transaction that built it aborted: the GC
+ * removes its objects once no checkpoint it keeps names the tree.  A tree
+ * built and dropped between two manifests is named by none, and nothing
+ * else would ever remove what its build put up.  The checkpoint in progress
+ * may still name it: the GC waits for the one after.
+ */
+void
+s3_note_dropped_tree(Oid datoid, Oid relnode)
+{
+	S3DroppedTree rec = {
+		.chkp = checkpoint_state->lastCheckpointNumber + 1,
+		.datoid = datoid,
+		.relnode = relnode
+	};
+	int			fd;
+
+	fd = BasicOpenFile(S3_DROPPED_TREES_FILE,
+					   O_WRONLY | O_CREAT | O_APPEND | PG_BINARY);
+	if (fd < 0 ||
+		write(fd, &rec, sizeof(rec)) != sizeof(rec) ||
+		pg_fsync(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m",
+						S3_DROPPED_TREES_FILE)));
+	close(fd);
+}
+
+/*
+ * A tree emptied in place keeps its relnode and numbers its parts on from
+ * `floor`: every part below it is gone.  Said in the same list as a build's
+ * part ends, which the next checkpoint that sees the tree uploads.
+ */
+void
+s3_tree_parts_gone(Oid datoid, Oid relnode, uint64 floor)
+{
+	char	   *dir = psprintf(ORIOLEDB_DATA_DIR "/%u", datoid);
+	char	   *path = s3_build_dead_filename(datoid, relnode);
+	int			fd;
+	FileExtent	gone = {.off = floor,.len = S3_DEAD_PARTS_BELOW_LEN};
+
+	(void) MakePGDirectory(dir);
+	fd = BasicOpenFile(path, O_WRONLY | O_CREAT | O_APPEND | PG_BINARY);
+	if (fd < 0 ||
+		write(fd, &gone, sizeof(gone)) != sizeof(gone) ||
+		pg_fsync(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", path)));
 	close(fd);
 	pfree(dir);
 	pfree(path);
@@ -232,6 +287,8 @@ s3_manifest_parse(const char *body)
 			m->checkpointLsn = ((uint64) hi << 32) | lo;
 		else if (sscanf(l, "timeline %u", &a) == 1)
 			m->timeline = a;
+		else if (sscanf(l, "time %llu", &t) == 1)
+			m->time = (int64) t;
 		else if (strncmp(l, "data ", 5) == 0)
 			m->data = lappend(m->data, pstrdup(l + 5));
 		else if (strncmp(l, "undo ", 5) == 0)
@@ -640,9 +697,9 @@ s3_manifest_publish(uint32 chkpNum, XLogRecPtr redoLsn,
 	initStringInfo(&body);
 	appendBinaryStringInfo(&body, data, size);
 	pfree(data);
-	appendStringInfo(&body, "redo %X/%X\nlsn %X/%X\ntimeline %u\n",
+	appendStringInfo(&body, "redo %X/%X\nlsn %X/%X\ntimeline %u\ntime %lld\n",
 					 LSN_FORMAT_ARGS(redoLsn), LSN_FORMAT_ARGS(checkpointLsn),
-					 timeline);
+					 timeline, (long long) time(NULL));
 	write_durable(MANIFEST_PENDING, &body);
 	upload(chkpNum, &body);
 	pfree(body.data);

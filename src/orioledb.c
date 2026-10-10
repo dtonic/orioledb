@@ -1311,6 +1311,20 @@ _PG_init(void)
 							NULL,
 							NULL);
 
+	DefineCustomIntVariable("orioledb.s3_gc_keep_time",
+							"How long the S3 GC keeps committed checkpoints restorable",
+							"It keeps what this or orioledb.s3_gc_keep_checkpoints "
+							"keeps, whichever is more.  0 keeps by count only.",
+							&s3_gc_keep_time,
+							0,
+							0,
+							INT_MAX,
+							PGC_POSTMASTER,
+							GUC_UNIT_S,
+							NULL,
+							NULL,
+							NULL);
+
 	DefineCustomIntVariable("orioledb.s3_reader_pin_ttl",
 							"How long an S3 reader's pin keeps its checkpoint from the GC without a renewal",
 							NULL,
