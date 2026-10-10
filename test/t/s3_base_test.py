@@ -81,6 +81,40 @@ def mock_moto_unkown_error(self) -> TYPE_RESPONSE:
 	raise InvalidRequest("mock_moto_unkown_error")
 
 
+class TransientServerError(S3ClientError):
+	code = 503
+
+	def __init__(self, **kwargs: Any):
+		super().__init__("SlowDown", "Please reduce your request rate.",
+		                 **kwargs)
+
+
+class FlakyPutObject:
+	"""
+	A put_object() that answers the first `failures` requests for a part
+	(or for keys under `prefix`) with 503, as a store under load does, then
+	stores them.
+	"""
+
+	def __init__(self, failures, prefix=None, contains='/parts/'):
+		self.failures = failures
+		self.failed = 0
+		self.prefix = prefix
+		self.contains = contains
+
+	def matches(self, key):
+		if self.prefix is not None:
+			return key.startswith(self.prefix)
+		return self.contains in key
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		if self.matches(response.parse_key_name()) and \
+		    self.failed < self.failures:
+			self.failed += 1
+			raise TransientServerError()
+		return orig_put_object(response)
+
+
 # TODO: re-enable under valgrind once s3_header_mark_part_loaded race is fixed
 @unittest.skipIf(
     os.environ.get('USE_VALGRIND') == '1', 'S3 tests flaky under valgrind')
@@ -244,7 +278,8 @@ class OrioledbS3Loader:
 		self._prefix = prefix
 		self._verify = verify
 
-	def download(self, path, verbose=False, checkpoint_only=False):
+	def download(self, path, verbose=False, checkpoint_only=False, as_of=None,
+	             keep_parts=False, local_wal=False):
 		dir_path = os.path.dirname(os.path.realpath(__file__))
 		old_argv = sys.argv
 		sys.argv = [f"{dir_path}/../../orioledb_s3_loader.py"]
@@ -258,6 +293,16 @@ class OrioledbS3Loader:
 			sys.argv += ["--verbose"]
 		if checkpoint_only:
 			sys.argv += ["--checkpoint-only"]
+		if as_of is not None:
+			sys.argv += ["--as-of", str(as_of)]
+		if keep_parts:
+			sys.argv += ["--keep-parts"]
+		if local_wal:
+			sys.argv += ["--local-wal"]
+		if path is None:
+			sys.argv.remove("-d")
+			sys.argv.remove(None)
+			sys.argv += ["--sweep"]
 		runpy.run_path(sys.argv[0], None, "__main__")
 		sys.argv = old_argv
 
