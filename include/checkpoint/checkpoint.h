@@ -260,6 +260,7 @@ typedef struct
 } CheckpointState;
 
 #define XID_FILENAME_FORMAT (ORIOLEDB_DATA_DIR"/%u.xid")
+#define XIDMAP_RANGE_FILENAME_FORMAT (ORIOLEDB_DATA_DIR"/%u.xidrange")
 
 #define chkp_inc_changecount_before(state)	\
 	do {	\

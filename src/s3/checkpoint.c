@@ -289,6 +289,12 @@ s3_perform_backup(int flags, S3TaskLocation maxLocation)
 			maxLocation = Max(maxLocation, location);
 			pfree(xidFilename);
 
+			xidFilename = psprintf(XIDMAP_RANGE_FILENAME_FORMAT,
+								   checkpoint_state->lastCheckpointNumber);
+			location = s3_schedule_file_write(chkpNum, xidFilename, false);
+			maxLocation = Max(maxLocation, location);
+			pfree(xidFilename);
+
 		}
 		else
 		{

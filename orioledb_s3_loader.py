@@ -261,6 +261,7 @@ class OrioledbS3ObjectLoader:
 			raise Exception(f"The manifest of checkpoint {chkp_num} is "
 			                "incomplete")
 		self.download_manifest(manifest)
+		self.apply_xidmap_range(chkp_num)
 
 		control = get_control_data(self.data_dir)
 		self.download_wal(control)
@@ -458,6 +459,41 @@ class OrioledbS3ObjectLoader:
 					raise Exception(f"Small file bundle {i} of checkpoint {n} "
 					                "is missing")
 				self.extract_small_files(data, names)
+
+	def apply_xidmap_range(self, chkp_num):
+		"""Put the checkpoint's copy of the xidmap range [xmin, xmax) back
+		where the xidmap keeps it: the transactions in that range that had
+		finished are known as such only from there.  A checkpoint written
+		before the copy existed has none."""
+		path = os.path.join(self.data_dir, 'orioledb_data',
+		                    f"{chkp_num}.xidrange")
+		if not os.path.exists(path):
+			return
+		with open(path, 'rb') as f:
+			data = f.read()
+		xmin, xmax = struct.unpack('<QQ', data[:16])
+		items = data[16:]
+		item_size = 16
+		file_size = 0x1000000
+		if len(items) != (xmax - xmin) * item_size:
+			raise Exception(f"{path} holds {len(items)} bytes, not "
+			                f"{(xmax - xmin) * item_size}")
+		offset = xmin * item_size
+		pos = 0
+		while pos < len(items):
+			file_num = offset // file_size
+			in_file = offset % file_size
+			n = min(len(items) - pos, file_size - in_file)
+			name = os.path.join(self.data_dir, 'orioledb_data',
+			                    f"{file_num >> 32:02X}{file_num & 0xFFFFFFFF:08X}.xidmap")
+			fd = os.open(name, os.O_WRONLY | os.O_CREAT, 0o600)
+			try:
+				os.pwrite(fd, items[pos:pos + n], in_file)
+				os.fsync(fd)
+			finally:
+				os.close(fd)
+			pos += n
+			offset += n
 
 	def replay_on_start(self):
 		"""

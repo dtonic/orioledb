@@ -798,9 +798,12 @@ static void
 unlink_xids_file(uint32 checkpointnum)
 {
 	char	   *xip_filename = psprintf(XID_FILENAME_FORMAT, checkpointnum);
+	char	   *range_filename = psprintf(XIDMAP_RANGE_FILENAME_FORMAT, checkpointnum);
 
 	unlink(xip_filename);
+	(void) unlink(range_filename);
 	pfree(xip_filename);
+	pfree(range_filename);
 }
 
 /*
@@ -2044,6 +2047,15 @@ o_perform_checkpoint_guts(int flags)
 	fsync_xidmap_range(checkpoint_xmin,
 					   checkpoint_xmax,
 					   WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC);
+
+	/* the bucket's copy of what recovery reads from the xidmap */
+	if (S3_WRITER_MODE)
+	{
+		char	   *range = psprintf(XIDMAP_RANGE_FILENAME_FORMAT, cur_chkp_num);
+
+		write_xidmap_range_file(range, checkpoint_xmin, checkpoint_xmax);
+		pfree(range);
+	}
 
 	if (checkpoint_state->controlIdentifier == 0)
 	{

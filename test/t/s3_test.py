@@ -1093,6 +1093,41 @@ class S3Test(S3BaseTest):
 			new_node.stop()
 			new_node.cleanup()
 
+	def test_s3_load_sees_commits_behind_a_long_transaction(self):
+		"""A transaction open across a checkpoint holds its xmin: the ones that
+		finished after it started and before the checkpoint are known as
+		finished only from the xidmap, which never left the data directory.
+		Here the open transaction creates a table, and the catalog cache
+		entries go in by autonomous transactions of their own; loaded from the
+		bucket they read as still in progress, and replaying the table's rows
+		did not find them."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("CREATE EXTENSION orioledb;")
+		hold = node.connect()
+		hold.begin()
+		hold.execute("""
+			CREATE TABLE o_test (id int PRIMARY KEY, v text) USING orioledb;
+			INSERT INTO o_test SELECT g, 'v' || g FROM generate_series(1, 1000) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		hold.commit()
+		hold.close()
+		node.safe_psql("UPDATE o_test SET v = v || 'x' WHERE id <= 10;")
+		node.stop(['-m', 'immediate'])
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(1000, 10)],
+			                 new_node.execute(
+			                     "SELECT count(*), count(*) FILTER (WHERE right(v, 1) = 'x') FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
+
 	def test_s3_dead_extents_are_recorded(self):
 		"""Pages a checkpoint wrote and the next one relocates are recorded as
 		dead from that next checkpoint on, for the GC; nothing is deleted."""

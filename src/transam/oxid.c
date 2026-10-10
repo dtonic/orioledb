@@ -14,6 +14,9 @@
 #include "c.h"
 #include "postgres.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "orioledb.h"
 
 #include "recovery/recovery.h"
@@ -33,6 +36,7 @@
 #if PG_VERSION_NUM >= 180000
 #include "utils/memutils.h"
 #endif
+#include "storage/fd.h"
 #include "utils/snapmgr.h"
 #include "utils/stopevent.h"
 #include "recovery/wal.h"
@@ -1344,6 +1348,51 @@ fsync_xidmap_range(OXid xmin, OXid xmax, uint32 wait_event_info)
 				   xmin * sizeof(OXidMapItem),
 				   xmax * sizeof(OXidMapItem),
 				   wait_event_info);
+}
+
+/*
+ * Write the xidmap range [xmin, xmax) to a file of its own: the checkpoint's
+ * copy of what recovery reads from the xidmap.  A transaction between xmin
+ * and xmax that finished before the checkpoint is known as such only from
+ * here (the xid file lists the ones in progress), and in S3 mode the xidmap
+ * itself never leaves the data directory.  The file is (xmin, xmax) and the
+ * items, as the xidmap holds them.
+ */
+void
+write_xidmap_range_file(const char *filename, OXid xmin, OXid xmax)
+{
+	char	   *tmp = psprintf("%s.tmp", filename);
+	int			fd;
+	OXid		header[2] = {xmin, xmax};
+	char	   *buf;
+	const int64 chunk = 64 * 1024;
+
+	fd = BasicOpenFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+	if (fd < 0 || write(fd, header, sizeof(header)) != sizeof(header))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", tmp)));
+	buf = palloc(chunk);
+	for (int64 off = (int64) xmin * sizeof(OXidMapItem);
+		 off < (int64) xmax * sizeof(OXidMapItem); off += chunk)
+	{
+		int64		len = Min(chunk, (int64) xmax * sizeof(OXidMapItem) - off);
+
+		memset(buf, 0, len);
+		(void) o_buffers_read(&buffersDesc, buf, OXID_BUFFERS_TAG, off, len, true);
+		if (write(fd, buf, len) != len)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write file \"%s\": %m", tmp)));
+	}
+	pfree(buf);
+	if (pg_fsync(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not fsync file \"%s\": %m", tmp)));
+	close(fd);
+	durable_rename(tmp, filename, ERROR);
+	pfree(tmp);
 }
 
 /*
