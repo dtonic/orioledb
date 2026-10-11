@@ -2,6 +2,7 @@ import inspect
 import json
 import logging
 import os
+import io
 import threading
 import struct
 import re
@@ -255,19 +256,22 @@ class FailingDelete:
 
 class HoldFirstGet:
 	"""
-	A get_object() that, once armed, holds the next GET of `key` until
-	`release` is set, and serves every other request meanwhile: one process
-	stops between two of its requests while the others go on.
+	A get_object() that, once armed, holds the next GET of `key` (for which
+	`when()`, if given, holds) until `release` is set, and serves every
+	other request meanwhile: one process stops between two of its requests
+	while the others go on.
 	"""
 
-	def __init__(self, key):
+	def __init__(self, key, when=None):
 		self.key = key
+		self.when = when
 		self.armed = False
 		self.entered = threading.Event()
 		self.release = threading.Event()
 
 	def __call__(self, response) -> TYPE_RESPONSE:
-		if self.armed and response.parse_key_name() == self.key:
+		if self.armed and response.parse_key_name() == self.key and \
+		    (self.when is None or self.when()):
 			self.armed = False
 			self.entered.set()
 			self.release.wait(120)
@@ -549,10 +553,20 @@ class MotoServerSSL:
 		puts = threading.Lock()
 
 		def app(environ, start_response):
-			# requests are served concurrently, as a store does; PUTs one at
-			# a time, so a conditional PUT is judged and stored atomically,
-			# and the fault injectors on put_object count without races
-			if environ.get('REQUEST_METHOD') == 'PUT':
+			# requests are served concurrently, as a store does; writes
+			# (PUT, POST, DELETE) one at a time, so a conditional PUT is
+			# judged and stored atomically against deletes too, and the
+			# fault injectors count without races. The body is read before
+			# the lock: a slow upload must not hold the other writes.
+			if environ.get('REQUEST_METHOD') in ('PUT', 'POST', 'DELETE'):
+				length = environ.get('CONTENT_LENGTH')
+				if length:
+					body = environ['wsgi.input'].read(int(length))
+				elif environ.get('wsgi.input_terminated'):
+					body = environ['wsgi.input'].read()  # chunked
+				else:
+					body = b''
+				environ['wsgi.input'] = io.BytesIO(body)
 				with puts:
 					return list(backend(environ, start_response))
 			return backend(environ, start_response)

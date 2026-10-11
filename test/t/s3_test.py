@@ -1230,6 +1230,91 @@ class S3Test(S3BaseTest):
 			new_node.stop()
 			new_node.cleanup()
 
+	def test_s3_restore_reads_a_stop_without_shipper_over_chunks(self):
+		"""A run ships chunks into a segment and stops; the next runs with
+		shipping off, writes on in that segment and stops, leaving it as a
+		.partial.  A load reads the chunks and, past them, the segment the
+		stop left: its checkpoint and every commit."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		node.stop()
+		node.append_conf("orioledb.s3_wal_shipping = off\nsynchronous_standby_names = ''\n")
+		node.start()
+		segment = node.execute(
+		    "SELECT pg_walfile_name(pg_current_wal_lsn());")[0][0]
+		node.safe_psql("INSERT INTO o_test SELECT generate_series(11, 20);")
+		self.assertEqual(segment, node.execute(
+		    "SELECT pg_walfile_name(pg_current_wal_lsn());")[0][0])
+		node.stop()
+		# the stop archives the segment it switches from and leaves the one
+		# its checkpoint is in as a .partial
+		self.assertTrue([k for k in self.all_keys('wal/') if k.endswith('.partial')])
+
+		with self.initNode(self.getBasePort() + 1, 'tgsp') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(20, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
+
+	def test_s3_shipping_off_for_two_starts_then_on(self):
+		"""Every start puts a terminator.  Two starts with shipping off leave
+		two this data directory's next run with shipping on walks past: they
+		are its own lineage's, not another writer's."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		node.stop()
+		for i in (11, 12):
+			node.append_conf("orioledb.s3_wal_shipping = off\nsynchronous_standby_names = ''\n")
+			node.start()
+			node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+			node.stop()
+		node.append_conf("orioledb.s3_wal_shipping = on\nsynchronous_standby_names = 's3'\n")
+		node.start()
+		node.safe_psql("INSERT INTO o_test VALUES (13);")
+		self.assertEqual([(13, )], node.execute("SELECT count(*) FROM o_test"))
+		with open(node.pg_log_file) as f:
+			self.assertNotIn("has WAL past this data directory", f.read())
+		node.stop(['-m', 'immediate'])
+		with self.initNode(self.getBasePort() + 1, 'tgsp') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(13, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			# a loaded directory runs with shipping off, then on
+			new_node.append_conf("orioledb.s3_wal_shipping = off\nsynchronous_standby_names = ''\n")
+			new_node.restart()
+			new_node.safe_psql("INSERT INTO o_test VALUES (14);")
+			new_node.append_conf("""
+				orioledb.s3_wal_shipping = on
+				synchronous_standby_names = 's3'
+			""")
+			new_node.restart()
+			new_node.safe_psql("INSERT INTO o_test VALUES (15);")
+			self.assertEqual([(15, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			with open(new_node.pg_log_file) as f:
+				self.assertNotIn("has WAL past this data directory", f.read())
+			new_node.stop()
+			new_node.cleanup()
+
 	def test_s3_restore_reads_the_segment_a_stop_left(self):
 		"""Without the shipper, a restore of a bucket whose last stop left a
 		partial segment reads that segment: it holds the stop's
@@ -2189,6 +2274,8 @@ class S3Test(S3BaseTest):
 	def test_s3_gc_keeps_checkpoints_by_time(self):
 		"""orioledb.s3_gc_keep_time keeps the checkpoints committed within it
 		restorable however many came after; then they go."""
+		# the window runs from the checkpoint's commit, after `before`
+		before = time.time()
 		node = self.gc_world("orioledb.s3_gc_keep_time = 40")
 		start = time.time()
 		parts = self.part_etags()
@@ -2232,7 +2319,7 @@ class S3Test(S3BaseTest):
 		deadline = time.time() + 90
 		while time.time() < deadline and first & set(self.part_etags()):
 			time.sleep(1)
-		self.assertGreater(time.time(), start + 40)
+		self.assertGreater(time.time(), before + 40)
 		self.assertEqual(set(), first & set(self.part_etags()))
 		self.assert_bucket_restores(node, [(30000, 90000)])
 
@@ -2479,18 +2566,22 @@ class S3Test(S3BaseTest):
 		checkpoint in between finds R past it and does not start; the GC,
 		reading the pins after, counts that pin and goes no further."""
 		node = self.gc_world()
-		hold = HoldFirstGet('readers')
+		pinned = None
+		# the GC's first pass that publishes R past the pinned checkpoint
+		# stops before it reads the pins, so before it folds or collects
+		hold = HoldFirstGet('readers',
+		                    when=lambda: int(self.kv('gc')['retain']) > pinned)
 		with self.initNode(self.getBasePort() + 1, 'tgsb') as reader, \
 		    patch('moto.s3.responses.S3Response.get_object',
 		          new=lambda response: hold(response)):
 			self.loader.download(reader.data_dir)
 			pinned = int(self.kv('root')['checkpoint'])
+			hold.armed = True
 			for v in range(1, 4):
 				node.safe_psql(f"UPDATE o_test SET v = {v};")
 				node.safe_psql("CHECKPOINT;")
-			# the GC's next pass stops after it publishes R
-			hold.armed = True
 			self.assertTrue(hold.entered.wait(60))
+			self.assertLessEqual(int(self.kv('gc').get('collected', 0)), pinned)
 			self.assertGreater(int(self.kv('gc')['retain']), pinned)
 			reader.append_conf(port=reader.port)
 			reader.append_conf("""
@@ -3967,6 +4058,100 @@ class S3Test(S3BaseTest):
 				new_node.stop(['-m', 'immediate'])
 			except Exception:
 				pass
+			new_node.cleanup()
+
+	def load_and_read_the_index(self):
+		"""Load the bucket into a new node and read o_test through its
+		index o_test_v, which the new node fetches from the bucket."""
+		with self.initNode(self.getBasePort() + 1, 'tgsp') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			result = {}
+			reader = threading.Thread(target=lambda: result.update(rows=new_node.execute("""
+				SET enable_seqscan = off;
+				SELECT count(*) FROM o_test WHERE v > 0;
+			""")), daemon=True)
+			reader.start()
+			reader.join(120)
+			with open(new_node.pg_log_file) as f:
+				self.assertNotIn("could not get object from S3", f.read())
+			self.assertEqual([(10000, )], result.get('rows'))
+
+	def test_s3_build_map_is_up_before_the_build_commits(self):
+		"""No later checkpoint uploads the map of a tree it did not change:
+		a build's map is in the bucket before the build commits, so a crash
+		right after it loses nothing a load needs."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, v int) USING orioledb;
+			INSERT INTO o_test SELECT g, g FROM generate_series(1, 10000) g;
+			CHECKPOINT;
+			CREATE INDEX o_test_v ON o_test (v);
+		""")
+		node.stop(['-m', 'immediate'])
+		node.start()
+		node.safe_psql("CHECKPOINT")
+		node.stop()
+		self.load_and_read_the_index()
+
+	def test_s3_build_of_a_run_that_crashed_before_a_checkpoint_loads(self):
+		"""A build names its tree's map with the last checkpoint done under
+		its run's token.  The run that crashes before its first checkpoint
+		and the run after it start at the same checkpoint: the first run's
+		epoch stays, and a load still finds the map."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, v int) USING orioledb;
+			INSERT INTO o_test SELECT g, g FROM generate_series(1, 10000) g;
+		""")
+		node.stop()
+		node.start()
+		node.safe_psql("CREATE INDEX o_test_v ON o_test (v);")
+		node.stop(['-m', 'immediate'])
+		node.start()
+		node.safe_psql("CHECKPOINT")
+		node.stop()
+		self.load_and_read_the_index()
+
+	def test_s3_truncate_in_place_stays_empty_in_a_load(self):
+		"""A table created and filled in a transaction a checkpoint goes
+		through, then truncated in place and committed: a load of a later
+		checkpoint that does not write the tree again has it empty, not
+		the map the bucket kept from before the TRUNCATE."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("CREATE EXTENSION orioledb;")
+		con = node.connect()
+		con.begin()
+		con.execute("""
+			CREATE TABLE o_test (id int PRIMARY KEY, pad text) USING orioledb;
+			INSERT INTO o_test SELECT g, repeat('x', 200) FROM generate_series(1, 20000) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		con.execute("TRUNCATE o_test;")
+		con.commit()
+		con.close()
+		node.safe_psql("CREATE TABLE o_other (id int) USING orioledb;")
+		node.safe_psql("CHECKPOINT;")
+		node.safe_psql("INSERT INTO o_other VALUES (1);")
+		node.safe_psql("CHECKPOINT;")
+		self.assertEqual([(0, )], node.execute("SELECT count(*) FROM o_test"))
+		node.stop()
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(0, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			new_node.stop()
 			new_node.cleanup()
 
 	def test_s3_truncate_in_place_numbers_parts_on(self):
