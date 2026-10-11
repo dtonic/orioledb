@@ -2883,6 +2883,70 @@ class S3Test(S3BaseTest):
 				pass
 			copy.cleanup()
 
+	def test_s3_restore_lists_the_chunks_once(self):
+		"""A recovery asks restore_command for its segments in order.  Each
+		lists the chunks from the last one it has that ends before the
+		segment, not the timeline's whole list again: across a recovery the
+		chunks are listed about once."""
+		from moto.s3.responses import S3Response
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			archive_mode = off
+			synchronous_standby_names = 's3'
+			checkpoint_timeout = 1h
+			max_wal_size = 1GB
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, pad text) USING orioledb;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		start = node.execute("SELECT pg_current_wal_lsn();")[0][0]
+		script = os.path.join(node.base_dir, 'insert.sql')
+		with open(script, 'w') as f:
+			f.write("INSERT INTO o_test SELECT nextval('s'), (SELECT "
+			        "string_agg(md5(random()::text), '') FROM generate_series(1, 400));\n")
+		node.safe_psql("CREATE SEQUENCE s;")
+		subprocess.run(
+		    [testgres.get_bin_path('pgbench'), '-n', '-f', script,
+		     '-c', '4', '-t', '2500', '-h', node.host, '-p', str(node.port),
+		     default_dbname()], check=True,
+		    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+		segments = node.execute(
+		    f"SELECT pg_wal_lsn_diff(pg_current_wal_lsn(), '{start}') / "
+		    "(16 * 1024 * 1024)")[0][0]
+		self.assertGreaterEqual(segments, 7)
+		chunks = len(self.all_keys('wal/00000001/chunks/'))
+		node.stop(['-m', 'immediate'])
+
+		listed = [0]
+		orig = S3Response.list_objects_v2
+
+		def counting(response):
+			result = orig(response)
+			prefix = response.querystring.get('prefix', [''])[0]
+			if '/chunks/' in prefix:
+				body = result[2] if isinstance(result, tuple) else result
+				if isinstance(body, bytes):
+					body = body.decode()
+				listed[0] += body.count('<Key>')
+			return result
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node, \
+		    patch.object(S3Response, 'list_objects_v2', counting):
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(10000, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
+		# the load reads them twice, and the first segment once
+		self.assertLess(listed[0], 4 * chunks,
+		                f"{chunks} chunks, {segments} segments")
+
 	def test_s3_restart_goes_on_past_a_lagging_hint(self):
 		"""The hint of where this directory's chunks end is not made durable
 		after every chunk: after a machine crash it may name a chunk the GC

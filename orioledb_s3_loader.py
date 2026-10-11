@@ -687,8 +687,10 @@ class OrioledbS3ObjectLoader:
 			self.write_wal(f"{latest:08X}.history", history)
 
 		chunks = self.chunks_of(latest)
-		# every key counts for where the chunks end: a terminator too
-		seqs = self.chunk_seqs(latest)
+		# every key counts for where the chunks end: a terminator too; the
+		# cache holds what the bucket listed
+		seqs = sorted(int(name) for name in os.listdir(self.chunk_cache(latest))
+		              if name.isdigit())
 		end = 0
 		for seq, magic, start, chunk_end in reversed(chunks):
 			if magic == CHUNK_MAGIC:
@@ -756,11 +758,12 @@ class OrioledbS3ObjectLoader:
 				last = (int(fields[0]), parse_lsn(fields[1]))
 		return last
 
-	def chunk_seqs(self, tli):
+	def chunk_seqs(self, tli, after=None):
 		prefix = f"wal/{tli:08X}/chunks/"
+		start_after = self.chunk_key(tli, after) if after is not None else None
 		return sorted(
 		    int(key.rsplit('/', 1)[1])
-		    for key in self.list_objects(self.bucket_name, prefix)
+		    for key in self.list_objects(self.bucket_name, prefix, start_after)
 		    if re.match(r'.*/chunks/\d+$', key))
 
 	def first_chunk_seq(self, tli):
@@ -789,16 +792,85 @@ class OrioledbS3ObjectLoader:
 		os.makedirs(path, mode=0o700, exist_ok=True)
 		return path
 
-	def chunks_of(self, tli):
+	def terminator_tokens(self, tli):
+		"""(seq, token) of a timeline's terminators, in order: each start
+		puts one, and they stay."""
+		result = []
+		prefix = f"wal/{tli:08X}/terminators/"
+		for key in self.list_objects(self.bucket_name, prefix):
+			if not re.match(r'.*/terminators/\d+$', key):
+				continue
+			mark = int(key.rsplit('/', 1)[1])
+			path = os.path.join(self.chunk_cache(tli), str(mark))
+			if os.path.exists(path):
+				with open(path, 'rb') as f:
+					head = f.read(32)
+			else:
+				head = self.s3.get_object(
+				    Bucket=self.bucket_name, Key=self.chunk_key(tli, mark),
+				    Range='bytes=0-31')['Body'].read()
+			magic, _, token, _, _ = struct.unpack('<IIQQQ', head)
+			if magic == TERMINATOR_MAGIC:
+				result.append((mark, token))
+		return sorted(result)
+
+	@staticmethod
+	def fence_through(terminators, seq):
+		"""The largest token a terminator up to chunk seq fenced off."""
+		return max([token for mark, token in terminators if mark <= seq],
+		           default=0)
+
+	def cached_before(self, cache, lo, terminators):
+		"""The last cached chunk that ends at or before lo and that no
+		terminator fenced off: a chunk wins over the ones before it from its
+		start on, so none of them puts anything at lo or after."""
+		result = None
+		for name in os.listdir(cache):
+			if not name.isdigit():
+				continue
+			with open(os.path.join(cache, name), 'rb') as f:
+				head = f.read(32)
+			if len(head) < 32:
+				continue
+			magic, _, token, _, end = struct.unpack('<IIQQQ', head)
+			seq = int(name)
+			if magic == CHUNK_MAGIC and end <= lo and \
+			    token >= self.fence_through(terminators, seq) and \
+			    (result is None or seq > result):
+				result = seq
+		return result
+
+	def chunks_of(self, tli, lo=None):
 		"""(seq, magic, start, end) of a timeline's chunks in order; the ones
 		not cached yet are fetched in parallel, and cached ones the bucket no
-		longer has are dropped."""
-		seqs = self.chunk_seqs(tli)
+		longer has are dropped.  For a segment starting at lo, the chunks
+		from the last cached one that ends at or before lo on: the ones
+		after it that are cached, and the ones the bucket lists after the
+		last cached.  A chunk never changes once put, so a cached one stands
+		for itself even when the GC removed it since (its segment is
+		archived, and read from there).  A recovery asks for its segments in
+		order, and lists each chunk about once."""
 		cache = self.chunk_cache(tli)
-		present = set(seqs)
-		for name in os.listdir(cache):
-			if name.isdigit() and int(name) not in present:
-				os.unlink(os.path.join(cache, name))
+		after = None
+		terminators = None
+		if lo is not None:
+			terminators = self.terminator_tokens(tli)
+			after = self.cached_before(cache, lo, terminators)
+		cached = sorted(int(name) for name in os.listdir(cache)
+		                if name.isdigit())
+		if after is None:
+			seqs = self.chunk_seqs(tli)
+			present = set(seqs)
+			for seq in cached:
+				if seq not in present:
+					os.unlink(os.path.join(cache, str(seq)))
+		else:
+			# what is before it puts nothing at lo or after
+			for seq in cached:
+				if seq < after:
+					os.unlink(os.path.join(cache, str(seq)))
+			known = [seq for seq in cached if seq > after]
+			seqs = known + self.chunk_seqs(tli, cached[-1])
 
 		def fetch(seq):
 			path = os.path.join(cache, str(seq))
@@ -820,7 +892,8 @@ class OrioledbS3ObjectLoader:
 		with ThreadPoolExecutor(16) as executor:
 			list(executor.map(fetch, seqs))
 		result = []
-		fence = 0
+		fence = self.fence_through(terminators, after) \
+		    if after is not None else 0
 		for seq in seqs:
 			with open(os.path.join(cache, str(seq)), 'rb') as f:
 				magic, _, token, start, end = struct.unpack('<IIQQQ', f.read(32))
@@ -898,7 +971,7 @@ class OrioledbS3ObjectLoader:
 			seg[0:switch - lo] = parent[0:switch - lo]
 			pos = switch
 		first = None
-		for seq, magic, start, end in self.chunks_of(tli):
+		for seq, magic, start, end in self.chunks_of(tli, lo):
 			if magic == TERMINATOR_MAGIC:
 				continue
 			if magic != CHUNK_MAGIC:
@@ -967,12 +1040,14 @@ class OrioledbS3ObjectLoader:
 			f.write(data)
 		return 0
 
-	def list_objects(self, bucket_name, directory):
+	def list_objects(self, bucket_name, directory, start_after=None):
 		objects = []
 		paginator = self.s3.get_paginator('list_objects_v2')
 
 		prefix = os.path.join(self.prefix, directory)
-		for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix):
+		extra = {'StartAfter': start_after} if start_after else {}
+		for page in paginator.paginate(Bucket=bucket_name, Prefix=prefix,
+		                               **extra):
 			if 'Contents' in page:
 				page_objs = [x["Key"] for x in page['Contents']]
 				objects.extend(page_objs)
