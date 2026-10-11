@@ -1477,6 +1477,47 @@ class S3Test(S3BaseTest):
 		self.assertGreater(int(self.kv('root')['checkpoint']), chkp)
 		node.stop()
 
+	def test_s3_a_root_put_back_from_an_older_copy_loads_on(self):
+		"""The newest copy of root is missing and root is damaged:
+		--repair-root puts back an older copy.  A data directory loaded from
+		it replays the bucket's WAL past that checkpoint, every commit the
+		writer acknowledged included, and writes on."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		older = int(self.kv('root')['checkpoint'])
+		node.safe_psql("INSERT INTO o_test SELECT generate_series(11, 20);")
+		node.safe_psql("CHECKPOINT;")
+		newest = int(self.kv('root')['checkpoint'])
+		self.wait_for_object(f'roots/{newest}')
+		for i in range(21, 31):
+			node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+		node.stop(['-m', 'immediate'])
+		self.client.delete_object(Bucket=self.bucket_name, Key=f'roots/{newest}')
+		self.client.put_object(Bucket=self.bucket_name, Key='root',
+		                       Body=b'\x00garbage')
+		self.loader.download(None, repair_root=True)
+		self.assertEqual(older, int(self.kv('root')['checkpoint']))
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(30, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			new_node.safe_psql("INSERT INTO o_test VALUES (31);")
+			new_node.safe_psql("CHECKPOINT;")
+			self.assertGreater(int(self.kv('root')['checkpoint']), newest)
+			new_node.stop()
+			new_node.cleanup()
+
 	def test_s3_puts_whose_answer_is_lost(self):
 		"""A PUT that went through but whose answer was lost is retried and
 		judged by what the bucket holds: a chunk, a part, a manifest, root and
@@ -1989,6 +2030,85 @@ class S3Test(S3BaseTest):
 			new_node.stop()
 			new_node.cleanup()
 
+	def test_s3_as_of_an_old_epoch_after_a_takeover(self):
+		"""Restarts add epochs and the GC prunes them; another data directory
+		takes the bucket over and commits on.  The oldest retained
+		checkpoint, written under a token of a run long gone, still loads
+		with --as-of and reads as it was."""
+		node = self.gc_world("orioledb.s3_gc_keep_checkpoints = 4")
+		values = {}
+
+		def note(v):
+			c = int(self.kv('root')['checkpoint'])
+			for k in range(max(values, default=0) + 1, c + 1):
+				values[k] = v
+
+		def epochs():
+			return [l for l in self.s3_object('root').decode().splitlines()
+			        if l.startswith('epoch ')]
+
+		note(0)
+		for v in range(1, 7):
+			node.safe_psql(f"UPDATE o_test SET v = {v};")
+			node.safe_psql("CHECKPOINT;")
+			note(v)
+			node.stop(['-m', 'immediate'])
+			node.start()
+			note(v)
+		grown = len(epochs())
+		deadline = time.time() + 60
+		while time.time() < deadline and len(epochs()) >= grown:
+			node.safe_psql("CHECKPOINT;")
+			note(6)
+			time.sleep(1)
+		self.assertLess(len(epochs()), grown)
+		node.stop()
+		note(6)
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as b:
+			self.loader.download(b.data_dir)
+			b.append_conf(port=b.port)
+			b.append_conf("""
+				orioledb.s3_gc_interval = 1
+				orioledb.s3_gc_keep_checkpoints = 4
+				orioledb.main_buffers = 8MB
+			""")
+			b.start()
+			note(6)
+			for v in range(7, 9):
+				b.safe_psql(f"UPDATE o_test SET v = {v};")
+				b.safe_psql("CHECKPOINT;")
+				note(v)
+			time.sleep(3)
+			oldest = int(self.kv('gc')['retain'])
+			b.stop()
+			self.assertIn(oldest, values)
+			# written before the takeover
+			self.assertLessEqual(values[oldest], 6)
+
+			with self.initNode(self.getBasePort() + 2, 'tgsc') as old:
+				self.loader.download(old.data_dir, as_of=oldest)
+				old.append_conf(port=old.port)
+				old.append_conf("""
+					orioledb.s3_reader = on
+					hot_standby = on
+					orioledb.main_buffers = 8MB
+				""")
+				open(os.path.join(old.data_dir, "standby.signal"), "w").close()
+				old.start()
+				deadline = time.time() + 60
+				while True:
+					try:
+						got = old.execute("SELECT count(*), sum(v) FROM o_test")
+						break
+					except Exception:
+						self.assertLess(time.time(), deadline)
+						time.sleep(0.5)
+				self.assertEqual([(30000, 30000 * values[oldest])], got)
+				old.stop()
+				old.cleanup()
+			b.cleanup()
+
 	def test_s3_gc_spares_a_reader_pin(self):
 		"""A reader's pin keeps the GC below the checkpoint it opened."""
 		node = self.gc_world()
@@ -2030,6 +2150,53 @@ class S3Test(S3BaseTest):
 				time.sleep(0.5)
 			self.assertEqual([(30000, 90000)], count)
 			reader.stop()
+			reader.cleanup()
+		node.stop()
+
+	def test_s3_reader_pinned_while_the_gc_reads_pins(self):
+		"""The GC publishes R, then reads the pins.  A reader that pins its
+		checkpoint in between finds R past it and does not start; the GC,
+		reading the pins after, counts that pin and goes no further."""
+		node = self.gc_world()
+		hold = HoldFirstGet('readers')
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as reader, \
+		    patch('moto.s3.responses.S3Response.get_object',
+		          new=lambda response: hold(response)):
+			self.loader.download(reader.data_dir)
+			pinned = int(self.kv('root')['checkpoint'])
+			for v in range(1, 4):
+				node.safe_psql(f"UPDATE o_test SET v = {v};")
+				node.safe_psql("CHECKPOINT;")
+			# the GC's next pass stops after it publishes R
+			hold.armed = True
+			self.assertTrue(hold.entered.wait(60))
+			self.assertGreater(int(self.kv('gc')['retain']), pinned)
+			reader.append_conf(port=reader.port)
+			reader.append_conf("""
+				orioledb.s3_reader = on
+				hot_standby = on
+				orioledb.main_buffers = 8MB
+			""")
+			open(os.path.join(reader.data_dir, "standby.signal"), "w").close()
+			try:
+				reader.start()
+			except StartNodeException:
+				pass
+			with open(reader.pg_log_file) as f:
+				self.assertIn(f"the S3 bucket no longer keeps checkpoint {pinned}",
+				              f.read())
+			# the pin is in the readers object the GC reads now
+			self.assertIn(f" {pinned} ", self.s3_object('readers').decode())
+			before = self.kv('gc')
+			hold.release.set()
+			node.safe_psql("UPDATE o_test SET v = 4;")
+			node.safe_psql("CHECKPOINT;")
+			time.sleep(5)
+			# the pin holds the GC where it was
+			after = self.kv('gc')
+			for name in ('folded', 'collected'):
+				self.assertLessEqual(int(after.get(name, 0)),
+				                     max(int(before.get(name, 0)), pinned))
 			reader.cleanup()
 		node.stop()
 
@@ -3247,6 +3414,75 @@ class S3Test(S3BaseTest):
 					self.assertEqual(expected, rc, (standby, answer))
 			new_node.cleanup()
 
+	def test_s3_restore_stops_when_the_store_fails(self):
+		"""A chunk the store does not serve (503 past the retries) is no
+		end of the WAL: --restore answers 128, which stops recovery, not 1;
+		served, the same request answers 0."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		node.safe_psql("INSERT INTO o_test SELECT generate_series(1, 10);")
+		segment = node.execute(
+		    "SELECT pg_walfile_name(pg_current_wal_lsn());")[0][0]
+		node.stop(['-m', 'immediate'])
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			with open(os.path.join(new_node.data_dir,
+			                       'postgresql.auto.conf')) as f:
+				line = [l for l in f if l.startswith('restore_command')][-1]
+			command = line.split('=', 1)[1].strip()[1:-1].replace("''", "'")
+			# the loader's own answer, without the wrapper's mapping
+			command = command.split(';')[0].replace('%f', segment).replace(
+			    '%p', os.path.join(new_node.base_dir, 'seg'))
+			shutil.rmtree(os.path.join(new_node.data_dir, 'pg_wal',
+			                           'orioledb_s3_chunks'), ignore_errors=True)
+			failing = FailingGet('/chunks/')
+			with patch('moto.s3.responses.S3Response.get_object',
+			           new=lambda response: failing(response)):
+				rc = subprocess.run(['sh', '-c', command], cwd=new_node.data_dir,
+				                    capture_output=True,
+				                    env=dict(os.environ, AWS_MAX_ATTEMPTS='1')).returncode
+			self.assertGreater(failing.failed, 0)
+			self.assertEqual(128, rc)
+			rc = subprocess.run(['sh', '-c', command], cwd=new_node.data_dir,
+			                    capture_output=True).returncode
+			self.assertEqual(0, rc)
+			new_node.cleanup()
+
+	def test_s3_a_conflicting_part_put_is_put_again(self):
+		"""AWS answers a conditional PUT that races another write of the key
+		with 409.  A part PUT answered so, with no object under the key, is
+		put again, and the checkpoint goes through."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, pad text) USING orioledb;
+			INSERT INTO o_test SELECT g, repeat('x', 200) FROM generate_series(1, 20000) g;
+		""")
+		conflicting = ConflictingPut(5)
+		with patch('moto.s3.responses.S3Response.put_object',
+		           new=lambda response: conflicting(response)):
+			node.safe_psql("CHECKPOINT;")
+		self.assertEqual(5, conflicting.answered)
+		node.stop()
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.append_conf("orioledb.main_buffers = 8MB")
+			new_node.start()
+			self.assertEqual([(20000, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
+
 	def test_s3_restore_refuses_a_gap_at_a_segment_start(self):
 		"""The chunk that a segment starts in missing is a gap too: the
 		segment is not assembled from the next chunk on."""
@@ -3729,6 +3965,14 @@ class S3Test(S3BaseTest):
 		"""A map whose header is lost loads its tree empty and does not say
 		how many parts the tree handed out; the tree numbers on past every
 		part the bucket has instead of putting one of them again."""
+		self.lost_map_header(0)
+
+	def test_s3_a_lost_map_header_lists_every_part(self):
+		"""The parts past a lost map header are found by a listing that
+		goes on past its first page of 1000 keys."""
+		self.lost_map_header(1500)
+
+	def lost_map_header(self, extra):
 		node = self.node
 		node.append_conf(self.s3_conf())
 		node.start()
@@ -3748,17 +3992,24 @@ class S3Test(S3BaseTest):
 		for f in maps:
 			with open(f"{node.data_dir}/orioledb_data/{datoid}/{f}", 'r+b') as m:
 				m.write(bytes(44))
+		old = max(int(k.split('/')[-1]) for k in before if k.split('/')[2] == tree)
+		# parts of the tree the map no longer counts, past a listing page
+		for p in range(old + 1, old + 1 + extra):
+			self.client.put_object(Bucket=self.bucket_name,
+			                       Key=f"trees/{datoid}/{tree}/parts/{p}", Body=b"x")
+		placed = {k: v for k, v in self.part_etags().items() if k not in before}
+		self.assertEqual(extra, len(placed))
 		node.start()
 		node.safe_psql("INSERT INTO o_test SELECT g, repeat('y', 200) "
 		               "FROM generate_series(1, 20000) g ON CONFLICT DO NOTHING;")
 		node.safe_psql("CHECKPOINT;")
 		after = self.part_etags()
 		self.assertEqual(before, {k: after.get(k) for k in before})
-		old = max(int(k.split('/')[-1]) for k in before if k.split('/')[2] == tree)
-		new = [int(k.split('/')[-1]) for k in set(after) - set(before)
+		self.assertEqual(placed, {k: after.get(k) for k in placed})
+		new = [int(k.split('/')[-1]) for k in set(after) - set(before) - set(placed)
 		       if k.split('/')[2] == tree]
 		self.assertTrue(new)
-		self.assertGreater(min(new), old)
+		self.assertGreater(min(new), old + extra)
 		node.stop()
 
 	def test_s3_unsealed_parts_request_a_checkpoint(self):
