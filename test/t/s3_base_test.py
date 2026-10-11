@@ -2,6 +2,7 @@ import inspect
 import json
 import logging
 import os
+import struct
 import re
 from re import RegexFlag
 import runpy
@@ -140,6 +141,32 @@ class AmbiguousPut:
 			if self.seen[kind] % self.every == 0:
 				orig_put_object(response)
 				self.landed[kind] += 1
+				raise TransientServerError()
+		return orig_put_object(response)
+
+
+class HoldChunksOf:
+	"""
+	A put_object() that answers 503 to WAL chunks of writer token `token`
+	until `release` is set, and stores everything else: one writer's
+	shipper waits while another's goes on.
+	"""
+
+	def __init__(self):
+		self.token = None
+		self.release = False
+		self.held = 0
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		if '/chunks/' in response.parse_key_name() and \
+		    self.token is not None and not self.release:
+			body = response.body
+			if isinstance(body, str):
+				body = body.encode()
+			if len(body) >= 16 and \
+			    struct.unpack('<I', body[0:4])[0] == 0x3143574f and \
+			    struct.unpack('<Q', body[8:16])[0] == self.token:
+				self.held += 1
 				raise TransientServerError()
 		return orig_put_object(response)
 

@@ -683,7 +683,7 @@ put_chunk(TimeLineID tli, uint64 seq, XLogRecPtr start, XLogRecPtr end,
  * before the switch.
  */
 void
-s3_wal_place_terminator(uint64 token)
+s3_wal_place_terminator(uint64 token, bool loaded)
 {
 	TimeLineID	tli,
 				loadedTli;
@@ -750,7 +750,7 @@ s3_wal_place_terminator(uint64 token)
 	 * WAL this data directory does not have: only a recovery that reads the
 	 * bucket gets them.
 	 */
-	if ((tli != loadedTli || seq > loadedNext) &&
+	if (loaded && (tli != loadedTli || seq > loadedNext) &&
 		access(RESTORE_BUCKET_FILENAME, F_OK) != 0)
 		ereport(FATAL,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -763,6 +763,14 @@ s3_wal_place_terminator(uint64 token)
 						 "restore_command reading the bucket (the loader's "
 						 "default).")));
 
+	/* a load goes on on a new timeline: this one is retired */
+	if (!loaded)
+	{
+		ereport(LOG,
+				(errmsg("put a WAL terminator at chunk %llu of timeline %u",
+						(unsigned long long) seq, tli)));
+		return;
+	}
 	initStringInfo(&retired);
 	appendStringInfo(&retired, "%u %llu\n", tli, (unsigned long long) seq);
 	{
@@ -1198,7 +1206,7 @@ s3_wal_shipper_main(Datum main_arg)
 	MemoryContext cxt;
 	TimestampTz lastReply = 0;
 	TimestampTz lastGc = 0;
-	bool		leaseChecked = false;
+	bool		fenced = false;
 
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
@@ -1249,9 +1257,15 @@ s3_wal_shipper_main(Datum main_arg)
 walk:
 	while (read_chunk_header(tli, nextSeq, &existing))
 	{
-		/* our own terminator: a load that started without a new timeline */
+		/*
+		 * Our own terminator (every start puts one): past it, only this run's
+		 * chunks are ours.  A copy of this data directory that went on
+		 * meanwhile has the previous run's token too.
+		 */
 		if (existing.magic == TERMINATOR_MAGIC && s3_lease_own_token(existing.token))
 		{
+			if (existing.token == s3_lease_token())
+				fenced = true;
 			nextSeq++;
 			continue;
 		}
@@ -1261,6 +1275,7 @@ walk:
 		 * shipping on would give the bucket two histories.
 		 */
 		if (!s3_lease_own_token(existing.token) ||
+			(fenced && existing.token != s3_lease_token()) ||
 			existing.startLsn != start)
 			s3_stop_instance("the S3 bucket has WAL past this data directory",
 							 psprintf("WAL chunk %llu of timeline %u, %X/%08X to %X/%08X, "
@@ -1453,12 +1468,12 @@ walk:
 		{
 			XLogRecPtr	end = chunkStart + chunk.len;
 
-			/* the run's first chunk: the lease is still ours */
-			if (!leaseChecked)
-			{
-				(void) s3_lease_hold();
-				leaseChecked = true;
-			}
+			/*
+			 * The lease is still ours: a writer paused past it (a stopped
+			 * VM, a partition) stops here rather than ship after another
+			 * took over.
+			 */
+			(void) s3_lease_hold();
 			if (!put_chunk(tli, nextSeq, chunkStart, end, chunk.data))
 				ereport(ERROR,
 						(errmsg("WAL chunk %llu of timeline %u belongs to another writer",

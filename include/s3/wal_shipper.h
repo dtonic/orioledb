@@ -30,7 +30,7 @@ extern bool s3_wal_chunk_end(TimeLineID tli, uint64 seq, bool *terminator,
 							 XLogRecPtr *end);
 extern bool s3_wal_shipper_wait(XLogRecPtr lsn);
 extern void s3_wal_shipper_state(XLogRecPtr *flushed, bool *running);
-extern void s3_wal_place_terminator(uint64 token);
+extern void s3_wal_place_terminator(uint64 token, bool loaded);
 extern PGDLLEXPORT void s3_wal_shipper_main(Datum main_arg);
 
 #endif							/* __S3_WAL_SHIPPER_H__ */

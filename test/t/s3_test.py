@@ -24,7 +24,7 @@ from testgres.exceptions import StartNodeException, QueryException
 from .base_test import wait_checkpointer_stopevent
 from .s3_base_test import S3BaseTest, s3_test_attrs, mock_put_object, \
  mock_put_object_conflict, mock_moto_unkown_error, FlakyPutObject, \
- RevokedKeyPut, AmbiguousPut
+ RevokedKeyPut, AmbiguousPut, HoldChunksOf
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
@@ -2362,6 +2362,104 @@ class S3Test(S3BaseTest):
 				last.start()
 				self.assertEqual([(20, )],
 				                 last.execute("SELECT count(*) FROM o_test"))
+				last.stop()
+				last.cleanup()
+			copy.cleanup()
+
+	def test_s3_copy_and_a_paused_original_do_not_splice(self):
+		"""A copy of a running writer's data directory starts while the
+		original is paused past its lease, and takes the bucket over.  The
+		original, resumed, ships a chunk where the copy's first one was to go
+		before the copy's lands.  Neither history may be spliced onto the
+		other: a load has the copy's history whole, and every commit the
+		original acknowledged."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_lease_duration = 15
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, who text) USING orioledb;
+			INSERT INTO o_test SELECT g, 'a' FROM generate_series(1, 10) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		token = int(self.kv('root')['token'])
+		hold = HoldChunksOf()
+		with self.initNode(self.getBasePort() + 1, 'tgsc') as copy, \
+		    patch('moto.s3.responses.S3Response.put_object',
+		          new=lambda response: hold(response)):
+			self.copy_while_stopped(node, copy)
+			copy.append_conf(port=copy.port)
+			pids = [node.pid] + [
+			    int(p) for p in os.popen(
+			        f"ps -o pid= --ppid {node.pid}").read().split()]
+			lease = [int(l.split()[0]) for l in os.popen(
+			    f"ps -o pid=,args= --ppid {node.pid}").read().splitlines()
+			    if 'orioledb s3 lease' in l]
+			for pid in pids:
+				os.kill(pid, signal.SIGSTOP)
+			# the copy's chunks wait until the original has shipped
+			hold.token = token + 1
+			copy.start()
+			copied = []
+
+			def copy_writes():
+				for i in range(11, 21):
+					copy.safe_psql(f"INSERT INTO o_test VALUES ({i}, 'b');")
+					copied.append(i)
+
+			writer_b = Thread(target=copy_writes)
+			writer_b.daemon = True
+			writer_b.start()
+			deadline = time.time() + 60
+			while hold.held < 2 and time.time() < deadline:
+				time.sleep(0.2)
+			self.assertGreaterEqual(hold.held, 2)
+			# the original, but its lease worker, goes on
+			for pid in pids:
+				if pid not in lease:
+					os.kill(pid, signal.SIGCONT)
+			acked = []
+
+			def original_writes():
+				try:
+					for i in range(100, 105):
+						node.safe_psql(f"INSERT INTO o_test VALUES ({i}, 'a');")
+						acked.append(i)
+				except Exception:
+					pass
+
+			writer_a = Thread(target=original_writes)
+			writer_a.daemon = True
+			writer_a.start()
+			writer_a.join(20)
+			hold.release = True
+			for pid in lease:
+				try:
+					os.kill(pid, signal.SIGCONT)
+				except ProcessLookupError:
+					pass
+			writer_b.join(60)
+			# the original, stopping on its lost lease, left the copy's alone
+			self.assertEqual(token + 1, int(self.kv('writer')['token']))
+			copy.stop(['-m', 'immediate'])
+			try:
+				node.stop(['-m', 'immediate'])
+			except Exception:
+				pass
+
+			with self.initNode(self.getBasePort() + 2, 'tgsd') as last:
+				self.loader.download(last.data_dir)
+				last.append_conf(port=last.port)
+				last.start()
+				rows = dict(last.execute("SELECT id, who FROM o_test"))
+				self.assertEqual([], [i for i in acked if i not in rows])
+				# the copy goes on: every commit of it acknowledged and loaded
+				self.assertEqual(list(range(11, 21)), copied)
+				self.assertEqual([], [i for i in copied if rows.get(i) != 'b'])
 				last.stop()
 				last.cleanup()
 			copy.cleanup()

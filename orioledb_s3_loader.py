@@ -763,6 +763,19 @@ class OrioledbS3ObjectLoader:
 		    for key in self.list_objects(self.bucket_name, prefix)
 		    if re.match(r'.*/chunks/\d+$', key))
 
+	def first_chunk_seq(self, tli):
+		"""The number of a timeline's first chunk of WAL: every number
+		before it is a terminator (each writer start puts one, and its mark
+		under terminators/ stays)."""
+		prefix = f"wal/{tli:08X}/terminators/"
+		marks = {int(key.rsplit('/', 1)[1])
+		         for key in self.list_objects(self.bucket_name, prefix)
+		         if re.match(r'.*/terminators/\d+$', key)}
+		first = 0
+		while first in marks:
+			first += 1
+		return first
+
 	def chunk_key(self, tli, seq):
 		return os.path.join(self.prefix, f"wal/{tli:08X}/chunks/{seq:020d}")
 
@@ -876,6 +889,7 @@ class OrioledbS3ObjectLoader:
 			switch = min(start_of[1], hi)
 			seg[0:switch - lo] = parent[0:switch - lo]
 			pos = switch
+		first = None
 		for seq, magic, start, end in self.chunks_of(tli):
 			if magic == TERMINATOR_MAGIC:
 				continue
@@ -888,7 +902,9 @@ class OrioledbS3ObjectLoader:
 				# one on, and none that reaches into a segment not archived
 				# yet is removed: a later one is the first here only when the
 				# one before it is missing
-				pos = lo if seq != 0 else max(start, lo)
+				if first is None:
+					first = self.first_chunk_seq(tli)
+				pos = lo if seq != first else max(start, lo)
 			if start > pos:
 				# a chunk missing between two that are there: the WAL
 				# after it was acknowledged and is not here; ending the

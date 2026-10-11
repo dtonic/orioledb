@@ -981,9 +981,12 @@ s3_lease_acquire(void)
 	if (newRoot.checkpoint > 0)
 		put_root_copy(newRoot.checkpoint, &body);
 
-	/* taking the bucket over: no chunk of the fenced writer after this */
-	if (pm_lease.loaded)
-		s3_wal_place_terminator(pm_lease.token);
+	/*
+	 * No chunk of an earlier writer after this: of the one this load takes
+	 * over from, or of a copy of this data directory still going on with
+	 * the previous run's token.
+	 */
+	s3_wal_place_terminator(pm_lease.token, pm_lease.loaded);
 
 	ereport(LOG,
 			(errmsg("took the S3 writer lease with token " UINT64_FORMAT,
