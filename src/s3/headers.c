@@ -1374,7 +1374,9 @@ s3_headers_try_eviction_cycle(void)
 	 * Unsealed parts cannot be evicted: only the checkpoint of the stream
 	 * that writes them seals them.  Past the bound, count them again and ask
 	 * for one, at most once a minute so a load that outruns the checkpointer
-	 * does not queue requests.
+	 * does not queue requests.  A spread checkpoint takes about
+	 * checkpoint_timeout while the parts go on piling up: past twice the
+	 * bound the request is immediate, which hurries one already going.
 	 */
 	if (pg_atomic_read_u64(&meta->numberOfUnsealedParts) > maxUnsealedParts)
 	{
@@ -1382,13 +1384,20 @@ s3_headers_try_eviction_cycle(void)
 
 		if (TimestampDifferenceExceeds(lastRequest, now, 60 * 1000))
 		{
+			uint64		unsealed;
+
 			lastRequest = now;
-			if (recount_unsealed_parts() > maxUnsealedParts)
+			unsealed = recount_unsealed_parts();
+			if (unsealed > maxUnsealedParts)
 			{
-				elog(LOG, "requesting a checkpoint: %llu MB of local S3 parts are not sealed yet (orioledb.s3_max_unsealed_size = %d MB)",
-					 (unsigned long long) (pg_atomic_read_u64(&meta->numberOfUnsealedParts) * ORIOLEDB_S3_PART_SIZE / (1024 * 1024)),
+				bool		immediate = unsealed > 2 * maxUnsealedParts;
+
+				elog(LOG, "requesting %s checkpoint: %llu MB of local S3 parts are not sealed yet (orioledb.s3_max_unsealed_size = %d MB)",
+					 immediate ? "an immediate" : "a",
+					 (unsigned long long) (unsealed * ORIOLEDB_S3_PART_SIZE / (1024 * 1024)),
 					 s3_max_unsealed_size);
-				RequestCheckpoint(CHECKPOINT_FORCE);
+				RequestCheckpoint(CHECKPOINT_FORCE |
+								  (immediate ? CHECKPOINT_IMMEDIATE : 0));
 			}
 		}
 	}

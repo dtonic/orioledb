@@ -2062,22 +2062,50 @@ class S3Test(S3BaseTest):
 	def test_s3_gc_keeps_checkpoints_by_time(self):
 		"""orioledb.s3_gc_keep_time keeps the checkpoints committed within it
 		restorable however many came after; then they go."""
-		node = self.gc_world("orioledb.s3_gc_keep_time = 20")
+		node = self.gc_world("orioledb.s3_gc_keep_time = 40")
 		start = time.time()
 		parts = self.part_etags()
 		tree = self.primary_relnode(node)
 		first = {k for k in parts if k.split('/')[2] == tree}
 		self.assertTrue(first)
+		kept = int(self.kv('root')['checkpoint'])
 		for v in range(1, 4):
 			node.safe_psql(f"UPDATE o_test SET v = {v};")
 			node.safe_psql("CHECKPOINT;")
-		while time.time() < start + 12:
-			self.assertEqual(first, first & set(self.part_etags()))
+		# within the window the first checkpoint loads and reads
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as old:
+			self.loader.download(old.data_dir, as_of=kept)
+			old.append_conf(port=old.port)
+			old.append_conf("""
+				orioledb.s3_reader = on
+				orioledb.s3_reader_pin_ttl = 30
+				hot_standby = on
+				orioledb.main_buffers = 8MB
+			""")
+			open(os.path.join(old.data_dir, "standby.signal"), "w").close()
+			old.start()
+			deadline = time.time() + 30
+			while True:
+				try:
+					got = old.execute("SELECT count(*), sum(v) FROM o_test")
+					break
+				except Exception:
+					self.assertLess(time.time(), deadline)
+					time.sleep(0.5)
+			self.assertEqual([(30000, 0)], got)
+			old.stop()
+			old.cleanup()
+		self.assertLess(time.time(), start + 35)
+		while time.time() < start + 35:
+			self.assertEqual(first, first & set(self.part_etags()),
+			                 f"{time.time() - start:.1f}s, gc {self.kv('gc')}, "
+			                 f"kept {kept}")
 			time.sleep(1)
-		deadline = time.time() + 60
+		# past the window, and past the reader's pin
+		deadline = time.time() + 90
 		while time.time() < deadline and first & set(self.part_etags()):
 			time.sleep(1)
-		self.assertGreater(time.time(), start + 20)
+		self.assertGreater(time.time(), start + 40)
 		self.assertEqual(set(), first & set(self.part_etags()))
 		self.assert_bucket_restores(node, [(30000, 90000)])
 
@@ -4264,6 +4292,9 @@ class S3Test(S3BaseTest):
 			orioledb.s3_max_unsealed_size = 1MB
 		""")
 		node.start()
+		node.safe_psql("CREATE EXTENSION IF NOT EXISTS orioledb;")
+		before = node.execute(
+		    "SELECT root_checkpoint FROM orioledb_s3_status()")[0][0]
 		node.safe_psql("""
 			CREATE EXTENSION IF NOT EXISTS orioledb;
 			CREATE TABLE o_test (
@@ -4276,13 +4307,26 @@ class S3Test(S3BaseTest):
 		deadline = time.time() + 60
 		while time.time() < deadline:
 			with open(node.pg_log_file) as f:
-				if "requesting a checkpoint" in f.read():
+				if re.search("requesting (a|an immediate) checkpoint", f.read()):
 					break
 			time.sleep(0.5)
 		else:
 			self.fail("no checkpoint was requested")
+		# a checkpoint follows, and seals what it asked for
+		deadline = time.time() + 60
+		while time.time() < deadline and \
+		    node.execute("SELECT root_checkpoint FROM orioledb_s3_status()")[0][0] <= before:
+			time.sleep(0.5)
+		self.assertGreater(
+		    node.execute("SELECT root_checkpoint FROM orioledb_s3_status()")[0][0], before)
 		self.assertEqual([(40000, )],
 		                 node.execute("SELECT count(*) FROM o_test"))
+		deadline = time.time() + 60
+		while time.time() < deadline and \
+		    node.execute("SELECT unsealed_parts FROM orioledb_s3_status()")[0][0] > 8:
+			time.sleep(0.5)
+		self.assertLessEqual(
+		    node.execute("SELECT unsealed_parts FROM orioledb_s3_status()")[0][0], 8)
 		node.stop()
 
 	def load_tables_after_checkpoint(self, tables, rows):

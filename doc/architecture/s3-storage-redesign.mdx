@@ -126,7 +126,9 @@ shipper). 한 버킷에 writer 하나와 reader 여럿이 붙는다. writer 는 
   재구축은 끝날 때 봉인하고(`btree_s3_seal_build`) 파트 끝을 `<rel>.bend` 에 남긴다.
 - 제자리 재기록은 봉인 전 파트에만 일어난다. 봉인된 파트는 바뀌지 않는다. Guard: `test_s3_parts_are_written_once`.
 - 미봉인 파트는 축출할 수 없어 로컬 디스크가 체크포인트 한 간격의 쓰기를 쥔다. 미봉인 양이
-  `orioledb.s3_max_unsealed_size`(기본 1 GB)를 넘으면 체크포인트를 요청한다(1분에 한 번까지).
+  `orioledb.s3_max_unsealed_size`(기본 1 GB)를 넘으면 체크포인트를 요청한다(1분에 한 번까지). 분산 체크포인트는
+  `checkpoint_timeout` 가까이 걸려 그동안 미봉인 파트가 계속 쌓이므로, 두 배를 넘으면 즉시 체크포인트를 요청해 진행 중인
+  것도 서둘러 끝낸다. Guard: `test_s3_unsealed_parts_request_a_checkpoint`.
 - 축출은 `orioledb.s3_desired_size`(기본 10000 MB)를 넘을 때, 올라간 파트 자리에 구멍을 뚫는다. 다시 읽으면 GET 이다.
 - **map 에서 트리를 올리면 두 흐름 모두 새 파트에서 시작한다**(`evictable_tree_init_meta`). map 의 커서는 쓰지 않는다:
   map 을 쓴 체크포인트는 자기 흐름을 봉인했으므로 map 이 가리키는 블록은 모두 봉인 파트에 있고, 다른 흐름이 그 뒤에 쓴
