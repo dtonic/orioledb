@@ -669,12 +669,26 @@ class S3Test(S3BaseTest):
 			    node.execute("INSERT INTO o_test VALUES (1) RETURNING id;")))
 			commit.daemon = True
 			commit.start()
-			time.sleep(5)
+			# this commit waits for the bucket, not for anything else
+			watch = node.connect(autocommit=True)
+			deadline = time.time() + 30
+			while time.time() < deadline and (flaky.failed == 0 or not watch.execute("""
+				SELECT 1 FROM pg_stat_activity
+				WHERE wait_event = 'SyncRep' AND query LIKE 'INSERT INTO o_test%%'
+			""")):
+				time.sleep(0.2)
+			flushed = int(watch.execute(
+			    "SELECT pg_wal_lsn_diff(pg_current_wal_flush_lsn(), '0/0')")[0][0])
+			watch.close()
 			self.assertGreater(flaky.failed, 0)
 			self.assertEqual(done, [])
+			# no chunk has its WAL yet
+			self.assertLess(max(e for _, e in self.chunk_ranges().values()), flushed)
 			flaky.failures = 0
 			commit.join(60)
 		self.assertEqual(len(done), 1)
+		self.assertGreaterEqual(max(e for _, e in self.chunk_ranges().values()),
+		                        flushed)
 		self.assertEqual([(1, )], node.execute("SELECT count(*) FROM o_test"))
 		node.stop()
 
@@ -1735,8 +1749,19 @@ class S3Test(S3BaseTest):
 			bench.wait()
 		node.stop(['-m', 'immediate'])
 		node.start()
-		self.assertGreater(node.execute("SELECT count(*) FROM o_test")[0][0], 0)
-		node.stop()
+		count = node.execute("SELECT count(*) FROM o_test")[0][0]
+		self.assertGreater(count, 0)
+		node.stop(['-m', 'immediate'])
+		# every commit the restart has, the bucket has: no chunk removed
+		# took WAL that was not archived
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(count, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
 
 	def test_s3_load_sees_commits_behind_a_long_transaction(self):
 		"""A transaction open across a checkpoint holds its xmin: the ones that
