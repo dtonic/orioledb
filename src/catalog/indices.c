@@ -2067,6 +2067,7 @@ build_secondary_index(Oid oldTblRelnode, OTable *o_table,
 	OIndexDescr *idx;
 	int			i;
 	bool		setting_tbl_tablespace = OidIsValid(oldTblRelnode);
+	S3TaskLocation location;
 
 	index_tuples = palloc0(sizeof(double));
 	ctid = 1;
@@ -2179,13 +2180,20 @@ build_secondary_index(Oid oldTblRelnode, OTable *o_table,
 	 */
 	o_tables_table_meta_lock(o_table);
 
-	btree_write_file_header(&idx->desc, &fileHeader);
+	location = btree_write_file_header(&idx->desc, &fileHeader);
 	if (!setting_tbl_tablespace)
 		o_drop_shared_root_info(idx->desc.oids.datoid,
 								idx->desc.oids.relnode,
 								idx->desc.oids.spcoid);
 
 	o_tables_table_meta_unlock(o_table, oldTblRelnode);
+
+	/*
+	 * The map is in the bucket before the build commits, as a rebuild's:
+	 * no later checkpoint uploads the map of a tree it did not change.
+	 */
+	if (orioledb_s3_mode)
+		s3_queue_wait_for_location(location);
 
 	if (result)
 	{
