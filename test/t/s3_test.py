@@ -441,10 +441,9 @@ class S3Test(S3BaseTest):
 			COMMIT;
 		""")
 		node.safe_psql("CHECKPOINT")
-		while True:
-			dataSize = self.get_data_size()
-			if dataSize <= 20 * 1024 * 1024:
-				break
+		deadline = time.time() + 120
+		while self.get_data_size() > 20 * 1024 * 1024:
+			self.assertLess(time.time(), deadline, "the data was never evicted")
 			time.sleep(1)
 		self.assertEqual(20000,
 		                 node.execute("SELECT COUNT(*) FROM o_test")[0][0])
@@ -504,6 +503,8 @@ class S3Test(S3BaseTest):
 			if self.get_data_size() <= 2 * 1024 * 1024:
 				break
 			time.sleep(1)
+		# evicted: the reads below go to the bucket
+		self.assertLessEqual(self.get_data_size(), 2 * 1024 * 1024)
 		self.assertEqual([(20000, 20000)],
 		                 con.execute("""
 			SELECT count(*), count(*) FILTER (WHERE value = repeat('b', 300))
@@ -978,10 +979,18 @@ class S3Test(S3BaseTest):
 		last = int(keys[-1].rsplit('/', 1)[1])
 		tli = int(keys[-1].split('/')[1], 16)
 		token = int(self.s3_body('writer')['token']) + 1
-		self.client.put_object(
-		    Bucket=self.bucket_name,
-		    Key=f"wal/{tli:08X}/chunks/{last + 1:020d}",
-		    Body=struct.pack('<IIQQQ', 0x3154574f, tli, token, 0, 0))
+		# after the last chunk, never over one the shipper put meanwhile
+		seq = last + 1
+		while True:
+			try:
+				self.client.put_object(
+				    Bucket=self.bucket_name,
+				    Key=f"wal/{tli:08X}/chunks/{seq:020d}",
+				    Body=struct.pack('<IIQQQ', 0x3154574f, tli, token, 0, 0),
+				    IfNoneMatch='*')
+				break
+			except self.client.exceptions.ClientError:
+				seq += 1
 		done = []
 		commit = Thread(target=lambda: done.append(
 		    node.execute("INSERT INTO o_test VALUES (11) RETURNING id;")))
@@ -1052,6 +1061,8 @@ class S3Test(S3BaseTest):
 			except ProcessLookupError:
 				pass
 		self.assertNotEqual(node.status(), NodeStatus.Running)
+		with open(node.pg_log_file) as f:
+			self.assertIn("lost the S3 writer lease", f.read())
 		self.assertNotIn("Contents", self.client.list_objects(
 		    Bucket=self.bucket_name, Prefix=f'wal/{segment}'))
 
@@ -1190,8 +1201,7 @@ class S3Test(S3BaseTest):
 	def chunk_keys(self, terminators=False):
 		# every start puts a terminator, and it stays: WAL chunks alone by
 		# default
-		keys = [x["Key"] for x in self.client.list_objects(
-		    Bucket=self.bucket_name, Prefix='wal/').get("Contents", [])]
+		keys = self.all_keys('wal/')
 		marks = {k.replace('/terminators/', '/chunks/') for k in keys
 		         if '/terminators/' in k}
 		return sorted(k for k in keys if '/chunks/' in k and
@@ -1656,6 +1666,22 @@ class S3Test(S3BaseTest):
 		node.safe_psql("CHECKPOINT;")
 		return node
 
+	def assert_bucket_restores(self, node, expected,
+	                           query="SELECT count(*), sum(v) FROM o_test"):
+		"""What the GC left serves the writer, and a load: it reads every
+		part it needs from the bucket, which the writer's local copies do
+		not."""
+		self.assertEqual(expected, node.execute(query))
+		node.stop()
+		with self.initNode(self.getBasePort() + 4, 'tgsr') as restored:
+			self.loader.download(restored.data_dir)
+			restored.append_conf(port=restored.port)
+			restored.append_conf("orioledb.main_buffers = 8MB")
+			restored.start()
+			self.assertEqual(expected, restored.execute(query))
+			restored.stop()
+			restored.cleanup()
+
 	def wait_for_gc(self, before, timeout=60):
 		deadline = time.time() + timeout
 		while time.time() < deadline:
@@ -1780,9 +1806,9 @@ class S3Test(S3BaseTest):
 			rounds.append(now - seen)
 			seen |= now
 		# the table's tree: every round rewrites each of its blocks
-		tree = collections.Counter(k.split('/')[2]
-		                           for k in rounds[-1]).most_common(1)[0][0]
+		tree = self.primary_relnode(node)
 		recent = rounds[-1] | rounds[-2]
+		self.assertTrue([k for k in recent if k.split('/')[2] == tree])
 
 		def left():
 			return {k for k in self.part_etags()
@@ -1792,9 +1818,7 @@ class S3Test(S3BaseTest):
 		while time.time() < deadline and left():
 			time.sleep(1)
 		self.assertEqual(set(), left())
-		self.assertEqual([(30000, total + 4 * 30000)],
-		                 node.execute("SELECT count(*), sum(v) FROM o_test"))
-		node.stop()
+		self.assert_bucket_restores(node, [(30000, total + 4 * 30000)])
 
 	def test_s3_gc_folds_the_lists_of_a_checkpoint_with_no_manifest(self):
 		"""A checkpoint that finished locally but never got its manifest up
@@ -1802,9 +1826,9 @@ class S3Test(S3BaseTest):
 		the blocks that died there do not live on."""
 		node = self.gc_world("orioledb.s3_lease_duration = 15")
 		parts = self.part_etags()
-		tree = collections.Counter(k.split('/')[2]
-		                           for k in parts).most_common(1)[0][0]
+		tree = self.primary_relnode(node)
 		first = {k for k in parts if k.split('/')[2] == tree}
+		self.assertTrue(first)
 		node.safe_psql("UPDATE o_test SET v = v + 1;")
 		flaky = FlakyPutObject(10**9, prefix='manifests/')
 		with patch('moto.s3.responses.S3Response.put_object',
@@ -1826,9 +1850,7 @@ class S3Test(S3BaseTest):
 		while time.time() < deadline and first & set(self.part_etags()):
 			time.sleep(1)
 		self.assertEqual(set(), first & set(self.part_etags()))
-		self.assertEqual([(30000, 120000)],
-		                 node.execute("SELECT count(*), sum(v) FROM o_test"))
-		node.stop()
+		self.assert_bucket_restores(node, [(30000, 120000)])
 
 	def test_s3_gc_keeps_checkpoints_by_time(self):
 		"""orioledb.s3_gc_keep_time keeps the checkpoints committed within it
@@ -1836,9 +1858,9 @@ class S3Test(S3BaseTest):
 		node = self.gc_world("orioledb.s3_gc_keep_time = 20")
 		start = time.time()
 		parts = self.part_etags()
-		tree = collections.Counter(k.split('/')[2]
-		                           for k in parts).most_common(1)[0][0]
+		tree = self.primary_relnode(node)
 		first = {k for k in parts if k.split('/')[2] == tree}
+		self.assertTrue(first)
 		for v in range(1, 4):
 			node.safe_psql(f"UPDATE o_test SET v = {v};")
 			node.safe_psql("CHECKPOINT;")
@@ -1850,9 +1872,7 @@ class S3Test(S3BaseTest):
 			time.sleep(1)
 		self.assertGreater(time.time(), start + 20)
 		self.assertEqual(set(), first & set(self.part_etags()))
-		self.assertEqual([(30000, 90000)],
-		                 node.execute("SELECT count(*), sum(v) FROM o_test"))
-		node.stop()
+		self.assert_bucket_restores(node, [(30000, 90000)])
 
 	def test_s3_gc_prunes_writer_epochs(self):
 		"""Every run that commits a checkpoint adds an epoch to root.  The GC
@@ -1906,10 +1926,18 @@ class S3Test(S3BaseTest):
 			open(os.path.join(reader.data_dir, "standby.signal"), "w").close()
 			reader.start()
 			pinned = self.part_etags()
+			pinned_checkpoint = int(self.kv('root')['checkpoint'])
 			for v in range(1, 4):
 				node.safe_psql(f"UPDATE o_test SET v = {v};")
 				node.safe_psql("CHECKPOINT;")
-			time.sleep(5)
+			# the GC ran past the pinned checkpoint's R, and its pass is through
+			deadline = time.time() + 60
+			while time.time() < deadline and \
+			    int(self.kv('gc').get('retain', 0)) <= pinned_checkpoint:
+				time.sleep(0.5)
+			self.assertGreater(int(self.kv('gc')['retain']), pinned_checkpoint)
+			node.safe_psql("CHECKPOINT;")
+			time.sleep(3)
 			# nothing the reader's checkpoint needs is gone
 			self.assertTrue(set(pinned) <= set(self.part_etags()))
 			# it reads its pinned parts, and follows the writer from the bucket
@@ -1965,6 +1993,13 @@ class S3Test(S3BaseTest):
 			new_node.cleanup()
 		node.stop()
 
+	def primary_relnode(self, node, table='o_test'):
+		"""The relnode of a table's primary tree, as its part keys name it."""
+		return str(node.execute(f"""
+			SELECT index_relnode FROM orioledb_index_oids()
+			WHERE table_reloid = '{table}'::regclass AND index_type = 'primary'
+		""")[0][0])
+
 	def part_relnodes(self):
 		return {k.split('/')[2] for k in self.part_etags()}
 
@@ -1999,9 +2034,7 @@ class S3Test(S3BaseTest):
 			time.sleep(1)
 		self.assertEqual(set(), left())
 		self.assertTrue(before <= self.part_relnodes())
-		self.assertEqual([(30000, 90000)],
-		                 node.execute("SELECT count(*), sum(v) FROM o_test"))
-		node.stop()
+		self.assert_bucket_restores(node, [(30000, 90000)])
 
 	def test_s3_gc_removes_a_dropped_tree(self):
 		"""Once the checkpoint that first left a dropped tree out of the
@@ -2292,9 +2325,7 @@ class S3Test(S3BaseTest):
 		self.assertFalse(first & set(self.part_etags()))
 		with open(node.pg_log_file) as f:
 			self.assertIn("S3 compaction marked", f.read())
-		self.assertEqual([(30000, 24000)],
-		                 node.execute("SELECT count(*), sum(v) FROM o_test"))
-		node.stop()
+		self.assert_bucket_restores(node, [(30000, 24000)])
 
 	def test_s3_reader_too_far_behind_stops(self):
 		"""A reader whose pin falls further behind than
@@ -2324,9 +2355,7 @@ class S3Test(S3BaseTest):
 				self.assertIn("this S3 reader is too far behind the writer", f.read())
 			self.assertTrue(self.wait_for_gc(pinned))
 			reader.cleanup()
-		self.assertEqual([(30000, 330000)],
-		                 node.execute("SELECT count(*), sum(v) FROM o_test"))
-		node.stop()
+		self.assert_bucket_restores(node, [(30000, 330000)])
 
 	def test_s3_reader_whose_pin_lapsed_stops(self):
 		"""A reader whose renewals stopped for longer than its pin lives is
@@ -3098,6 +3127,49 @@ class S3Test(S3BaseTest):
 			finally:
 				shutil.rmtree(d)
 
+	def test_s3_restore_command_maps_the_loader_answers(self):
+		"""The restore_command a load writes passes the loader's answers on as
+		PostgreSQL reads them: found (0) is 0, not there (99) is 1, and any
+		other end (an error, a crash, a signal) is 128, which stops recovery
+		rather than end the WAL there.  A standby takes them all as not
+		there yet."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("CREATE EXTENSION orioledb;")
+		node.safe_psql("CHECKPOINT;")
+		node.stop()
+		loader = os.path.abspath(
+		    os.path.join(dir_path, '..', '..', 'orioledb_s3_loader.py'))
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			with open(os.path.join(new_node.data_dir,
+			                       'postgresql.auto.conf')) as f:
+				line = [l for l in f if l.startswith('restore_command')][-1]
+			command = line.split('=', 1)[1].strip()[1:-1].replace("''", "'")
+			self.assertIn(loader, command)
+			stub = os.path.join(new_node.base_dir, 'stub.py')
+			with open(stub, 'w') as f:
+				f.write("import os, signal\n"
+				        "code = os.environ['STUB_ANSWER']\n"
+				        "if code == 'kill':\n"
+				        "    os.kill(os.getpid(), signal.SIGKILL)\n"
+				        "raise SystemExit(int(code))\n")
+			command = command.replace(loader, stub).replace(
+			    '%f', '000000010000000000000009').replace('%p', 'x')
+			for standby, answers in (
+			    (False, {'0': 0, '99': 1, '1': 128, '2': 128, 'kill': 128}),
+			    (True, {'0': 0, '99': 1, '1': 1, '2': 1, 'kill': 1})):
+				if standby:
+					open(os.path.join(new_node.data_dir, 'standby.signal'),
+					     'w').close()
+				for answer, expected in answers.items():
+					rc = subprocess.run(
+					    ['sh', '-c', command], cwd=new_node.data_dir,
+					    env=dict(os.environ, STUB_ANSWER=answer)).returncode
+					self.assertEqual(expected, rc, (standby, answer))
+			new_node.cleanup()
+
 	def test_s3_restore_refuses_a_gap_at_a_segment_start(self):
 		"""The chunk that a segment starts in missing is a gap too: the
 		segment is not assembled from the next chunk on."""
@@ -3535,8 +3607,7 @@ class S3Test(S3BaseTest):
 		""")
 		node.safe_psql("CHECKPOINT;")
 		before = self.part_etags()
-		tree = collections.Counter(k.split('/')[2]
-		                           for k in before).most_common(1)[0][0]
+		tree = self.primary_relnode(node)
 		datoid = next(k.split('/')[1] for k in before if k.split('/')[2] == tree)
 		node.stop()
 		maps = [f for f in os.listdir(f"{node.data_dir}/orioledb_data/{datoid}")
@@ -3614,20 +3685,23 @@ class S3Test(S3BaseTest):
 
 	def test_s3_evicted_data_of_checkpoint_in_progress(self):
 		"""
-		Data written since the last checkpoint gets uploaded and evicted
-		before the next checkpoint completes.  Once every part of such a
-		file is evicted and its header buffer goes to another file, the file
-		must still say its parts are in S3, not look like a new file whose
-		parts are all local.
+		Data gets uploaded and evicted while the tables it belongs to are
+		new.  Once every part of such a file is evicted and its header
+		buffer goes to another file, the file must still say its parts are
+		in S3, not look like a new file whose parts are all local.  Parts
+		are uploaded once a checkpoint seals them: unsealed ones are never
+		evicted.
 		"""
 		node = self.node
 		self.s3_small_buffers_conf('20MB')
 		node.start()
 		self.load_tables_after_checkpoint(8, 40000)
+		node.safe_psql("CHECKPOINT")
 		for _ in range(60):
 			if self.get_data_size() <= 30 * 1024 * 1024:
 				break
 			time.sleep(1)
+		self.assertLessEqual(self.get_data_size(), 30 * 1024 * 1024)
 		# Let later eviction cycles hand the header buffers of the evicted
 		# files to others
 		time.sleep(10)
@@ -3712,12 +3786,9 @@ class S3Test(S3BaseTest):
 		                 node.execute("SELECT * FROM o_test_1"))
 		node.stop(['--no-wait'])
 
-		while self.client.list_objects(Bucket=self.bucket_name,
-		                               Prefix='wal/') == []:
-			pass
+		self.wait_for_object('wal/')
 		os.kill(archiver_pid, signal.SIGUSR2)
-		while node.status() == NodeStatus.Running:
-			pass
+		self.wait_stopped(node)
 
 		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
 			self.loader.download(new_node.data_dir)
@@ -3775,12 +3846,9 @@ class S3Test(S3BaseTest):
 		node.safe_psql("CHECKPOINT;")
 		node.stop(['--no-wait'])
 
-		while self.client.list_objects(Bucket=self.bucket_name,
-		                               Prefix='wal/') == []:
-			pass
+		self.wait_for_object('wal/')
 		os.kill(archiver_pid, signal.SIGUSR2)
-		while node.status() == NodeStatus.Running:
-			pass
+		self.wait_stopped(node)
 
 		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
 			self.loader.download(new_node.data_dir)
@@ -3820,6 +3888,12 @@ class S3Test(S3BaseTest):
 		while "Contents" not in self.client.list_objects(
 		    Bucket=self.bucket_name, Prefix=key):
 			self.assertLess(time.time(), deadline, f"{key} never arrived")
+			time.sleep(0.1)
+
+	def wait_stopped(self, node, timeout=120):
+		deadline = time.time() + timeout
+		while node.status() == NodeStatus.Running:
+			self.assertLess(time.time(), deadline, "the node never stopped")
 			time.sleep(0.1)
 
 	def s3_object(self, key):
@@ -4071,13 +4145,10 @@ class S3Test(S3BaseTest):
 		                 node.execute("SELECT * FROM o_test_1"))
 		node.stop(['--no-wait'])
 
-		wal_prefix = os.path.join(prefix, 'wal/')
-		while self.client.list_objects(Bucket=self.bucket_name,
-		                               Prefix=wal_prefix) == []:
-			pass
+		wal_prefix = os.path.join(self.optional_prefix, 'wal/')
+		self.wait_for_object(wal_prefix)
 		os.kill(archiver_pid, signal.SIGUSR2)
-		while node.status() == NodeStatus.Running:
-			pass
+		self.wait_stopped(node)
 
 		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
 			self.loader.download(new_node.data_dir)
@@ -4128,12 +4199,9 @@ class S3Test(S3BaseTest):
 		node.stop(['--no-wait'])
 
 		wal_prefix = os.path.join(self.optional_prefix, 'wal/')
-		while self.client.list_objects(Bucket=self.bucket_name,
-		                               Prefix=wal_prefix) == []:
-			pass
+		self.wait_for_object(wal_prefix)
 		os.kill(archiver_pid, signal.SIGUSR2)
-		while node.status() == NodeStatus.Running:
-			pass
+		self.wait_stopped(node)
 
 		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
 			self.loader.download(new_node.data_dir)
@@ -4180,13 +4248,10 @@ class S3Test(S3BaseTest):
 		                 node.execute("SELECT * FROM o_test_1"))
 		node.stop(['--no-wait'])
 
-		wal_prefix = os.path.join(self.optional_prefix, 'wal/')
-		while self.client.list_objects(Bucket=self.bucket_name,
-		                               Prefix=wal_prefix) == []:
-			pass
+		wal_prefix = 'wal/'
+		self.wait_for_object(wal_prefix)
 		os.kill(archiver_pid, signal.SIGUSR2)
-		while node.status() == NodeStatus.Running:
-			pass
+		self.wait_stopped(node)
 
 		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
 			self.loader.download(new_node.data_dir)
@@ -4232,13 +4297,10 @@ class S3Test(S3BaseTest):
 		                 node.execute("SELECT * FROM o_test_1"))
 		node.stop(['--no-wait'])
 
-		wal_prefix = os.path.join(self.optional_prefix, 'wal/')
-		while self.client.list_objects(Bucket=self.bucket_name,
-		                               Prefix=wal_prefix) == []:
-			pass
+		wal_prefix = 'wal/'
+		self.wait_for_object(wal_prefix)
 		os.kill(archiver_pid, signal.SIGUSR2)
-		while node.status() == NodeStatus.Running:
-			pass
+		self.wait_stopped(node)
 
 		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
 			self.loader.download(new_node.data_dir)
