@@ -6564,12 +6564,17 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 /* TODO: move this method ? */
 /*
  * S3 mode: a tree emptied in place that a committed checkpoint has a map of
- * (the unlogged trees reset after a crash) gets an empty map of that
- * checkpoint here.  Without one, the tree is opened from the bucket's map,
- * and what was emptied comes back.  It numbers its parts on from next.
+ * (the unlogged trees reset after a crash, a TRUNCATE of a table created in
+ * the same transaction) gets an empty map.  Without one, the tree is opened
+ * from the bucket's map, and what was emptied comes back -- here, and in a
+ * load of any later checkpoint that does not write the tree again, as its
+ * manifest names the tree's latest map.  As a build does, the map is of the
+ * checkpoint going on (or next), under this run's token, never over the
+ * committed one, and is up before this returns.  The tree numbers its parts
+ * on from next.
  */
-void
-s3_write_empty_map(OIndexKey key, uint64 next)
+static void
+write_empty_map_file(OIndexKey key, uint32 num, uint64 next)
 {
 	SeqBufTag	tag = {0};
 	CheckpointFileHeader header = {0};
@@ -6577,32 +6582,61 @@ s3_write_empty_map(OIndexKey key, uint64 next)
 		.cursor = {InvalidFileExtentOff, InvalidFileExtentOff},
 		.sealFrom = {InvalidFileExtentOff, InvalidFileExtentOff}
 	};
-	bool		found;
-	char	   *filename;
-	File		file;
+	char	   *filename,
+			   *tmp;
+	int			fd;
 
 	tag.key = key;
 	tag.type = 'm';
-	tag.num = o_get_latest_chkp_num(key.oids.datoid, key.oids.relnode,
-									key.oids.spcoid, PG_UINT32_MAX, &found);
-	if (!found)
-		return;
+	tag.num = num;
 	header.rootDownlink = InvalidDiskDownlink;
 	header.datafileLength = next;
 	header.leafPagesNum = 1;
 	filename = get_seq_buf_filename(&tag);
-	file = PathNameOpenFile(filename, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
-	if (file < 0 ||
-		OFileWrite(file, (Pointer) &header, sizeof(header), 0,
-				   WAIT_EVENT_SLRU_WRITE) != sizeof(header) ||
-		OFileWrite(file, (Pointer) &cursors, sizeof(cursors), sizeof(header),
-				   WAIT_EVENT_SLRU_WRITE) != sizeof(cursors) ||
-		FileSync(file, WAIT_EVENT_SLRU_SYNC) != 0)
+	tmp = psprintf("%s.tmp", filename);
+	fd = BasicOpenFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+	if (fd < 0 ||
+		write(fd, &header, sizeof(header)) != sizeof(header) ||
+		write(fd, &cursors, sizeof(cursors)) != sizeof(cursors) ||
+		pg_fsync(fd) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not write file \"%s\": %m", filename)));
-	FileClose(file);
+				 errmsg("could not write file \"%s\": %m", tmp)));
+	close(fd);
+	durable_rename(tmp, filename, ERROR);
+	pfree(tmp);
 	pfree(filename);
+	o_update_latest_chkp_num(key.oids.datoid, key.oids.relnode,
+							 key.oids.spcoid, num);
+}
+
+void
+s3_write_empty_map(OIndexKey key, uint64 next)
+{
+	uint32		last = checkpoint_state->lastCheckpointNumber;
+	bool		found;
+
+	(void) o_get_latest_chkp_num(key.oids.datoid, key.oids.relnode,
+								 key.oids.spcoid, PG_UINT32_MAX, &found);
+	if (!found)
+		return;
+
+	/*
+	 * Twice.  Under the last checkpoint's number, locally: this run opens
+	 * the tree at that number.  Under the next one, uploaded before going
+	 * on: the bucket's map of the last checkpoint is committed and stays,
+	 * and the next checkpoint names this one for a tree it did not change,
+	 * so a load from it finds the tree empty.
+	 */
+	write_empty_map_file(key, last, next);
+	write_empty_map_file(key, last + 1, next);
+	if (S3_WRITER_MODE)
+	{
+		S3TaskLocation location = s3_schedule_map_file_write(last + 1, key);
+
+		if (location > 0)
+			s3_queue_wait_for_location(location);
+	}
 }
 
 bool
