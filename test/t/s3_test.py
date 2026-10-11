@@ -903,7 +903,7 @@ class S3Test(S3BaseTest):
 			deadline = time.time() + 90
 			while time.time() < deadline and [
 			    k for k in self.chunk_keys()
-			    if k.startswith('wal/00000001/chunks/')][:-1]:
+			    if k.startswith('wal/00000001/chunks/')]:
 				b.safe_psql("CHECKPOINT;")
 				time.sleep(1)
 			b.safe_psql("INSERT INTO o_test VALUES (106);")
@@ -973,7 +973,7 @@ class S3Test(S3BaseTest):
 		""")
 		node.safe_psql("CHECKPOINT;")
 		node.safe_psql("INSERT INTO o_test SELECT generate_series(1, 10);")
-		keys = self.chunk_keys()
+		keys = self.chunk_keys(terminators=True)
 		last = int(keys[-1].rsplit('/', 1)[1])
 		tli = int(keys[-1].split('/')[1], 16)
 		token = int(self.s3_body('writer')['token']) + 1
@@ -1186,11 +1186,15 @@ class S3Test(S3BaseTest):
 			last.stop()
 			last.cleanup()
 
-	def chunk_keys(self):
-		return sorted(
-		    x["Key"] for x in self.client.list_objects(
-		        Bucket=self.bucket_name, Prefix='wal/').get("Contents", [])
-		    if '/chunks/' in x["Key"])
+	def chunk_keys(self, terminators=False):
+		# every start puts a terminator, and it stays: WAL chunks alone by
+		# default
+		keys = [x["Key"] for x in self.client.list_objects(
+		    Bucket=self.bucket_name, Prefix='wal/').get("Contents", [])]
+		marks = {k.replace('/terminators/', '/chunks/') for k in keys
+		         if '/terminators/' in k}
+		return sorted(k for k in keys if '/chunks/' in k and
+		              (terminators or k not in marks))
 
 	def test_s3_gc_removes_chunks_when_segments_are_not_archived(self):
 		"""With archiving off no segment is archived, so the shipper keeps
@@ -2329,7 +2333,7 @@ class S3Test(S3BaseTest):
 			self.loader.download(new_node.data_dir)
 			new_node.append_conf(port=new_node.port)
 			new_node.start()
-			keys = sorted(k for k in self.chunk_keys()
+			keys = sorted(k for k in self.chunk_keys(terminators=True)
 			              if k.startswith('wal/00000001/'))
 			chunks = [(k, struct.unpack('<IIQQQ', self.s3_object(k)[:32]))
 			          for k in keys]

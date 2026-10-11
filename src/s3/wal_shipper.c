@@ -402,13 +402,18 @@ bucket_wal_bytes(BucketWal *bw, XLogRecPtr lsn, char *dst, Size n)
 				if (bw->chunksSeq == 0)
 					return false;
 				initStringInfo(&body);
-				if (!read_chunk(bw->tli, bw->chunksSeq - 1, &header, &body) ||
-					header.magic != CHUNK_MAGIC)
+				if (!read_chunk(bw->tli, bw->chunksSeq - 1, &header, &body))
 				{
 					pfree(body.data);
 					return false;
 				}
 				bw->chunksSeq--;
+				/* a start's terminator holds no WAL: the chunks go on before it */
+				if (header.magic == TERMINATOR_MAGIC)
+				{
+					pfree(body.data);
+					continue;
+				}
 				/* a later chunk wins where two overlap */
 				upto = Min(header.endLsn, bw->chunksFrom);
 				if (upto < bw->chunksFrom || header.startLsn >= upto)
