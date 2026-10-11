@@ -1670,6 +1670,53 @@ class S3Test(S3BaseTest):
 			new_node.stop()
 			new_node.cleanup()
 
+	def test_s3_crash_restart_takes_a_new_token(self):
+		"""A crash restart of the same postmaster takes a new writer token:
+		the checkpoint numbers the run takes again never name what the
+		crashed run left, nor one of its PUTs still on the way.  Its own
+		lease it takes over at once."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_lease_duration = 60
+			restart_after_crash = on
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		token = int(self.kv('root')['token'])
+		postmaster = node.pid
+		with node.connect() as con:
+			backend = con.execute("SELECT pg_backend_pid();")[0][0]
+			os.kill(backend, signal.SIGKILL)
+		deadline = time.time() + 30
+		while True:
+			try:
+				node.safe_psql("INSERT INTO o_test SELECT generate_series(11, 20);")
+				break
+			except Exception:
+				self.assertLess(time.time(), deadline)
+				time.sleep(0.5)
+		self.assertEqual(postmaster, node.pid)
+		self.assertEqual(token + 1, int(self.kv('writer')['token']))
+		node.safe_psql("CHECKPOINT;")
+		self.assertEqual(token + 1, int(self.kv('root')['token']))
+		node.stop(['-m', 'immediate'])
+
+		with self.initNode(self.getBasePort() + 1, 'tgsr') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(20, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
+
 	def test_s3_gc_removes_parts_written_before_a_crash(self):
 		"""Blocks the next checkpoint's stream wrote while a checkpoint ran
 		are no longer referenced once a crash goes back to that checkpoint;

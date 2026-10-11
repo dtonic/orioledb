@@ -814,9 +814,12 @@ s3_lease_acquire(void)
 	int64		storageNow = -1;
 	TimestampTz sentAt = 0;
 	CasResult	res = CAS_UNKNOWN;
+	uint64		runToken = pm_lease.token;
+	char		runOwner[OWNER_LEN];
 
 	initStringInfo(&body);
 	initStringInfo(&current);
+	strlcpy(runOwner, pm_lease.owner, OWNER_LEN);
 
 	/* a state older than the bucket's may be read, never written on */
 	if (access(AS_OF_FILENAME, F_OK) == 0)
@@ -893,7 +896,13 @@ s3_lease_acquire(void)
 						   root.token, local),
 				 errhint("Load the data directory from the bucket.")));
 
-	if (writerExists && writer.expiresAt >= storageNow)
+	/*
+	 * A restart after a crash: the lease is this postmaster's own, held under
+	 * its owner, and no copy can have renewed it.
+	 */
+	if (writerExists && writer.expiresAt >= storageNow &&
+		!(runToken != 0 && writer.token == runToken &&
+		  strcmp(writer.owner, runOwner) == 0))
 	{
 		if (writer.token != local)
 			ereport(FATAL,
@@ -1064,6 +1073,21 @@ s3_lease_shmem_needs(void)
 void
 s3_lease_shmem_init(Pointer ptr, bool found)
 {
+	static bool made = false;
+
+	/*
+	 * The postmaster makes shared memory again after a crash: the run that
+	 * follows takes a new token, so the checkpoint numbers it takes again
+	 * never name the objects the crashed run left, nor one of its PUTs still
+	 * on the way.  It is taken as at the first start, with no shared state.
+	 */
+	if (!found && made && !IsUnderPostmaster && pm_lease.token != 0 &&
+		!orioledb_s3_reader)
+	{
+		lease = NULL;
+		s3_lease_acquire();
+	}
+	made = true;
 	lease = (S3LeaseState *) ptr;
 
 	if (!found)
