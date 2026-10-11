@@ -191,10 +191,19 @@ class FlakyPutObject:
 
 	def __call__(self, response) -> TYPE_RESPONSE:
 		if self.matches(response.parse_key_name()) and \
-		    self.failed < self.failures:
+		    self.failed < self.failures and not self.terminator(response):
 			self.failed += 1
 			raise TransientServerError()
 		return orig_put_object(response)
+
+	@staticmethod
+	def terminator(response):
+		# a start's terminator goes: the failures are the shipper's
+		body = response.body
+		if isinstance(body, str):
+			body = body.encode()
+		return len(body) >= 4 and \
+		    struct.unpack('<I', body[0:4])[0] == 0x3154574f
 
 
 # TODO: re-enable under valgrind once s3_header_mark_part_loaded race is fixed
