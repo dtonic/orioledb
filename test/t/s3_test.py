@@ -15,6 +15,7 @@ import threading
 from threading import Thread
 from unittest.mock import patch
 
+import boto3
 import botocore.client
 import testgres
 from testgres.defaults import default_dbname
@@ -23,8 +24,10 @@ from testgres.exceptions import StartNodeException, QueryException
 
 from .base_test import wait_checkpointer_stopevent
 from .s3_base_test import S3BaseTest, s3_test_attrs, mock_put_object, \
+ orig_put_object, \
  mock_put_object_conflict, mock_moto_unkown_error, FlakyPutObject, \
- RevokedKeyPut, AmbiguousPut, HoldChunksOf
+ RevokedKeyPut, AmbiguousPut, HoldChunksOf, HoldFirstGet, ConflictingPut, \
+ FailingGet, RevokedKey, orig_get_object, orig_list_objects_v2
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
@@ -1289,6 +1292,80 @@ class S3Test(S3BaseTest):
 			node.safe_psql("CHECKPOINT;")
 			self.assertGreater(revoked.accepted, 0)
 		self.assertEqual([(11, )], node.execute("SELECT count(*) FROM o_test"))
+		node.stop()
+
+	def test_s3_keys_rotate_on_a_reader(self):
+		"""A reader takes rotated keys on a reload too: its pin goes on, and
+		restore_command, run per segment, reads the keys the server has
+		now, not the ones in the environment it started with."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_gc_interval = 0
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as reader:
+			self.loader.download(reader.data_dir)
+			reader.append_conf(port=reader.port)
+			reader.append_conf("""
+				orioledb.s3_reader = on
+				orioledb.s3_reader_pin_ttl = 30
+				hot_standby = on
+			""")
+			open(os.path.join(reader.data_dir, "standby.signal"), "w").close()
+			reader.start()
+			new_key = f"orioledb.s3_accesskey = '{self.access_key_id}NEW'"
+			for n in (node, reader):
+				n.append_conf(new_key)
+				n.reload()
+			time.sleep(2)
+			revoked = RevokedKey(self.access_key_id)
+			pin = self.s3_object('readers')
+			# the test reads with a key of its own
+			own = boto3.client(
+			    "s3", endpoint_url=self.client.meta.endpoint_url,
+			    verify=self.s3_cainfo, region_name=self.region,
+			    aws_access_key_id='TESTREADER',
+			    aws_secret_access_key=self.secret_access_key)
+
+			def readers():
+				return own.get_object(Bucket=self.bucket_name,
+				                      Key='readers')['Body'].read()
+
+			with patch('moto.s3.responses.S3Response.put_object',
+			           new=lambda r: revoked(r, orig_put_object)), \
+			    patch('moto.s3.responses.S3Response.get_object',
+			          new=lambda r: revoked(r, orig_get_object)), \
+			    patch('moto.s3.responses.S3Response.list_objects_v2',
+			          new=lambda r: revoked(r, orig_list_objects_v2)):
+				for i in range(11, 21):
+					node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+				node.safe_psql("SELECT pg_switch_wal();")
+				node.safe_psql("INSERT INTO o_test VALUES (21);")
+				deadline = time.time() + 60
+				count = None
+				while time.time() < deadline and count != [(21, )]:
+					try:
+						count = reader.execute("SELECT count(*) FROM o_test")
+					except Exception:
+						pass
+					time.sleep(0.5)
+				self.assertEqual([(21, )], count)
+				# the pin is renewed with the new key
+				deadline = time.time() + 30
+				while time.time() < deadline and readers() == pin:
+					time.sleep(1)
+				self.assertNotEqual(pin, readers())
+			self.assertEqual(NodeStatus.Running, reader.status())
+			reader.stop()
+			reader.cleanup()
 		node.stop()
 
 	def test_s3_a_refused_key_fails_with_no_retry_time(self):

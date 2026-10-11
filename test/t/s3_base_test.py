@@ -2,6 +2,7 @@ import inspect
 import json
 import logging
 import os
+import threading
 import struct
 import re
 from re import RegexFlag
@@ -42,6 +43,8 @@ def s3_test_attrs(**_):
 
 
 orig_put_object = S3Response.put_object
+orig_get_object = S3Response.get_object
+orig_list_objects_v2 = S3Response.list_objects_v2
 
 
 # moto[s3] doesn't implement 409 HTTP error code therefore we need to do that
@@ -120,6 +123,25 @@ class RevokedKeyPut:
 		return orig_put_object(response)
 
 
+class RevokedKey:
+	"""
+	Refuses (403) every request signed with a revoked access key: a
+	put_object(), get_object() and list_objects_v2() in one, given the
+	handler each stands for.
+	"""
+
+	def __init__(self, revoked):
+		self.revoked = revoked
+		self.refused = 0
+
+	def __call__(self, response, handler) -> TYPE_RESPONSE:
+		if f"Credential={self.revoked}/" in response.headers.get(
+		    "Authorization", ""):
+			self.refused += 1
+			raise AccessDenied()
+		return handler(response)
+
+
 class AmbiguousPut:
 	"""
 	A put_object() that stores every `every`-th request for each kind of key
@@ -171,6 +193,61 @@ class HoldChunksOf:
 				self.held += 1
 				raise TransientServerError()
 		return orig_put_object(response)
+
+
+class ConflictingPut:
+	"""
+	A put_object() that answers the first `conflicts` PUTs of keys holding
+	`contains` with 409 ConditionalRequestConflict, as AWS does to a
+	conditional PUT racing another write of the key, without storing.
+	"""
+
+	def __init__(self, conflicts, contains='/parts/'):
+		self.conflicts = conflicts
+		self.contains = contains
+		self.answered = 0
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		if self.contains in response.parse_key_name() and \
+		    self.answered < self.conflicts:
+			self.answered += 1
+			raise ConditionalRequestConflict("If-None-Match")
+		return orig_put_object(response)
+
+
+class FailingGet:
+	"""A get_object() that answers 503 to GETs of keys holding `contains`."""
+
+	def __init__(self, contains):
+		self.contains = contains
+		self.failed = 0
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		if self.contains in response.parse_key_name():
+			self.failed += 1
+			raise TransientServerError()
+		return orig_get_object(response)
+
+
+class HoldFirstGet:
+	"""
+	A get_object() that, once armed, holds the next GET of `key` until
+	`release` is set, and serves every other request meanwhile: one process
+	stops between two of its requests while the others go on.
+	"""
+
+	def __init__(self, key):
+		self.key = key
+		self.armed = False
+		self.entered = threading.Event()
+		self.release = threading.Event()
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		if self.armed and response.parse_key_name() == self.key:
+			self.armed = False
+			self.entered.set()
+			self.release.wait(120)
+		return orig_get_object(response)
 
 
 class FlakyPutObject:
@@ -414,12 +491,22 @@ class MotoServerSSL:
 		self._ssl_context = ssl_context
 
 	def _server_entry(self) -> None:
-		app = DomainDispatcherApplication(create_backend_app)
+		backend = DomainDispatcherApplication(create_backend_app)
+		puts = threading.Lock()
+
+		def app(environ, start_response):
+			# requests are served concurrently, as a store does; PUTs one at
+			# a time, so a conditional PUT is judged and stored atomically,
+			# and the fault injectors on put_object count without races
+			if environ.get('REQUEST_METHOD') == 'PUT':
+				with puts:
+					return list(backend(environ, start_response))
+			return backend(environ, start_response)
 
 		self._server = make_server(self._host,
 		                           self._port,
 		                           app,
-		                           False,
+		                           True,
 		                           ssl_context=self._ssl_context,
 		                           passthrough_errors=True)
 		self._server_ready = True

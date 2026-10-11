@@ -140,11 +140,12 @@ class OrioledbS3ObjectLoader:
 		else:
 			verify = None
 
-		if args.restore and 'AWS_ACCESS_KEY_ID' not in os.environ:
-			# restore_command runs in the data directory with the server's
-			# environment: take the credentials the server uses
+		if args.restore:
+			# restore_command runs in the data directory: take the
+			# credentials the server uses, which a reload may have rotated,
+			# over the ones in the environment it was started with
 			for key, value in server_s3_settings('.').items():
-				os.environ.setdefault(key, value)
+				os.environ[key] = value
 
 		if args.resolved_bucket:
 			self.resolved = (args.resolved_endpoint, args.resolved_bucket,
