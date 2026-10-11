@@ -297,6 +297,36 @@ class S3BaseTest(BaseTest):
 	policy_name = "ORDB_POLICY"
 	optional_prefix = "prefix/test/"
 
+	def table_contents(self, node):
+		"""Every user table's rows (its own, not its children's), and whether
+		it is unlogged."""
+		result = {}
+		for name, persistence in node.execute("""
+			SELECT c.oid::regclass::text, c.relpersistence FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relkind = 'r' AND n.nspname = 'public'
+		"""):
+			rows = node.execute(
+			    f"SELECT coalesce(string_agg(t::text, ';' ORDER BY t::text), '') "
+			    f"FROM ONLY {name} t")[0][0]
+			result[name] = (persistence, rows)
+		return result
+
+	def assert_contents_after_crash(self, node, before):
+		"""What a crash restart and a load from the bucket give: the logged
+		tables' rows as they were, the unlogged ones empty."""
+		expected = {name: (p, '' if p == 'u' else rows)
+		            for name, (p, rows) in before.items()}
+		self.assertEqual(expected, self.table_contents(node))
+		node.stop()
+		with self.initNode(self.getBasePort() + 1, 'tgsr') as loaded:
+			self.loader.download(loaded.data_dir)
+			loaded.append_conf(port=loaded.port)
+			loaded.start()
+			self.assertEqual(expected, self.table_contents(loaded))
+			loaded.stop()
+			loaded.cleanup()
+
 	def setUp(self):
 		super().setUp()
 

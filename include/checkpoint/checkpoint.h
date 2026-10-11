@@ -317,6 +317,7 @@ extern bool s3_tree_records_dead(BTreeDescr *desc);
 extern bool s3_dead_list_start(BTreeDescr *desc, SeqBufDescPrivate *buf);
 extern void backend_set_autonomous_level(CheckpointState *state, uint32 level);
 extern bool tbl_data_exists(ORelOids *oids);
+extern void s3_write_empty_map(OIndexKey key, uint64 next);
 extern void evictable_tree_init(BTreeDescr *desc, bool init_shmem,
 								bool *was_evicted);
 extern void checkpointable_tree_init(BTreeDescr *desc, bool init_shmem,

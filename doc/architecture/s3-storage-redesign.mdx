@@ -495,6 +495,7 @@ Guard: `test_s3_terminator_goes_after_the_last_chunk_path_style`, `test_s3_http_
 | 전송을 끈 정지 뒤 전송을 켜고 크래시 | 끝 세그먼트는 `.partial` 이라 복원이 그 위의 조각을 읽음 | Guard: `test_s3_shipping_turned_on_keeps_the_segment_a_stop_left` |
 | 재구축을 롤백 | 롤백의 undo 가 `s3_note_dropped_tree` 를 부름 | 올라간 파트·map 은 버려진 트리로 GC. Guard: `test_s3_gc_removes_the_objects_of_an_aborted_build` |
 | 재구축 중 크래시(롤백 undo 전) | 복구 끝에서 진행 중 트랜잭션의 undo 를 적용하는 경로(`apply_undo_stack`)는 있다. relnode undo 가 거기서 돌아 기록하는지는 시험이 없다 | 기록되지 않으면 그 트리의 객체는 누수 |
+| unlogged 트리가 있는 상태에서 크래시, 또는 그런 버킷에서 받기 | 복구 뒤 unlogged 트리를 제자리에서 비우고, 커밋된 map 의 번호로 빈 머리의 로컬 map 을 둔다 | 버킷의 map 에서 옛 내용이 되살아나지 않음(로컬 모드와 같이 비어 있음). 옛 파트는 `PART_GONE` 으로 GC. Guard: `s3_unlogged_test` |
 | 제자리 TRUNCATE 뒤 | `s3floor_<rel>` 에서 이어 셈 | 아래 파트는 `PART_GONE` 표지로 GC. Guard: `test_s3_gc_removes_parts_a_truncate_in_place_left` |
 | GC 한 바퀴 도중 | 발표된 진행에서 다시 | 모든 단계가 멱등. 이어받은 writer 도 같음 |
 | 옛 writer 가 리스 만료 뒤 깨어남 | 갱신·CAS·펜싱된 PUT·조각 가운데 먼저 닿는 것에서 멈춤 | 없음 |

@@ -6562,6 +6562,49 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 }
 
 /* TODO: move this method ? */
+/*
+ * S3 mode: a tree emptied in place that a committed checkpoint has a map of
+ * (the unlogged trees reset after a crash) gets an empty map of that
+ * checkpoint here.  Without one, the tree is opened from the bucket's map,
+ * and what was emptied comes back.  It numbers its parts on from next.
+ */
+void
+s3_write_empty_map(OIndexKey key, uint64 next)
+{
+	SeqBufTag	tag = {0};
+	CheckpointFileHeader header = {0};
+	S3TreeCursors cursors = {
+		.cursor = {InvalidFileExtentOff, InvalidFileExtentOff},
+		.sealFrom = {InvalidFileExtentOff, InvalidFileExtentOff}
+	};
+	bool		found;
+	char	   *filename;
+	File		file;
+
+	tag.key = key;
+	tag.type = 'm';
+	tag.num = o_get_latest_chkp_num(key.oids.datoid, key.oids.relnode,
+									key.oids.spcoid, PG_UINT32_MAX, &found);
+	if (!found)
+		return;
+	header.rootDownlink = InvalidDiskDownlink;
+	header.datafileLength = next;
+	header.leafPagesNum = 1;
+	filename = get_seq_buf_filename(&tag);
+	file = PathNameOpenFile(filename, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+	if (file < 0 ||
+		OFileWrite(file, (Pointer) &header, sizeof(header), 0,
+				   WAIT_EVENT_SLRU_WRITE) != sizeof(header) ||
+		OFileWrite(file, (Pointer) &cursors, sizeof(cursors), sizeof(header),
+				   WAIT_EVENT_SLRU_WRITE) != sizeof(cursors) ||
+		FileSync(file, WAIT_EVENT_SLRU_SYNC) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", filename)));
+	FileClose(file);
+	pfree(filename);
+}
+
 bool
 tbl_data_exists(ORelOids *oids)
 {

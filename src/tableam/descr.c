@@ -1540,6 +1540,7 @@ cleanup_btree_extended(OIndexKey ix_key, bool files, bool fsync,
 {
 	SharedRootInfoKey key;
 	SharedRootInfo *shared = NULL;
+	uint64		next = 0;
 
 	key.datoid = ix_key.oids.datoid;
 	key.relnode = ix_key.oids.relnode;
@@ -1549,8 +1550,6 @@ cleanup_btree_extended(OIndexKey ix_key, bool files, bool fsync,
 
 	if (keepPartFloor && orioledb_s3_mode)
 	{
-		uint64		next = 0;
-
 		if (shared && !shared->placeholder)
 			next = pg_atomic_read_u64(&((BTreeMetaPage *) O_GET_IN_MEMORY_PAGE(shared->rootInfo.metaPageBlkno))->s3NextPart);
 		next = s3_keep_part_floor(ix_key, next);
@@ -1573,6 +1572,8 @@ cleanup_btree_extended(OIndexKey ix_key, bool files, bool fsync,
 	}
 	if (files)
 		cleanup_btree_files(ix_key, fsync);
+	if (files && keepPartFloor && orioledb_s3_mode)
+		s3_write_empty_map(ix_key, next);
 }
 
 bool
