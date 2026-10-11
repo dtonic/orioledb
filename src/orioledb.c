@@ -1706,7 +1706,7 @@ _PG_init(void)
 	if (S3_WRITER_MODE && s3_compact_interval > 0 &&
 		s3_compact_database && s3_compact_database[0])
 		register_s3_compact_worker();
-	if (S3_WRITER_MODE && s3_wal_shipping)
+	if (S3_WRITER_MODE)
 		s3_wal_shipper_init();
 
 	/* Register custom deTOAST function */

@@ -1405,9 +1405,41 @@ walk:
 		start = Min(start, replayEnd);
 	}
 	if (start < slotRestart - XLogSegmentOffset(slotRestart, wal_segment_size))
-		ereport(ERROR,
-				(errmsg("the WAL after %X/%08X that the bucket needs is gone",
-						LSN_FORMAT_ARGS(start))));
+	{
+		XLogSegNo	segno,
+					slotSegno;
+
+		/*
+		 * The slot was made after WAL this timeline wrote with shipping off
+		 * (a directory loaded from the bucket, run with shipping off first).
+		 * Those runs archived it: go on from the slot if every segment
+		 * between is in the bucket, as a restore reads it.
+		 */
+		XLByteToSeg(start, segno, wal_segment_size);
+		XLByteToSeg(slotRestart, slotSegno, wal_segment_size);
+		for (; segno < slotSegno; segno++)
+		{
+			char		name[MAXFNAMELEN];
+			char	   *key;
+			bool		archived;
+
+			XLogFileName(name, tli, segno, wal_segment_size);
+			key = psprintf("wal/%s", name);
+			archived = s3_object_exists(key);
+			pfree(key);
+			if (!archived)
+				ereport(ERROR,
+						(errmsg("the WAL after %X/%08X that the bucket needs is gone",
+								LSN_FORMAT_ARGS(start)),
+						 errdetail("Segment %s is neither kept for the shipper nor archived.",
+								   name)));
+		}
+		ereport(LOG,
+				(errmsg("WAL of timeline %u from %X/%08X is archived, shipping from %X/%08X",
+						tli, LSN_FORMAT_ARGS(start),
+						LSN_FORMAT_ARGS(slotRestart - XLogSegmentOffset(slotRestart, wal_segment_size)))));
+		start = slotRestart - XLogSegmentOffset(slotRestart, wal_segment_size);
+	}
 
 	flushed = start;
 	set_flushed(flushed);
@@ -1724,7 +1756,12 @@ s3_wal_client_auth(Port *port, int status)
 void
 s3_wal_shipper_init(void)
 {
+	/*
+	 * A writer recovering from the bucket takes no client until it is done,
+	 * whether or not it ships WAL.
+	 */
 	prev_client_auth_hook = ClientAuthentication_hook;
 	ClientAuthentication_hook = s3_wal_client_auth;
-	register_s3_wal_shipper();
+	if (s3_wal_shipping)
+		register_s3_wal_shipper();
 }
