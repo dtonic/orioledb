@@ -2101,6 +2101,59 @@ class S3Test(S3BaseTest):
 		self.assertEqual(set(), left())
 		self.assert_bucket_restores(node, [(30000, total + 4 * 30000)])
 
+	def test_s3_gc_and_a_tree_dropped_during_a_checkpoint(self):
+		"""A table is dropped while a checkpoint walks it.  If the
+		checkpoint's manifest names the tree, the tree's objects stay while
+		that checkpoint is retained; once it is not, everything under the
+		tree goes."""
+		node = self.gc_world("""
+			orioledb.enable_stopevents = true
+		""")
+		node.safe_psql("""
+			CREATE TABLE t_drop (id int PRIMARY KEY, pad text) USING orioledb;
+			INSERT INTO t_drop SELECT g, repeat('d', 200) FROM generate_series(1, 20000) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		tree = self.primary_relnode(node, 't_drop')
+		node.safe_psql("UPDATE t_drop SET pad = repeat('e', 200);")
+		con = node.connect()
+		con.execute("SELECT pg_stopevent_set('checkpoint_step', "
+		            "'$.action == \"walkDownwards\" && "
+		            "$.treeName == \"t_drop_pkey\"');")
+		con.commit()
+		checkpoint = Thread(target=lambda: node.safe_psql("CHECKPOINT;"))
+		checkpoint.start()
+		wait_checkpointer_stopevent(node)
+		drop = Thread(target=lambda: node.safe_psql("DROP TABLE t_drop;"))
+		drop.start()
+		time.sleep(2)
+		con.execute("SELECT pg_stopevent_reset('checkpoint_step');")
+		con.commit()
+		con.close()
+		checkpoint.join(60)
+		drop.join(60)
+		k = int(self.kv('root')['checkpoint'])
+		named = any(r == tree for (_, r) in self.manifest(k)['trees'])
+
+		def objects():
+			return [key for key in self.all_keys('trees/')
+			        if key.split('/')[2] == tree]
+
+		if named:
+			# K is R now: the GC keeps what K reads
+			self.assertTrue(self.wait_for_collected(k - 1))
+			time.sleep(3)
+			self.assertTrue(objects())
+		# past K
+		deadline = time.time() + 120
+		while time.time() < deadline and objects():
+			node.safe_psql("UPDATE o_test SET v = v + 1;")
+			node.safe_psql("CHECKPOINT;")
+			time.sleep(2)
+		self.assertEqual([], objects())
+		self.assert_bucket_restores(node, [(30000, None)],
+		                            "SELECT count(*), NULL FROM o_test")
+
 	def test_s3_gc_folds_the_lists_of_a_checkpoint_with_no_manifest(self):
 		"""A checkpoint that finished locally but never got its manifest up
 		has its dead lists in the bucket all the same; the GC folds them, so
