@@ -109,6 +109,7 @@ typedef struct
 	pg_atomic_uint64 catchUpLsn;	/* clients wait until flushedLsn reaches it */
 	pg_atomic_uint64 replayEndLsn;	/* where recovery found the WAL to end */
 	pg_atomic_uint32 running;	/* the shipper is up and streaming */
+	pg_atomic_uint32 stopped;	/* it ended on SIGTERM: a stop is going on */
 	ConditionVariable flushedCV;
 } S3WalShipperShared;
 
@@ -183,6 +184,7 @@ s3_wal_shipper_shmem_init(Pointer ptr, bool found)
 		pg_atomic_init_u64(&shipper->catchUpLsn, InvalidXLogRecPtr);
 		pg_atomic_init_u64(&shipper->replayEndLsn, InvalidXLogRecPtr);
 		pg_atomic_init_u32(&shipper->running, 0);
+		pg_atomic_init_u32(&shipper->stopped, 0);
 		ConditionVariableInit(&shipper->flushedCV);
 	}
 }
@@ -1148,6 +1150,8 @@ recovered_gc(TimeLineID tli)
 static void
 shipper_exit(int code, Datum arg)
 {
+	if (ShutdownRequestPending)
+		pg_atomic_write_u32(&shipper->stopped, 1);
 	pg_atomic_write_u32(&shipper->running, 0);
 	ConditionVariableBroadcast(&shipper->flushedCV);
 }
@@ -1170,7 +1174,12 @@ s3_wal_shipper_wait(XLogRecPtr lsn)
 	{
 		if (pg_atomic_read_u32(&shipper->running) == 0)
 		{
-			if (absentMs >= SHIPPER_ABSENT_WAIT_MS)
+			/*
+			 * Stopped on SIGTERM (a server stop, which ships the rest at its
+			 * shutdown checkpoint): nothing comes to wait for.
+			 */
+			if (absentMs >= SHIPPER_ABSENT_WAIT_MS ||
+				pg_atomic_read_u32(&shipper->stopped) != 0)
 			{
 				reached = false;
 				break;
@@ -1424,6 +1433,7 @@ walk:
 	replyConn = conn;
 	s3_request_wait_hook = reply_while_waiting;
 	before_shmem_exit(shipper_exit, (Datum) 0);
+	pg_atomic_write_u32(&shipper->stopped, 0);
 	pg_atomic_write_u32(&shipper->running, 1);
 	ereport(LOG,
 			(errmsg("shipping WAL to S3 from %X/%08X, timeline %u, chunk %llu",

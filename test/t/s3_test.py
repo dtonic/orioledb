@@ -704,6 +704,43 @@ class S3Test(S3BaseTest):
 		self.assertEqual([(1, )], node.execute("SELECT count(*) FROM o_test"))
 		node.stop()
 
+	def test_s3_stop_during_a_spread_checkpoint(self):
+		"""A stop that comes during a spread checkpoint does not wait for
+		the WAL shipper, which stops first: the checkpoint going on is left
+		uncommitted, and the shutdown checkpoint ships the rest and
+		commits."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			checkpoint_timeout = 30s
+			checkpoint_completion_target = 0.9
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, pad text) USING orioledb;
+			INSERT INTO o_test SELECT g, repeat('x', 200) FROM generate_series(1, 50000) g;
+		""")
+		deadline = time.time() + 60
+		started = False
+		while time.time() < deadline and not started:
+			with open(node.pg_log_file) as f:
+				started = "checkpoint starting: time" in f.read()
+			time.sleep(0.5)
+		self.assertTrue(started)
+		begun = time.time()
+		node.stop()
+		self.assertLess(time.time() - begun, 20)
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(50000, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
+
 	def test_s3_restart_waits_for_unshipped_wal(self):
 		"""A commit that was waiting for the bucket when the server died is
 		visible after local recovery: clients are held until the shipper has

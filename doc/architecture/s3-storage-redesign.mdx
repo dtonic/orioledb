@@ -198,7 +198,8 @@ shipper). 한 버킷에 writer 하나와 reader 여럿이 붙는다. writer 는 
 6. after-hook(`o_after_checkpoint_cleanup_hook`, 복구가 끝난 writer 에서만): `pg_control` 과 OrioleDB control 을
    `data/<T>-<K>/` 로 올린다.
 7. shipper 의 flush 가 현재 flush LSN(체크포인트 레코드 포함)에 닿기를 기다린다(`s3_wal_shipper_wait`). shipper 가 30초
-   동안 없으면 K 를 커밋하지 않고 LOG 를 남긴다. 다음 체크포인트가 커밋한다.
+   동안 없으면 K 를 커밋하지 않고 LOG 를 남긴다. 다음 체크포인트가 커밋한다. shipper 가 SIGTERM 으로 끝났으면(서버 정지가
+   진행 중) 기다리지 않는다: 정지 체크포인트가 남은 WAL 을 올리고 커밋한다. Guard: `test_s3_stop_during_a_spread_checkpoint`.
 8. 매니페스트에 `redo`, `lsn`, `timeline`, `time` 을 더해 다시 올린다. pending 매니페스트가 K 의 것이 아니면(백업 도중 크래시
    뒤 복구 끝의 hook) 커밋하지 않는다.
 9. `root` 를 `If-Match` 로 교체한다. 그 전에 남은 리스가 리스 길이의 절반 아래면 갱신한다. 성공하면 K 가 커밋된 것이다.
