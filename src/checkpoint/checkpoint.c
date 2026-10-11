@@ -2447,6 +2447,13 @@ check_archive_done(const char *xlog)
 	return false;
 }
 
+/*
+ * The WAL a shutdown without the shipper leaves unarchived.  The segment the
+ * WAL ends in goes up as "<name>.partial": under the archive's key a restore
+ * takes it as complete, and reads no chunk a later run ships into it.  The
+ * segments past it are recycled ones, old WAL under a future name, and stay
+ * here.
+ */
 static S3TaskLocation
 after_checkpoint_sync_wal(void)
 {
@@ -2454,11 +2461,17 @@ after_checkpoint_sync_wal(void)
 	struct dirent *xlde;
 	S3TaskLocation maxLocation = 0;
 	S3TaskLocation location;
+	TimeLineID	endTli = GetWALInsertionTimeLine();
+	XLogSegNo	endSeg;
 
+	XLByteToSeg(GetFlushRecPtr(NULL), endSeg, wal_segment_size);
 	xldir = AllocateDir(XLOGDIR);
 
 	while ((xlde = ReadDir(xldir, XLOGDIR)) != NULL)
 	{
+		TimeLineID	tli;
+		XLogSegNo	segno;
+
 		/* Ignore files that are not XLOG segments */
 		if (!IsXLogFileName(xlde->d_name))
 			continue;
@@ -2467,7 +2480,18 @@ after_checkpoint_sync_wal(void)
 		if (check_archive_done(xlde->d_name))
 			continue;
 
-		location = s3_schedule_wal_file_write(xlde->d_name, false);
+		XLogFromFileName(xlde->d_name, &tli, &segno, wal_segment_size);
+		if (tli == endTli && segno > endSeg)
+			continue;
+		if (tli == endTli && segno == endSeg)
+		{
+			char	   *partial = psprintf("%s.partial", xlde->d_name);
+
+			location = s3_schedule_wal_file_write(partial, false);
+			pfree(partial);
+		}
+		else
+			location = s3_schedule_wal_file_write(xlde->d_name, false);
 		maxLocation = Max(location, maxLocation);
 	}
 

@@ -987,6 +987,9 @@ delete_wal(S3Manifest *from, S3Manifest *to)
 			key = psprintf("wal/%s", name);
 			gc_delete(key);
 			pfree(key);
+			key = psprintf("wal/%s.partial", name);
+			gc_delete(key);
+			pfree(key);
 		}
 	}
 }

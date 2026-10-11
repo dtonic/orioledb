@@ -861,6 +861,8 @@ class OrioledbS3ObjectLoader:
 					raise
 			if seg is None:
 				seg = self.archived_since(tli, segno)
+			if seg is None:
+				seg = self.partial_segment(tli, segno)
 			return seg
 		raise RestoreRefused(f"the WAL chunks of segment "
 		                     f"{self.segment_name(tli, segno)} keep going")
@@ -870,6 +872,12 @@ class OrioledbS3ObjectLoader:
 		shipper then removes the chunks inside it, and the chunks listed
 		after that can miss the segment's start, or all of it."""
 		data = self.read_object(f"wal/{self.segment_name(tli, segno)}")
+		return bytearray(data) if data is not None else None
+
+	def partial_segment(self, tli, segno):
+		"""The segment the WAL ended in at a shutdown without the shipper:
+		a restore takes it only where no chunk has the segment's start."""
+		data = self.read_object(f"wal/{self.segment_name(tli, segno)}.partial")
 		return bytearray(data) if data is not None else None
 
 	def assemble_segment(self, tli, segno):
@@ -905,6 +913,12 @@ class OrioledbS3ObjectLoader:
 				if first is None:
 					first = self.first_chunk_seq(tli)
 				pos = lo if seq != first else max(start, lo)
+				if pos > lo:
+					# the first chunks of a run whose last shutdown had no
+					# shipper: before them, the segment it left
+					partial = self.partial_segment(tli, segno)
+					if partial is not None:
+						seg = partial
 			if start > pos:
 				# a chunk missing between two that are there: the WAL
 				# after it was acknowledged and is not here; ending the

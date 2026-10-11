@@ -1054,6 +1054,75 @@ class S3Test(S3BaseTest):
 		self.assertNotIn("Contents", self.client.list_objects(
 		    Bucket=self.bucket_name, Prefix=f'wal/{segment}'))
 
+	def test_s3_shipping_turned_on_keeps_the_segment_a_stop_left(self):
+		"""A stop without the shipper puts the segment the WAL ends in into
+		the bucket.  Started again with the shipper, the instance ships the
+		rest of that segment as chunks, and a restore reads them: the segment
+		the stop left is no complete archived one."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("orioledb.s3_wal_shipping = off\n")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		node.stop()
+		node.append_conf("""
+			orioledb.s3_wal_shipping = on
+			synchronous_standby_names = 's3'
+		""")
+		node.start()
+		segment = node.execute(
+		    "SELECT pg_walfile_name(pg_current_wal_lsn());")[0][0]
+		# the stop put it up
+		self.wait_for_object(f'wal/{segment}')
+		for i in range(11, 21):
+			node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+		self.assertEqual(segment, node.execute(
+		    "SELECT pg_walfile_name(pg_current_wal_lsn());")[0][0])
+		node.stop(['-m', 'immediate'])
+		self.assertNotIn("Contents", self.client.list_objects(
+		    Bucket=self.bucket_name, Prefix=f'wal/{segment}', Delimiter='.'))
+
+		with self.initNode(self.getBasePort() + 1, 'tgsp') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(20, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
+
+	def test_s3_restore_reads_the_segment_a_stop_left(self):
+		"""Without the shipper, a restore of a bucket whose last stop left a
+		partial segment reads that segment: it holds the stop's
+		checkpoint."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("orioledb.s3_wal_shipping = off\n")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		node.stop()
+		self.assertEqual(1, len([
+		    o['Key'] for o in self.client.list_objects(
+		        Bucket=self.bucket_name, Prefix='wal/')['Contents']
+		    if o['Key'].endswith('.partial')]))
+
+		with self.initNode(self.getBasePort() + 1, 'tgsq') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(10, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
+
 	def test_s3_reader_becomes_the_writer(self):
 		"""A reader keeps its parts when it is loaded again to write: once the
 		writer is gone, it takes the bucket over with every commit."""

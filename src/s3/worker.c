@@ -539,11 +539,13 @@ s3process_task(uint64 taskLocation)
 		uint64		size;
 
 		/*
-		 * The WAL a checkpoint without the shipper leaves unarchived, a
-		 * partial segment among it: tagged and fenced like an archived one,
-		 * so a writer fenced off cannot put its version over the bucket's.
+		 * The WAL a checkpoint without the shipper leaves unarchived, the
+		 * segment it ends in named "<segment>.partial": tagged and fenced
+		 * like an archived one, so a writer fenced off cannot put its
+		 * version over the bucket's.
 		 */
-		filename = psprintf(XLOGDIR "/%s", task->typeSpecific.walFilename);
+		filename = psprintf(XLOGDIR "/%.*s", XLOG_FNAME_LEN,
+							task->typeSpecific.walFilename);
 		objectname = psprintf("wal/%s", task->typeSpecific.walFilename);
 		data = read_file(filename, &size);
 		if (data == NULL)
