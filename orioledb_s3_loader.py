@@ -397,9 +397,11 @@ class OrioledbS3ObjectLoader:
 			# only an answer of this script says a file is not there: one
 			# that cannot run at all (no interpreter, no module) stops
 			# recovery instead of ending the WAL where it is
+			# a standby (a reader) asks again later rather than stop
 			command = (' '.join(shlex.quote(x) for x in cmd) +
 			           ' --restore %f %p; rc=$?; [ $rc -eq 0 ] && exit 0; '
-			           f'[ $rc -eq {RESTORE_NOT_FOUND} ] && exit 1; exit 128')
+			           f'[ $rc -eq {RESTORE_NOT_FOUND} ] && exit 1; '
+			           '[ -f standby.signal ] && exit 1; exit 128')
 		if not self.local_wal:
 			# the writer's terminator check: recovery reads the bucket
 			open(os.path.join(self.data_dir, 'orioledb_data',
@@ -565,10 +567,21 @@ class OrioledbS3ObjectLoader:
 		for chkp, key in sorted(copies, reverse=True):
 			body = self.s3.get_object(Bucket=self.bucket_name,
 			                          Key=key)['Body'].read()
-			self.epochs = parse_root_body(body.decode())['epochs']
+			copy = parse_root_body(body.decode())
+			self.epochs = copy['epochs']
 			if self.read_object(
 			    f"manifests/{self.token_of(chkp)}-{chkp}") is None:
 				continue
+			# a writer that took over since wrote no copy we can see: putting
+			# an older token back would let the fenced writer in again
+			writer = self.read_object('writer')
+			if writer is not None:
+				w = parse_root_body(writer.decode())
+				if int(w.get('token', 0)) > int(copy.get('token', 0)):
+					raise Exception(
+					    f"The writer object names token {w['token']}, newer than "
+					    f"{key} (token {copy.get('token')}): root cannot be put "
+					    "back from a copy")
 			self.s3.put_object(Bucket=self.bucket_name,
 			                   Key=os.path.join(self.prefix, 'root'),
 			                   Body=body)
@@ -826,11 +839,25 @@ class OrioledbS3ObjectLoader:
 		# segment was archived: ask for the segment again
 		for _ in range(10):
 			try:
-				return self.assemble_segment(tli, segno)
+				seg = self.assemble_segment(tli, segno)
 			except ChunkGone:
 				continue
+			except RestoreRefused:
+				seg = self.archived_since(tli, segno)
+				if seg is None:
+					raise
+			if seg is None:
+				seg = self.archived_since(tli, segno)
+			return seg
 		raise RestoreRefused(f"the WAL chunks of segment "
 		                     f"{self.segment_name(tli, segno)} keep going")
+
+	def archived_since(self, tli, segno):
+		"""The segment archived after assemble_segment looked for it: the
+		shipper then removes the chunks inside it, and the chunks listed
+		after that can miss the segment's start, or all of it."""
+		data = self.read_object(f"wal/{self.segment_name(tli, segno)}")
+		return bytearray(data) if data is not None else None
 
 	def assemble_segment(self, tli, segno):
 		size = self.segment_size
@@ -891,6 +918,9 @@ class OrioledbS3ObjectLoader:
 		except Exception as e:
 			print(f"orioledb_s3_loader: cannot restore {fname}: {e}",
 			      file=sys.stderr)
+			# a standby only waits: it asks again, and never promotes on it
+			if os.path.exists('standby.signal'):
+				return RESTORE_NOT_FOUND
 			return 128
 
 	def restore_file(self, fname, path):

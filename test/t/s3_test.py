@@ -9,7 +9,7 @@ import signal
 import struct
 import subprocess
 import sys
-from tempfile import mkstemp
+from tempfile import mkdtemp, mkstemp
 
 import threading
 from threading import Thread
@@ -793,6 +793,10 @@ class S3Test(S3BaseTest):
 				time.sleep(0.5)
 			self.assertEqual([(20003, 100002)],
 			                 reader.execute("SELECT count(*), max(id) FROM o_test"))
+			# in recovery the WAL position is the replayed one
+			self.assertEqual([('reader', True)],
+			                 reader.execute("SELECT role, wal_flush_lsn > '0/0' "
+			                                "FROM orioledb_s3_status()"))
 
 			self.assertEqual(self.s3_body('writer')['token'],
 			                 writer_before['token'])
@@ -2559,6 +2563,28 @@ class S3Test(S3BaseTest):
 			except Exception:
 				pass
 			new_node.cleanup()
+
+	def test_s3_restore_answers_a_standby_with_not_there(self):
+		"""--restore that cannot reach the bucket stops a writer's recovery
+		(128) but tells a standby the file is not there yet (99), so a reader
+		asks again later rather than stop."""
+		loader = os.path.join(dir_path, '..', '..', 'orioledb_s3_loader.py')
+		for standby, expected in ((False, 128), (True, 99)):
+			d = mkdtemp()
+			try:
+				if standby:
+					open(os.path.join(d, 'standby.signal'), 'w').close()
+				rc = subprocess.run(
+				    [sys.executable, loader, '--endpoint', 'http://127.0.0.1:9',
+				     '--resolved-endpoint', 'http://127.0.0.1:9',
+				     '--resolved-bucket', self.bucket_name, '--resolved-prefix', '',
+				     '--resolved-style', 'path', '--segment-size', '16777216',
+				     '--restore', '000000010000000000000009', os.path.join(d, 'x')],
+				    cwd=d, capture_output=True,
+				    env=dict(os.environ, AWS_MAX_ATTEMPTS='1')).returncode
+				self.assertEqual(expected, rc)
+			finally:
+				shutil.rmtree(d)
 
 	def test_s3_restore_refuses_a_gap_at_a_segment_start(self):
 		"""The chunk that a segment starts in missing is a gap too: the

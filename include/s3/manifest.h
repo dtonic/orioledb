@@ -110,5 +110,8 @@ extern void s3_tree_parts_gone(Oid datoid, Oid relnode, uint64 floor);
 extern void s3_build_part_end(Oid datoid, Oid relnode, Oid spcoid,
 							  uint64 blocksPerPart, uint64 *ends, int nends);
 extern char *s3_build_dead_filename(Oid datoid, Oid relnode);
+extern int	s3_local_lists_lock(void);
+extern void s3_local_lists_unlock(int fd);
+extern void s3_tree_lists_unlink(Oid datoid, Oid relnode);
 
 #endif							/* __S3_MANIFEST_H__ */

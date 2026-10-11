@@ -44,6 +44,7 @@
 
 #include "access/htup_details.h"
 #include "access/xlog.h"
+#include "access/xlogrecovery.h"
 #include "common/controldata_utils.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -591,6 +592,21 @@ start_epoch(S3LeaseState *state, uint32 localCheckpoint, uint64 token)
 }
 
 /*
+ * The epoch table is read without the lock but for one case: the GC prunes
+ * it in place (s3_lease_prune_epochs()), so a reader in another process
+ * takes the lock shared.  The postmaster takes no LWLock, and a process
+ * that holds the lock already reads under it.
+ */
+static bool
+lock_epochs(void)
+{
+	if (!IsUnderPostmaster || LWLockHeldByMe(&lease->lock))
+		return false;
+	LWLockAcquire(&lease->lock, LW_SHARED);
+	return true;
+}
+
+/*
  * The GC: the checkpoints from `from` on are retained, and of the ones
  * before only refs[] have objects a retained checkpoint refers to.  The other
  * epochs are no longer needed to name an object: they go, so the table does
@@ -635,13 +651,19 @@ s3_lease_prune_epochs(uint32 from, const uint32 *refs, int nrefs)
 bool
 s3_checkpoint_token_known(uint32 chkpNum, uint64 *token)
 {
+	bool		locked = lock_epochs();
+	bool		found = false;
+
 	for (int i = lease->numEpochs - 1; i >= 0; i--)
 		if (lease->epochs[i].firstCheckpoint <= chkpNum)
 		{
 			*token = lease->epochs[i].token;
-			return true;
+			found = true;
+			break;
 		}
-	return false;
+	if (locked)
+		LWLockRelease(&lease->lock);
+	return found;
 }
 
 /*
@@ -650,11 +672,11 @@ s3_checkpoint_token_known(uint32 chkpNum, uint64 *token)
 uint64
 s3_checkpoint_token(uint32 chkpNum)
 {
-	for (int i = lease->numEpochs - 1; i >= 0; i--)
-		if (lease->epochs[i].firstCheckpoint <= chkpNum)
-			return lease->epochs[i].token;
-	elog(ERROR, "no S3 writer token is known for checkpoint %u", chkpNum);
-	return 0;
+	uint64		token;
+
+	if (!s3_checkpoint_token_known(chkpNum, &token))
+		elog(ERROR, "no S3 writer token is known for checkpoint %u", chkpNum);
+	return token;
 }
 
 /*
@@ -744,6 +766,26 @@ wait_for_own_lease(WriterBody *writer, char *writerEtag, int64 storageNow)
  * before anything is uploaded; refuses to start when another writer holds the
  * lease, or has written root since this data directory last did.
  */
+/*
+ * A copy of root under its checkpoint's number: root is a single object, and
+ * a root lost or damaged is put back from the last copy whose manifest is
+ * there (orioledb_s3_loader.py --repair-root).  Each commit leaves one, and so
+ * does a start, whose root carries the new token and epoch under the same
+ * checkpoint.  The GC removes the copies with the manifests.
+ */
+static void
+put_root_copy(uint32 checkpointNum, StringInfo body)
+{
+	char	   *key = psprintf(ROOT_COPY_FORMAT, checkpointNum);
+
+	if (s3_put_object_conditional(key, body->data, body->len, NULL, false,
+								  NULL) != S3_RESPONSE_OK)
+		ereport(WARNING,
+				(errmsg("could not put a copy of \"%s\" to S3 as \"%s\"",
+						ROOT_KEY, key)));
+	pfree(key);
+}
+
 void
 s3_lease_acquire(void)
 {
@@ -928,6 +970,9 @@ s3_lease_acquire(void)
 
 	pm_lease.root = newRoot;
 	strlcpy(pm_lease.rootEtag, rootEtag, S3_ETAG_LEN);
+	/* a takeover's root, with its token and epoch, is the one to put back */
+	if (newRoot.checkpoint > 0)
+		put_root_copy(newRoot.checkpoint, &body);
 
 	/* taking the bucket over: no chunk of the fenced writer after this */
 	if (pm_lease.loaded)
@@ -1238,22 +1283,7 @@ s3_root_commit(uint32 checkpointNum, XLogRecPtr redoLsn,
 	lease->root = r;
 	LWLockRelease(&lease->lock);
 
-	/*
-	 * A copy under the checkpoint's number: root is a single object, and a
-	 * root lost or damaged is put back from the last copy whose manifest is
-	 * there (orioledb_s3_loader.py --repair-root).  The GC removes the
-	 * copies with the manifests.
-	 */
-	{
-		char	   *key = psprintf(ROOT_COPY_FORMAT, checkpointNum);
-
-		if (s3_put_object_conditional(key, body.data, body.len, NULL, false,
-									  NULL) != S3_RESPONSE_OK)
-			ereport(WARNING,
-					(errmsg("could not put a copy of \"%s\" to S3 as \"%s\"",
-							ROOT_KEY, key)));
-		pfree(key);
-	}
+	put_root_copy(checkpointNum, &body);
 
 	elog(DEBUG1, "S3 root now points at checkpoint %u", checkpointNum);
 	pfree(body.data);
@@ -1642,7 +1672,8 @@ orioledb_s3_status(PG_FUNCTION_ARGS)
 	TupleDesc	tupdesc;
 	Datum		values[12];
 	bool		nulls[12] = {0};
-	XLogRecPtr	flush = GetFlushRecPtr(NULL);
+	XLogRecPtr	flush = RecoveryInProgress() ? GetXLogReplayRecPtr(NULL) :
+		GetFlushRecPtr(NULL);
 	XLogRecPtr	shipped;
 	bool		running;
 	uint64		token;

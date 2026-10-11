@@ -1022,6 +1022,23 @@ delete_chunks_below(TimeLineID tli, XLogRecPtr below)
 						   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
 	keys = s3_list_objects(prefix, NULL);
+
+	/*
+	 * The chunks before the first one listed are gone (the shipper removes
+	 * archived ones too): their ends are not kept.
+	 */
+	{
+		uint64		first = keys != NIL ?
+			strtou64((char *) linitial(keys) + strlen(prefix), NULL, 10) :
+			PG_UINT64_MAX;
+		HASH_SEQ_STATUS seq;
+		uint64	   *cached;
+
+		hash_seq_init(&seq, ends);
+		while ((cached = hash_seq_search(&seq)) != NULL)
+			if (cached[0] == tli && cached[1] < first)
+				(void) hash_search(ends, cached, HASH_REMOVE, NULL);
+	}
 	foreach(lc, keys)
 	{
 		char	   *key = lfirst(lc);
@@ -1065,7 +1082,6 @@ collect_dropped_tree(DroppedTree *d)
 	uint64		nextPart = 0;
 	int			removed = 0;
 	ListCell   *lc;
-	char	   *bend;
 
 	if (tree_next_part(d->key.datoid, d->key.relnode, d->lastMap, &nextPart))
 	{
@@ -1087,9 +1103,7 @@ collect_dropped_tree(DroppedTree *d)
 	foreach(lc, d->maps)
 		delete_map(d->key.datoid, d->key.relnode, (uint32) lfirst_int(lc));
 	state_drop(d->key.datoid, d->key.relnode);
-	bend = s3_build_dead_filename(d->key.datoid, d->key.relnode);
-	(void) unlink(bend);
-	pfree(bend);
+	s3_tree_lists_unlink(d->key.datoid, d->key.relnode);
 	return removed;
 }
 
@@ -1111,11 +1125,17 @@ collect_abandoned_trees(uint32 r, uint32 committed)
 	HTAB	   *named = NULL;
 	int			removed = 0;
 
-	if (stat(taken, &st) != 0 &&
-		rename(S3_DROPPED_TREES_FILE, taken) != 0)
+	if (stat(taken, &st) != 0)
 	{
-		pfree(taken);
-		return 0;
+		int			lock = s3_local_lists_lock();
+		bool		renamed = rename(S3_DROPPED_TREES_FILE, taken) == 0;
+
+		s3_local_lists_unlock(lock);
+		if (!renamed)
+		{
+			pfree(taken);
+			return 0;
+		}
 	}
 	fd = BasicOpenFile(taken, O_RDONLY | PG_BINARY);
 	if (fd < 0 || fstat(fd, &st) != 0)
@@ -1149,6 +1169,8 @@ collect_abandoned_trees(uint32 r, uint32 committed)
 		if (committed <= rec.chkp)
 		{
 			/* the checkpoint going at the drop may still name it */
+			int			lock = s3_local_lists_lock();
+
 			fd = BasicOpenFile(S3_DROPPED_TREES_FILE,
 							   O_WRONLY | O_CREAT | O_APPEND | PG_BINARY);
 			if (fd < 0 || write(fd, &rec, sizeof(rec)) != sizeof(rec) ||
@@ -1158,6 +1180,7 @@ collect_abandoned_trees(uint32 r, uint32 committed)
 						 errmsg("could not write file \"%s\": %m",
 								S3_DROPPED_TREES_FILE)));
 			close(fd);
+			s3_local_lists_unlock(lock);
 			continue;
 		}
 		if (named == NULL)
@@ -1202,9 +1225,7 @@ collect_abandoned_trees(uint32 r, uint32 committed)
 		list_free_deep(keys);
 		pfree(prefix);
 		state_drop(rec.datoid, rec.relnode);
-		prefix = s3_build_dead_filename(rec.datoid, rec.relnode);
-		(void) unlink(prefix);
-		pfree(prefix);
+		s3_tree_lists_unlink(rec.datoid, rec.relnode);
 	}
 	gc_flush();
 	(void) unlink(taken);

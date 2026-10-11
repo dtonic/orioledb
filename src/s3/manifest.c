@@ -29,6 +29,7 @@
 #include "postgres.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -117,6 +118,60 @@ s3_build_dead_filename(Oid datoid, Oid relnode)
 }
 
 /*
+ * The local lists that backends add to and the checkpointer or the GC take
+ * away from (a tree's build list, the parts a TRUNCATE left, the dropped
+ * trees) are changed under one file lock, so nothing added between a read
+ * and the removal of what was read is lost.
+ */
+#define LOCAL_LISTS_LOCK	ORIOLEDB_DATA_DIR "/s3_local_lists.lock"
+
+int
+s3_local_lists_lock(void)
+{
+	int			fd = BasicOpenFile(LOCAL_LISTS_LOCK, O_RDWR | O_CREAT | PG_BINARY);
+
+	if (fd < 0 || flock(fd, LOCK_EX) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not lock file \"%s\": %m", LOCAL_LISTS_LOCK)));
+	return fd;
+}
+
+void
+s3_local_lists_unlock(int fd)
+{
+	(void) flock(fd, LOCK_UN);
+	close(fd);
+}
+
+static char *
+parts_gone_filename(Oid datoid, Oid relnode)
+{
+	return psprintf(ORIOLEDB_DATA_DIR "/%u/%u.bgone", datoid, relnode);
+}
+
+static char *
+uploaded_filename(Oid datoid, Oid relnode)
+{
+	return psprintf(ORIOLEDB_DATA_DIR "/%u/%u.bend.up", datoid, relnode);
+}
+
+/* the local lists of a tree that is gone */
+void
+s3_tree_lists_unlink(Oid datoid, Oid relnode)
+{
+	char	   *names[3] = {s3_build_dead_filename(datoid, relnode),
+		parts_gone_filename(datoid, relnode),
+	uploaded_filename(datoid, relnode)};
+
+	for (int i = 0; i < 3; i++)
+	{
+		(void) unlink(names[i]);
+		pfree(names[i]);
+	}
+}
+
+/*
  * A tree build is done: the ends of the parts it filled, for the GC.  The
  * build's meta page is private, so the checkpoint lists have none of them;
  * the next checkpoint that sees the tree in the catalog uploads this list
@@ -130,8 +185,10 @@ s3_build_part_end(Oid datoid, Oid relnode, Oid spcoid, uint64 blocksPerPart,
 	char	   *path = s3_build_dead_filename(datoid, relnode);
 	int			fd;
 	FileExtent	unit = {.off = blocksPerPart,.len = S3_DEAD_UNIT_LEN};
+	int			lock;
 
 	(void) MakePGDirectory(dir);
+	lock = s3_local_lists_lock();
 	fd = BasicOpenFile(path, O_WRONLY | O_CREAT | O_APPEND | PG_BINARY);
 	if (fd < 0 ||
 		write(fd, &unit, sizeof(unit)) != sizeof(unit))
@@ -152,6 +209,7 @@ s3_build_part_end(Oid datoid, Oid relnode, Oid spcoid, uint64 blocksPerPart,
 				(errcode_for_file_access(),
 				 errmsg("could not fsync file \"%s\": %m", path)));
 	close(fd);
+	s3_local_lists_unlock(lock);
 	pfree(dir);
 	pfree(path);
 }
@@ -172,6 +230,7 @@ s3_note_dropped_tree(Oid datoid, Oid relnode)
 		.relnode = relnode
 	};
 	int			fd;
+	int			lock = s3_local_lists_lock();
 
 	fd = BasicOpenFile(S3_DROPPED_TREES_FILE,
 					   O_WRONLY | O_CREAT | O_APPEND | PG_BINARY);
@@ -183,31 +242,104 @@ s3_note_dropped_tree(Oid datoid, Oid relnode)
 				 errmsg("could not write file \"%s\": %m",
 						S3_DROPPED_TREES_FILE)));
 	close(fd);
+	s3_local_lists_unlock(lock);
 }
 
 /*
  * A tree emptied in place keeps its relnode and numbers its parts on from
- * `floor`: every part below it is gone.  Said in the same list as a build's
- * part ends, which the next checkpoint that sees the tree uploads.
+ * `floor`: every part below it is gone.  The checkpoint going on may have
+ * written the tree's map before the TRUNCATE, naming those parts, so they
+ * are dead only from the checkpoint after it: the note keeps that number,
+ * and a checkpoint begun after it moves it into the tree's build list
+ * (move_parts_gone()), which goes up with that checkpoint's manifest.
  */
 void
 s3_tree_parts_gone(Oid datoid, Oid relnode, uint64 floor)
 {
 	char	   *dir = psprintf(ORIOLEDB_DATA_DIR "/%u", datoid);
-	char	   *path = s3_build_dead_filename(datoid, relnode);
-	int			fd;
-	FileExtent	gone = {.off = floor,.len = S3_DEAD_PARTS_BELOW_LEN};
+	char	   *path = parts_gone_filename(datoid, relnode);
+	char		line[64];
+	int			len,
+				fd,
+				lock;
 
+	len = snprintf(line, sizeof(line), "%u " UINT64_FORMAT "\n",
+				   checkpoint_state->lastCheckpointNumber + 1, floor);
 	(void) MakePGDirectory(dir);
+	lock = s3_local_lists_lock();
 	fd = BasicOpenFile(path, O_WRONLY | O_CREAT | O_APPEND | PG_BINARY);
-	if (fd < 0 ||
-		write(fd, &gone, sizeof(gone)) != sizeof(gone) ||
-		pg_fsync(fd) != 0)
+	if (fd < 0 || write(fd, line, len) != len || pg_fsync(fd) != 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not write file \"%s\": %m", path)));
 	close(fd);
+	s3_local_lists_unlock(lock);
 	pfree(dir);
+	pfree(path);
+}
+
+/*
+ * Checkpoint chkpNum is preparing its manifest: the TRUNCATE notes of
+ * checkpoints before it go into the tree's build list.  Under the lists
+ * lock.
+ */
+static void
+move_parts_gone(Oid datoid, Oid relnode, uint32 chkpNum)
+{
+	char	   *path = parts_gone_filename(datoid, relnode);
+	FILE	   *f = AllocateFile(path, "r");
+	StringInfoData keep;
+	bool		moved = false;
+	unsigned int noted;
+	unsigned long long floor;
+
+	if (f == NULL)
+	{
+		pfree(path);
+		return;
+	}
+	initStringInfo(&keep);
+	while (fscanf(f, "%u %llu", &noted, &floor) == 2)
+	{
+		if (noted < chkpNum)
+		{
+			char	   *bend = s3_build_dead_filename(datoid, relnode);
+			FileExtent	gone = {.off = floor,.len = S3_DEAD_PARTS_BELOW_LEN};
+			int			fd = BasicOpenFile(bend, O_WRONLY | O_CREAT | O_APPEND | PG_BINARY);
+
+			if (fd < 0 || write(fd, &gone, sizeof(gone)) != sizeof(gone) ||
+				pg_fsync(fd) != 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not write file \"%s\": %m", bend)));
+			close(fd);
+			pfree(bend);
+			moved = true;
+		}
+		else
+			appendStringInfo(&keep, "%u %llu\n", noted, floor);
+	}
+	FreeFile(f);
+	if (moved)
+	{
+		if (keep.len == 0)
+			(void) unlink(path);
+		else
+		{
+			char	   *tmp = psprintf("%s.tmp", path);
+			int			fd = BasicOpenFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+
+			if (fd < 0 || write(fd, keep.data, keep.len) != keep.len ||
+				pg_fsync(fd) != 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not write file \"%s\": %m", tmp)));
+			close(fd);
+			durable_rename(tmp, path, ERROR);
+			pfree(tmp);
+		}
+	}
+	pfree(keep.data);
 	pfree(path);
 }
 
@@ -570,17 +702,39 @@ s3_manifest_prepare(uint32 chkpNum, int bundles)
 					tree->map = 0;
 			}
 
-			/* the part ends of a build, once its tree is in the catalog */
-			if (stat(bend, &st) == 0)
+			/*
+			 * The part ends of a build and the parts a TRUNCATE left, once
+			 * the tree is in the catalog.  What is up is taken off the local
+			 * list once the checkpoint is committed: the size put up is
+			 * noted, and what is added meanwhile stays.
+			 */
 			{
-				char	   *object = psprintf("trees/%u/%u/dead/" UINT64_FORMAT "-%u.build",
-											  a, b, s3_checkpoint_token(chkpNum),
-											  chkpNum);
+				int			lock = s3_local_lists_lock();
 
-				/* the local copy goes once the checkpoint is committed */
-				if (s3_put_file(object, bend, false) == S3_RESPONSE_OK)
-					appendStringInfo(&body, "bdead %u %u %u\n", a, b, c);
-				pfree(object);
+				move_parts_gone(a, b, chkpNum);
+				if (stat(bend, &st) == 0)
+				{
+					char	   *object = psprintf("trees/%u/%u/dead/" UINT64_FORMAT "-%u.build",
+												  a, b, s3_checkpoint_token(chkpNum),
+												  chkpNum);
+
+					if (s3_put_file(object, bend, false) == S3_RESPONSE_OK)
+					{
+						char	   *up = uploaded_filename(a, b);
+						FILE	   *f = AllocateFile(up, "w");
+
+						if (f == NULL ||
+							fprintf(f, "%u %lld\n", chkpNum, (long long) st.st_size) < 0 ||
+							FreeFile(f) != 0)
+							ereport(ERROR,
+									(errcode_for_file_access(),
+									 errmsg("could not write file \"%s\": %m", up)));
+						appendStringInfo(&body, "bdead %u %u %u\n", a, b, c);
+						pfree(up);
+					}
+					pfree(object);
+				}
+				s3_local_lists_unlock(lock);
 			}
 			pfree(bend);
 		}
@@ -709,6 +863,53 @@ s3_manifest_publish(uint32 chkpNum, XLogRecPtr redoLsn,
 /*
  * Root names chkpNum: its manifest is the committed one.
  */
+/*
+ * Checkpoint chkpNum is committed with the first bytes of a tree's build
+ * list: take them off, and keep what was added since.
+ */
+static void
+drop_uploaded(Oid datoid, Oid relnode, uint32 chkpNum)
+{
+	char	   *bend = s3_build_dead_filename(datoid, relnode);
+	char	   *up = uploaded_filename(datoid, relnode);
+	int			lock = s3_local_lists_lock();
+	FILE	   *f = AllocateFile(up, "r");
+	unsigned int noted;
+	long long	size;
+	struct stat st;
+
+	if (f != NULL && fscanf(f, "%u %lld", &noted, &size) == 2 &&
+		noted == chkpNum && stat(bend, &st) == 0)
+	{
+		if (st.st_size <= size)
+			(void) unlink(bend);
+		else
+		{
+			uint64		restSize;
+			Pointer		data = read_file(bend, &restSize);
+			char	   *tmp = psprintf("%s.tmp", bend);
+			int			fd = BasicOpenFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+
+			restSize -= size;
+			if (fd < 0 || write(fd, data + size, restSize) != (ssize_t) restSize ||
+				pg_fsync(fd) != 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not write file \"%s\": %m", tmp)));
+			close(fd);
+			durable_rename(tmp, bend, ERROR);
+			pfree(tmp);
+			pfree(data);
+		}
+	}
+	if (f != NULL)
+		FreeFile(f);
+	(void) unlink(up);
+	s3_local_lists_unlock(lock);
+	pfree(bend);
+	pfree(up);
+}
+
 void
 s3_manifest_committed(uint32 chkpNum)
 {
@@ -729,11 +930,8 @@ s3_manifest_committed(uint32 chkpNum)
 		foreach(lc, m->buildDeadUp)
 		{
 			S3ManifestTree *t = lfirst(lc);
-			char	   *bend = s3_build_dead_filename(t->key.datoid,
-													  t->key.relnode);
 
-			(void) unlink(bend);
-			pfree(bend);
+			drop_uploaded(t->key.datoid, t->key.relnode, chkpNum);
 		}
 	}
 	s3_manifest_free(m);
