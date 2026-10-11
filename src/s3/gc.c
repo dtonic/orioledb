@@ -693,46 +693,9 @@ delete_map(Oid datoid, Oid relnode, uint32 chkp)
 	}
 }
 
-/*
- * The number of parts a tree has handed out, from its map of checkpoint
- * chkp: the parts of a dropped tree are 0 up to it.
- */
-static bool
-tree_next_part(Oid datoid, Oid relnode, uint32 chkp, uint64 *nextPart)
-{
-	uint64		tokens[2];
-	int			n = map_tokens(chkp, tokens);
-
-	for (int i = 0; i < n; i++)
-	{
-		char	   *key = psprintf("trees/%u/%u/maps/" UINT64_FORMAT "-%u",
-								   datoid, relnode, tokens[i], chkp);
-		StringInfoData body;
-		bool		found = false;
-
-		initStringInfo(&body);
-		if (s3_get_object(key, &body, true) == S3_RESPONSE_OK &&
-			body.len >= sizeof(CheckpointFileHeader))
-		{
-			CheckpointFileHeader header;
-
-			memcpy(&header, body.data, sizeof(header));
-			*nextPart = header.datafileLength;
-			found = true;
-		}
-		pfree(body.data);
-		pfree(key);
-		if (found)
-			return true;
-	}
-	return false;
-}
-
 typedef struct
 {
 	S3ManifestTreeKey key;
-	uint32		lastMap;
-	List	   *maps;			/* every map number seen */
 } DroppedTree;
 
 typedef struct
@@ -772,19 +735,9 @@ data_key(uint64 token, uint32 chkp, const char *path)
 }
 
 static void
-note_dropped(HTAB *dropped, S3ManifestTreeKey *key, uint32 map)
+note_dropped(HTAB *dropped, S3ManifestTreeKey *key)
 {
-	bool		found;
-	DroppedTree *d = hash_search(dropped, key, HASH_ENTER, &found);
-
-	if (!found)
-	{
-		d->lastMap = map;
-		d->maps = NIL;
-	}
-	d->lastMap = Max(d->lastMap, map);
-	if (!list_member_int(d->maps, (int) map))
-		d->maps = lappend_int(d->maps, (int) map);
+	(void) hash_search(dropped, key, HASH_ENTER, NULL);
 }
 
 /*
@@ -883,7 +836,7 @@ collect_checkpoint(S3Manifest *m, S3Manifest *r, HTAB *dropped, HTAB *deleted)
 		if (rt == NULL)
 		{
 			if (t->key.datoid != SYS_TREES_DATOID)
-				note_dropped(dropped, &t->key, m->checkpoint);
+				note_dropped(dropped, &t->key);
 			continue;
 		}
 		if (rt->map != m->checkpoint)
@@ -897,7 +850,7 @@ collect_checkpoint(S3Manifest *m, S3Manifest *r, HTAB *dropped, HTAB *deleted)
 		if (rt == NULL)
 		{
 			if (tree->key.datoid != SYS_TREES_DATOID)
-				note_dropped(dropped, &tree->key, tree->map);
+				note_dropped(dropped, &tree->key);
 			continue;
 		}
 		if (rt->map != tree->map)
@@ -1076,37 +1029,64 @@ delete_chunks_below(TimeLineID tli, XLogRecPtr below)
 }
 
 /*
- * Remove a dropped tree: its parts (as many as its last map handed out), its
- * maps and its GC state.
+ * Whether a checkpoint from `from` through `committed` names the tree: a tree
+ * that has the relnode again (OIDs wrapped around) has the dropped one's
+ * keys, and is left, with whatever the dropped one left under them.
  */
-static int
-collect_dropped_tree(DroppedTree *d)
+static bool
+tree_named(S3ManifestTreeKey *key, uint32 from, uint32 committed, HTAB **named)
 {
-	uint64		nextPart = 0;
-	int			removed = 0;
-	ListCell   *lc;
-
-	if (tree_next_part(d->key.datoid, d->key.relnode, d->lastMap, &nextPart))
+	if (*named == NULL)
 	{
-		for (uint64 p = 0; p < nextPart; p++)
+		HASHCTL		ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(S3ManifestTreeKey);
+		ctl.entrysize = sizeof(S3ManifestTreeKey);
+		ctl.hcxt = CurrentMemoryContext;
+		*named = hash_create("orioledb s3 gc named trees", 64, &ctl,
+							 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		for (uint32 k = Max(from, 1); k <= committed; k++)
 		{
-			char	   *key = part_key(d->key.datoid, d->key.relnode, p);
+			S3Manifest *m = s3_manifest_fetch(k);
+			HASH_SEQ_STATUS seq;
+			S3ManifestTree *t;
 
-			gc_check_stop();
-
-			gc_delete(key);
-			pfree(key);
-			removed++;
+			if (m == NULL)
+				continue;
+			hash_seq_init(&seq, m->trees);
+			while ((t = hash_seq_search(&seq)) != NULL)
+				(void) hash_search(*named, &t->key, HASH_ENTER, NULL);
+			s3_manifest_free(m);
 		}
 	}
-	else
-		ereport(LOG,
-				(errmsg("S3 GC could not read the last map of dropped tree %u/%u",
-						d->key.datoid, d->key.relnode)));
-	foreach(lc, d->maps)
-		delete_map(d->key.datoid, d->key.relnode, (uint32) lfirst_int(lc));
-	state_drop(d->key.datoid, d->key.relnode);
-	s3_tree_lists_unlink(d->key.datoid, d->key.relnode);
+	return hash_search(*named, key, HASH_FIND, NULL) != NULL;
+}
+
+/*
+ * Remove a dropped tree: every object under its prefix (its parts, maps and
+ * GC state, those of a run that crashed before naming them too), and its
+ * local GC files.
+ */
+static int
+collect_dropped_tree(S3ManifestTreeKey *key)
+{
+	char	   *prefix = psprintf("trees/%u/%u/", key->datoid, key->relnode);
+	List	   *keys = s3_list_objects(prefix, NULL);
+	ListCell   *lc;
+	int			removed = 0;
+
+	foreach(lc, keys)
+	{
+		gc_check_stop();
+		gc_delete((char *) lfirst(lc));
+		if (strstr((char *) lfirst(lc), "/parts/") != NULL)
+			removed++;
+	}
+	list_free_deep(keys);
+	pfree(prefix);
+	state_drop(key->datoid, key->relnode);
+	s3_tree_lists_unlink(key->datoid, key->relnode);
 	return removed;
 }
 
@@ -1163,9 +1143,6 @@ collect_abandoned_trees(uint32 r, uint32 committed)
 	{
 		S3DroppedTree rec;
 		S3ManifestTreeKey key;
-		char	   *prefix;
-		List	   *keys;
-		ListCell   *lc;
 
 		memcpy(&rec, data + pos, sizeof(rec));
 		gc_check_stop();
@@ -1186,49 +1163,12 @@ collect_abandoned_trees(uint32 r, uint32 committed)
 			s3_local_lists_unlock(lock);
 			continue;
 		}
-		if (named == NULL)
-		{
-			HASHCTL		ctl;
-
-			memset(&ctl, 0, sizeof(ctl));
-			ctl.keysize = sizeof(S3ManifestTreeKey);
-			ctl.entrysize = sizeof(S3ManifestTreeKey);
-			ctl.hcxt = CurrentMemoryContext;
-			named = hash_create("orioledb s3 gc named trees", 64, &ctl,
-								HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-			for (uint32 k = Max(r, 1); k <= committed; k++)
-			{
-				S3Manifest *m = s3_manifest_fetch(k);
-				HASH_SEQ_STATUS seq;
-				S3ManifestTree *t;
-
-				if (m == NULL)
-					continue;
-				hash_seq_init(&seq, m->trees);
-				while ((t = hash_seq_search(&seq)) != NULL)
-					(void) hash_search(named, &t->key, HASH_ENTER, NULL);
-				s3_manifest_free(m);
-			}
-		}
 		memset(&key, 0, sizeof(key));
 		key.datoid = rec.datoid;
 		key.relnode = rec.relnode;
-		if (hash_search(named, &key, HASH_FIND, NULL) != NULL)
+		if (tree_named(&key, r, committed, &named))
 			continue;
-
-		prefix = psprintf("trees/%u/%u/", rec.datoid, rec.relnode);
-		keys = s3_list_objects(prefix, NULL);
-		foreach(lc, keys)
-		{
-			gc_check_stop();
-			gc_delete((char *) lfirst(lc));
-			if (strstr((char *) lfirst(lc), "/parts/") != NULL)
-				removed++;
-		}
-		list_free_deep(keys);
-		pfree(prefix);
-		state_drop(rec.datoid, rec.relnode);
-		s3_tree_lists_unlink(rec.datoid, rec.relnode);
+		removed += collect_dropped_tree(&key);
 	}
 	gc_flush();
 	(void) unlink(taken);
@@ -1418,7 +1358,8 @@ s3_gc_cycle(void)
 		if (rm != NULL && rm->checkpoint > Max(collected, 1))
 		{
 			HTAB	   *dropped,
-					   *deleted;
+					   *deleted,
+					   *named = NULL;
 			S3Manifest *first = NULL;
 			DroppedTree *d;
 
@@ -1453,7 +1394,18 @@ s3_gc_cycle(void)
 
 			hash_seq_init(&seq, dropped);
 			while ((d = hash_seq_search(&seq)) != NULL)
-				removed += collect_dropped_tree(d);
+			{
+				if (tree_named(&d->key, rk + 1, committed, &named))
+				{
+					ereport(LOG,
+							(errmsg("S3 GC leaves dropped tree %u/%u: a tree has its relnode again",
+									d->key.datoid, d->key.relnode)));
+					continue;
+				}
+				removed += collect_dropped_tree(&d->key);
+			}
+			if (named)
+				hash_destroy(named);
 
 			if (first != NULL)
 			{

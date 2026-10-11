@@ -2026,6 +2026,61 @@ class S3Test(S3BaseTest):
 			new_node.stop()
 			new_node.cleanup()
 
+	def test_s3_gc_removes_every_object_of_a_dropped_tree(self):
+		"""A tree dropped by a writer whose GC never ran goes whole under the
+		writer that takes the bucket over, which knows of the drop only from
+		the manifests: the maps and parts no manifest named (a run that
+		crashed before its checkpoint put them) go with the ones they
+		named."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("orioledb.s3_gc_interval = 0\n")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE kept (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO kept SELECT generate_series(1, 100);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		before = {k.rsplit('/', 2)[0] for k in self.part_etags()}
+		node.safe_psql("""
+			CREATE TABLE dropped (id int PRIMARY KEY, pad text) USING orioledb;
+			INSERT INTO dropped SELECT g, repeat('d', 200) FROM generate_series(1, 20000) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		trees = {k.rsplit('/', 2)[0] for k in self.part_etags()} - before
+		self.assertTrue(trees)
+		for tree in trees:
+			self.client.put_object(Bucket=self.bucket_name,
+			                       Key=f"{tree}/maps/999-999", Body=b"x")
+			self.client.put_object(Bucket=self.bucket_name,
+			                       Key=f"{tree}/parts/999999", Body=b"x")
+		node.safe_psql("DROP TABLE dropped;")
+		node.safe_psql("CHECKPOINT;")
+		node.safe_psql("CHECKPOINT;")
+		node.stop()
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.append_conf("""
+				orioledb.s3_gc_interval = 1
+				orioledb.s3_gc_keep_checkpoints = 1
+			""")
+			new_node.start()
+			deadline = time.time() + 90
+			while time.time() < deadline and \
+			    any(self.all_keys(f"{tree}/parts/0") for tree in trees):
+				new_node.safe_psql("CHECKPOINT;")
+				time.sleep(1)
+			time.sleep(2)
+			self.assertEqual(
+			    [], [k for tree in trees for k in self.all_keys(f"{tree}/")])
+			self.assertEqual([(100, )],
+			                 new_node.execute("SELECT count(*) FROM kept"))
+			new_node.stop()
+			new_node.cleanup()
+
 	def all_keys(self, prefix=''):
 		keys = []
 		paginator = self.client.get_paginator('list_objects_v2')
