@@ -552,7 +552,13 @@ class S3Test(S3BaseTest):
 		self.assertEqual([(1000, )], node.execute("SELECT count(*) FROM o_test"))
 		node.stop()
 
-	def crash_while_uploading(self, flaky):
+	def local_checkpoint_number(self, node):
+		"""lastCheckpointNumber of the local OrioleDB control file."""
+		with open(os.path.join(node.data_dir, 'orioledb_data', 'control'),
+		          'rb') as f:
+			return struct.unpack('<QI', f.read(12))[1]
+
+	def crash_while_uploading(self, flaky, before_control=False):
 		"""Crash while a checkpoint waits for uploads that `flaky` refuses,
 		restart, checkpoint, and return the rows of a node loaded from the
 		bucket."""
@@ -572,6 +578,7 @@ class S3Test(S3BaseTest):
 			INSERT INTO o_test SELECT generate_series(1001, 2000);
 			INSERT INTO h_test SELECT generate_series(1001, 2000);
 		""")
+		before = self.local_checkpoint_number(node)
 		with patch('moto.s3.responses.S3Response.put_object',
 		           new=lambda response: flaky(response)):
 			checkpoint = Thread(target=lambda: node.execute("CHECKPOINT;"))
@@ -581,6 +588,10 @@ class S3Test(S3BaseTest):
 			while flaky.failed < 3 and time.time() < deadline:
 				time.sleep(0.2)
 			self.assertGreaterEqual(flaky.failed, 3)
+			# parts: the checkpoint waits for them before its local control
+			for _ in range(15 if before_control else 0):
+				self.assertEqual(before, self.local_checkpoint_number(node))
+				time.sleep(0.2)
 			node.stop(['-m', 'immediate'])
 			checkpoint.join(10)
 		node.start()
@@ -603,7 +614,8 @@ class S3Test(S3BaseTest):
 		after a restart the flags that would upload them are gone, and the
 		next checkpoint commits a bucket naming parts that were never up."""
 		self.assertEqual((2000, 2000),
-		                 self.crash_while_uploading(FlakyPutObject(10**9)))
+		                 self.crash_while_uploading(FlakyPutObject(10**9),
+		                                            before_control=True))
 
 	def test_s3_crash_while_pg_files_upload(self):
 		"""The same for the PostgreSQL files of a checkpoint."""
