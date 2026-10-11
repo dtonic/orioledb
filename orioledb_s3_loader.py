@@ -644,6 +644,16 @@ class OrioledbS3ObjectLoader:
 		with open(os.path.join(self.data_dir, 'orioledb_data', 's3_manifest'),
 		          'wb') as f:
 			f.write(manifest_body)
+		# the trees the writer dropped and had not removed: this data
+		# directory's GC removes them once a checkpoint after this one is
+		# committed (S3DroppedTree: checkpoint, datoid, relnode)
+		dropped = [line.split()[1:] for line in manifest_body.decode().splitlines()
+		           if line.startswith('dropped ')]
+		with open(os.path.join(self.data_dir, 'orioledb_data',
+		                       's3_dropped_trees'), 'wb') as f:
+			for datoid, relnode in dropped:
+				f.write(struct.pack('<III', self.chkp_num, int(datoid),
+				                    int(relnode)))
 		if self.as_of is not None:
 			# an older state than the bucket's: it may only be read
 			with open(os.path.join(self.data_dir, 'orioledb_data', 's3_as_of'),

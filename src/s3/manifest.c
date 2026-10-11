@@ -625,6 +625,32 @@ undo_suffix(UndoLogType type)
 	}
 }
 
+
+/*
+ * The trees dropped and not removed yet: the local list and the one the GC
+ * took aside.  A tree built and dropped between two manifests is named by
+ * none; carried here, a data directory loaded from this checkpoint notes it
+ * again, and the writer that takes the bucket over removes it.
+ */
+static void
+add_dropped_trees(StringInfo body)
+{
+	const char *files[] = {S3_DROPPED_TREES_FILE, S3_DROPPED_TREES_FILE ".gc"};
+	int			lock = s3_local_lists_lock();
+
+	for (int i = 0; i < lengthof(files); i++)
+	{
+		int			fd = BasicOpenFile(files[i], O_RDONLY | PG_BINARY);
+		S3DroppedTree rec;
+
+		if (fd < 0)
+			continue;
+		while (read(fd, &rec, sizeof(rec)) == sizeof(rec))
+			appendStringInfo(body, "dropped %u %u\n", rec.datoid, rec.relnode);
+		close(fd);
+	}
+	s3_local_lists_unlock(lock);
+}
 /*
  * The checkpoint's PG file backup is done: write its manifest.
  */
@@ -747,6 +773,7 @@ s3_manifest_prepare(uint32 chkpNum, int bundles)
 		appendStringInfo(&body, "tree %u %u %u %u\n", tree->key.datoid,
 						 tree->key.relnode, tree->spcoid, tree->map);
 	hash_destroy(trees);
+	add_dropped_trees(&body);
 
 	/* PG files, and the checkpoints whose small file bundles are read */
 	memset(&ctl, 0, sizeof(ctl));

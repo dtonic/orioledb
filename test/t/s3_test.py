@@ -3418,6 +3418,61 @@ class S3Test(S3BaseTest):
 			new_node.stop()
 			new_node.cleanup()
 
+	def test_s3_gc_after_a_takeover_removes_an_aborted_build(self):
+		"""A build rolled back between two checkpoints leaves a tree no
+		manifest names.  Its writer stops before its GC removes it; the
+		manifest carries the drop, and the writer that takes the bucket
+		over removes what the build put up."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			orioledb.s3_gc_interval = 0
+			orioledb.main_buffers = 8MB
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, v int, pad text) USING orioledb;
+			INSERT INTO o_test SELECT g, 0, repeat('x', 200) FROM generate_series(1, 30000) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		before = self.part_relnodes()
+		con = node.connect()
+		con.begin()
+		con.execute("CREATE INDEX o_test_v ON o_test (v, pad);")
+		deadline = time.time() + 60
+		while time.time() < deadline and not self.part_relnodes() - before:
+			time.sleep(0.5)
+		built = self.part_relnodes() - before
+		self.assertTrue(built)
+		con.rollback()
+		con.close()
+		node.safe_psql("CHECKPOINT;")
+		node.stop()
+
+		def left():
+			return [k for k in self.all_keys('trees/') if k.split('/')[2] in built]
+
+		self.assertTrue(left())
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.append_conf("""
+				orioledb.s3_gc_interval = 1
+				orioledb.s3_gc_keep_checkpoints = 1
+				orioledb.main_buffers = 8MB
+			""")
+			new_node.start()
+			deadline = time.time() + 90
+			while time.time() < deadline and left():
+				new_node.safe_psql("CHECKPOINT;")
+				time.sleep(1)
+			self.assertEqual([], left())
+			self.assertEqual([(30000, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
+
 	def test_s3_gc_removes_build_parts(self):
 		"""A tree build says where its parts end, so once every block of one
 		is dead the part goes like any other."""
