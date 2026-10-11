@@ -27,7 +27,7 @@ from .s3_base_test import S3BaseTest, s3_test_attrs, mock_put_object, \
  orig_put_object, \
  mock_put_object_conflict, mock_moto_unkown_error, FlakyPutObject, \
  RevokedKeyPut, AmbiguousPut, HoldChunksOf, HoldFirstGet, ConflictingPut, \
- FailingGet, RevokedKey, orig_get_object, orig_list_objects_v2
+ FailingGet, RevokedKey, orig_get_object, orig_list_objects_v2, FailingDelete
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
@@ -2349,6 +2349,33 @@ class S3Test(S3BaseTest):
 			self.assertEqual(set(), first & set(self.part_etags()))
 			self.assert_bucket_restores(b, [(30000, 30000)])
 			b.cleanup()
+
+	def test_s3_gc_goes_through_failing_deletes(self):
+		"""DELETEs the store fails are put again until they go: the parts
+		the GC removes are gone in the end, and the rest restores."""
+		node = self.gc_world()
+		first = self.part_etags()
+		failing = FailingDelete(20)
+		with patch('moto.s3.responses.S3Response.delete_object',
+		           new=lambda response: failing(response)):
+			for v in range(1, 4):
+				node.safe_psql(f"UPDATE o_test SET v = {v};")
+				node.safe_psql("CHECKPOINT;")
+			self.assertTrue(self.wait_for_gc(first))
+			deadline = time.time() + 60
+			while time.time() < deadline and failing.failed < failing.failures:
+				node.safe_psql("CHECKPOINT;")
+				time.sleep(1)
+		self.assertEqual(failing.failures, failing.failed)
+		tree = self.primary_relnode(node)
+		deadline = time.time() + 60
+		while time.time() < deadline and \
+		    {k for k in first if k.split('/')[2] == tree} & set(self.part_etags()):
+			node.safe_psql("CHECKPOINT;")
+			time.sleep(1)
+		self.assertEqual(set(), {k for k in first if k.split('/')[2] == tree} &
+		                 set(self.part_etags()))
+		self.assert_bucket_restores(node, [(30000, 90000)])
 
 	def test_s3_gc_spares_a_reader_pin(self):
 		"""A reader's pin keeps the GC below the checkpoint it opened."""

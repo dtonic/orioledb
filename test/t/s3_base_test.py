@@ -45,6 +45,7 @@ def s3_test_attrs(**_):
 orig_put_object = S3Response.put_object
 orig_get_object = S3Response.get_object
 orig_list_objects_v2 = S3Response.list_objects_v2
+orig_delete_object = S3Response.delete_object
 
 
 # moto[s3] doesn't implement 409 HTTP error code therefore we need to do that
@@ -227,6 +228,29 @@ class FailingGet:
 			self.failed += 1
 			raise TransientServerError()
 		return orig_get_object(response)
+
+
+class FailingDelete:
+	"""
+	A delete_object() that answers the first `failures` DELETEs of keys
+	holding `contains` with 503, removing nothing.
+	"""
+
+	def __init__(self, failures, contains='/parts/'):
+		self.failures = failures
+		self.contains = contains
+		self.failed = 0
+		self.lock = threading.Lock()
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		if self.contains in response.parse_key_name():
+			with self.lock:
+				fail = self.failed < self.failures
+				if fail:
+					self.failed += 1
+			if fail:
+				raise TransientServerError()
+		return orig_delete_object(response)
 
 
 class HoldFirstGet:
