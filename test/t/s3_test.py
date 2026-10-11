@@ -728,6 +728,63 @@ class S3Test(S3BaseTest):
 				result[obj["Key"]] = obj["ETag"]
 		return result
 
+	def test_s3_reader_writes_nothing_from_start_to_stop(self):
+		"""Across its start, the replay of the bucket's WAL, a restartpoint,
+		a restart and its stop, a reader changes no object but its pin."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.main_buffers = 8MB
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, pad text) USING orioledb;
+			INSERT INTO o_test SELECT g, repeat('x', 500) FROM generate_series(1, 20000) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		node.safe_psql("UPDATE o_test SET pad = 'y' WHERE id % 7 = 0;")
+		node.stop(['-m', 'immediate'])
+
+		def bucket():
+			result = {}
+			paginator = self.client.get_paginator('list_objects_v2')
+			for page in paginator.paginate(Bucket=self.bucket_name):
+				for obj in page.get("Contents", []):
+					result[obj["Key"]] = obj["ETag"]
+			return result
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as reader:
+			self.loader.download(reader.data_dir)
+			reader.append_conf(port=reader.port)
+			reader.append_conf("""
+				orioledb.s3_reader = on
+				hot_standby = on
+				orioledb.main_buffers = 8MB
+			""")
+			open(os.path.join(reader.data_dir, "standby.signal"), "w").close()
+			before = bucket()
+			for _ in range(2):
+				reader.start()
+				deadline = time.time() + 60
+				count = None
+				while time.time() < deadline and count != [(20000, 2857)]:
+					try:
+						count = reader.execute(
+						    "SELECT count(*), count(*) FILTER (WHERE pad = 'y') FROM o_test")
+					except Exception:
+						pass
+					time.sleep(0.5)
+				self.assertEqual([(20000, 2857)], count)
+				reader.safe_psql("CHECKPOINT;")
+				reader.stop()
+			after = bucket()
+			changed = {k for k in set(before) | set(after)
+			           if before.get(k) != after.get(k)}
+			self.assertEqual({'readers'}, changed)
+			reader.cleanup()
+
 	def test_s3_reader_reads_without_writing(self):
 		"""A reader opens what the bucket holds, as a hot standby on a data
 		directory the loader made, and writes nothing to the bucket while the
@@ -2109,6 +2166,56 @@ class S3Test(S3BaseTest):
 				old.cleanup()
 			b.cleanup()
 
+	def test_s3_gc_goes_on_from_a_tree_state_folded_before_a_takeover(self):
+		"""The old writer's GC folded the blocks that died in the first half
+		of a table and removed those dead lists; the part the boundary falls
+		in is half dead.  The writer that takes over kills the second half:
+		its GC finds the first half's blocks in the tree state the bucket
+		keeps, and removes that part too."""
+		node = self.gc_world()
+		first = {k for k in self.part_etags()
+		         if k.split('/')[2] == self.primary_relnode(node)}
+		self.assertTrue(first)
+		node.safe_psql("UPDATE o_test SET v = 1 WHERE id <= 15000;")
+		node.safe_psql("CHECKPOINT;")
+		half = int(self.kv('root')['checkpoint'])
+		for _ in range(2):
+			node.safe_psql("CHECKPOINT;")
+		deadline = time.time() + 60
+		while time.time() < deadline and int(self.kv('gc').get('folded', 0)) < half:
+			node.safe_psql("CHECKPOINT;")
+			time.sleep(1)
+		self.assertGreaterEqual(int(self.kv('gc')['folded']), half)
+		# the parts of the first half go; the one the boundary falls in is
+		# half dead, and stays with the second half
+		deadline = time.time() + 60
+		while time.time() < deadline and first == first & set(self.part_etags()):
+			time.sleep(1)
+		left = first & set(self.part_etags())
+		self.assertTrue(left)
+		self.assertNotEqual(first, left)
+		node.stop()
+		self.assertTrue(self.all_keys('trees/') and
+		                [k for k in self.all_keys('trees/') if k.endswith('/gc')])
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as b:
+			self.loader.download(b.data_dir)
+			b.append_conf(port=b.port)
+			b.append_conf("""
+				orioledb.s3_gc_interval = 1
+				orioledb.s3_gc_keep_checkpoints = 1
+				orioledb.main_buffers = 8MB
+			""")
+			b.start()
+			b.safe_psql("UPDATE o_test SET v = 1 WHERE id > 15000;")
+			deadline = time.time() + 90
+			while time.time() < deadline and first & set(self.part_etags()):
+				b.safe_psql("CHECKPOINT;")
+				time.sleep(1)
+			self.assertEqual(set(), first & set(self.part_etags()))
+			self.assert_bucket_restores(b, [(30000, 30000)])
+			b.cleanup()
+
 	def test_s3_gc_spares_a_reader_pin(self):
 		"""A reader's pin keeps the GC below the checkpoint it opened."""
 		node = self.gc_world()
@@ -3176,6 +3283,35 @@ class S3Test(S3BaseTest):
 			except Exception:
 				pass
 			copy.cleanup()
+
+	def test_s3_restart_keeps_the_chunk_across_a_segment_end(self):
+		"""The last chunk a clean stop puts up reaches past the end of a
+		segment that is archived.  The next run must keep it: the restore
+		of the next segment reads its start from it."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, pad text) USING orioledb;
+		""")
+		node.safe_psql("INSERT INTO o_test SELECT g, md5(g::text) FROM generate_series(1, 300000) g;")
+		node.stop()
+		# segments archived, the last chunk past the end of one of them
+		self.assertTrue([k for k in self.all_keys('wal/0') if len(k) == 28])
+		node.start()
+		# the shipper's GC of what the last run left comes round
+		time.sleep(14)
+		node.stop(['-m', 'immediate'])
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual([(300000, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			new_node.stop()
+			new_node.cleanup()
 
 	def test_s3_restore_lists_the_chunks_once(self):
 		"""A recovery asks restore_command for its segments in order.  Each

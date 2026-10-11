@@ -1079,9 +1079,9 @@ recovered_delete(TimeLineID tli, uint64 from, uint64 to)
 
 /*
  * Whether a recovered chunk may go: its WAL is in archived segments.  A chunk
- * that is gone was removed as such.  A terminator is passed over (the
- * chunks after it may go) but stays: removed, its key would be free for the
- * writer it fenced (recovered_delete).  The chunks' ends do not grow
+ * that is gone was removed as such.  A terminator answers as the chunk
+ * before it, and stays: removed, its key would be free for the writer it
+ * fenced (recovered_delete).  The chunks' ends do not grow
  * with their numbers across a restart (a run ships again from where its
  * recovery ended), but a chunk whose WAL is archived has every chunk before
  * it holding archived WAL or WAL no restore reads (a later chunk wins where
@@ -1092,11 +1092,22 @@ recovered_archived(TimeLineID tli, uint64 seq)
 {
 	ChunkHeader header;
 
-	if (!read_chunk_header(tli, seq, &header))
-		return true;
-	if (header.magic != CHUNK_MAGIC)
-		return true;
-	return chunk_archived(tli, header.startLsn, header.endLsn);
+	for (;;)
+	{
+		if (!read_chunk_header(tli, seq, &header))
+			return true;
+		if (header.magic == CHUNK_MAGIC)
+			return chunk_archived(tli, header.startLsn, header.endLsn);
+
+		/*
+		 * A terminator answers as the chunk before it: every start puts one
+		 * right after the last chunk, which may reach into a segment not
+		 * archived yet.
+		 */
+		if (seq == recoveredFrom)
+			return true;
+		seq--;
+	}
 }
 
 /*
