@@ -1267,6 +1267,34 @@ class S3Test(S3BaseTest):
 		return sorted(k for k in keys if '/chunks/' in k and
 		              (terminators or k not in marks))
 
+	def chunk_ranges(self, keys=None):
+		"""[start, end) of WAL chunks, by key."""
+		result = {}
+		for k in self.chunk_keys() if keys is None else keys:
+			try:
+				head = self.client.get_object(Bucket=self.bucket_name, Key=k,
+				                              Range='bytes=0-31')['Body'].read()
+			except self.client.exceptions.NoSuchKey:
+				continue
+			_, _, _, start, end = struct.unpack('<IIQQQ', head)
+			result[k] = (start, end)
+		return result
+
+	def assert_removed_chunks_archived(self, ranges, seg_size=16 * 1024 * 1024):
+		"""Every chunk of ranges the bucket no longer has held WAL that
+		archived segments hold, its start and its end alike."""
+		present = set(self.chunk_keys())
+		segments = {k.split('/')[-1] for k in self.all_keys('wal/')
+		            if re.fullmatch(r'wal/[0-9A-F]{24}', k)}
+		for key, (start, end) in ranges.items():
+			if key in present:
+				continue
+			tli = int(key.split('/')[1], 16)
+			for lsn in (start, end - 1):
+				seg = lsn // seg_size
+				name = f"{tli:08X}{seg // 256:08X}{seg % 256:08X}"
+				self.assertIn(name, segments, f"{key} {start:X}-{end:X} removed")
+
 	def test_s3_gc_removes_chunks_when_segments_are_not_archived(self):
 		"""With archiving off no segment is archived, so the shipper keeps
 		every chunk; the GC removes the ones before the segment of R's REDO,
@@ -1637,12 +1665,14 @@ class S3Test(S3BaseTest):
 			    "SELECT pg_walfile_name(pg_current_wal_lsn());")[0][0]
 			node.safe_psql("SELECT pg_switch_wal();")
 			self.wait_for_object(f'wal/{wal_file}')
-		shipped = len(self.chunk_keys())
+		ranges = self.chunk_ranges()
+		shipped = len(ranges)
 		node.safe_psql("INSERT INTO o_test VALUES (6);")
 		deadline = time.time() + 60
 		while time.time() < deadline and len(self.chunk_keys()) >= shipped:
 			time.sleep(1)
 		self.assertLess(len(self.chunk_keys()), shipped)
+		self.assert_removed_chunks_archived(ranges)
 		node.stop(['-m', 'immediate'])
 
 		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
@@ -1693,11 +1723,13 @@ class S3Test(S3BaseTest):
 				keys = set(self.chunk_keys())
 				if early is None:
 					early = keys or None
+					early_ranges = self.chunk_ranges(keys)
 					continue
 				# the chunks seen first are gone while commits still come
 				removed = not early & keys
 				self.assertIsNone(bench.poll())
 			self.assertTrue(removed)
+			self.assert_removed_chunks_archived(early_ranges)
 		finally:
 			bench.kill()
 			bench.wait()
@@ -3298,11 +3330,13 @@ class S3Test(S3BaseTest):
 		""")
 		node.safe_psql("INSERT INTO o_test SELECT g, md5(g::text) FROM generate_series(1, 300000) g;")
 		node.stop()
+		ranges = self.chunk_ranges()
 		# segments archived, the last chunk past the end of one of them
 		self.assertTrue([k for k in self.all_keys('wal/0') if len(k) == 28])
 		node.start()
 		# the shipper's GC of what the last run left comes round
 		time.sleep(14)
+		self.assert_removed_chunks_archived(ranges)
 		node.stop(['-m', 'immediate'])
 		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
 			self.loader.download(new_node.data_dir)
