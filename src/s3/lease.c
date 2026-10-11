@@ -375,7 +375,8 @@ lease_cas(const char *key, StringInfo body, const char *ifMatch,
 	long		code;
 	uint64		curToken;
 	uint32		curAttempt;
-	char		curOwner[OWNER_LEN];
+	char		curOwner[OWNER_LEN],
+				curEtag[S3_ETAG_LEN];
 	bool		parsed;
 
 	initStringInfo(&resp);
@@ -402,7 +403,12 @@ lease_cas(const char *key, StringInfo body, const char *ifMatch,
 		code != S3_RESPONSE_CONDITION_FAILED)
 		return CAS_ERROR;
 
-	code = lease_get(key, current, etag, NULL);
+	/*
+	 * The ETag read back is ours only while the object is: handed to a writer
+	 * that lost it, a later If-Match (the release at stop) would overwrite
+	 * the new writer's object.
+	 */
+	code = lease_get(key, current, curEtag, NULL);
 	if (code == S3_RESPONSE_NOT_FOUND)
 		return ifMatch ? CAS_LOST : CAS_UNKNOWN;
 	if (code != S3_RESPONSE_OK)
@@ -429,6 +435,7 @@ lease_cas(const char *key, StringInfo body, const char *ifMatch,
 
 	if (!parsed || curToken != token || strcmp(curOwner, owner) != 0)
 		return CAS_LOST;
+	strlcpy(etag, curEtag, S3_ETAG_LEN);
 	return curAttempt == attempt ? CAS_DONE : CAS_STALE;
 }
 
