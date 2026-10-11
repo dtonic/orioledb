@@ -777,18 +777,34 @@ class OrioledbS3ObjectLoader:
 		    for key in self.list_objects(self.bucket_name, prefix, start_after)
 		    if re.match(r'.*/chunks/\d+$', key))
 
+	def chunk_head(self, tli, seq):
+		"""The 32-byte header of a chunk, from the cache or a ranged GET;
+		None when the bucket does not have it."""
+		path = os.path.join(self.chunk_cache(tli), str(seq))
+		if os.path.exists(path):
+			with open(path, 'rb') as f:
+				return f.read(32)
+		try:
+			return self.s3.get_object(
+			    Bucket=self.bucket_name, Key=self.chunk_key(tli, seq),
+			    Range='bytes=0-31')['Body'].read()
+		except ClientError as e:
+			if e.response['Error']['Code'] in ("404", "NoSuchKey"):
+				return None
+			raise
+
 	def first_chunk_seq(self, tli):
 		"""The number of a timeline's first chunk of WAL: every number
-		before it is a terminator (each writer start puts one, and its mark
-		under terminators/ stays)."""
-		prefix = f"wal/{tli:08X}/terminators/"
-		marks = {int(key.rsplit('/', 1)[1])
-		         for key in self.list_objects(self.bucket_name, prefix)
-		         if re.match(r'.*/terminators/\d+$', key)}
+		before it is a terminator (each writer start puts one).  Read from
+		the chunks' own headers: a terminator's mark under terminators/ is
+		put after it, and a crash in between leaves none."""
 		first = 0
-		while first in marks:
+		while True:
+			head = self.chunk_head(tli, first)
+			if head is None or \
+			    struct.unpack('<I', head[0:4])[0] != TERMINATOR_MAGIC:
+				return first
 			first += 1
-		return first
 
 	def chunk_key(self, tli, seq):
 		return os.path.join(self.prefix, f"wal/{tli:08X}/chunks/{seq:020d}")
@@ -869,6 +885,19 @@ class OrioledbS3ObjectLoader:
 			after = self.cached_before(cache, lo, terminators)
 		cached = sorted(int(name) for name in os.listdir(cache)
 		                if name.isdigit())
+		# every chunk up to this one listed was fetched: past it, list again
+		marker = os.path.join(cache, 'listed')
+		listed = None
+		if after is not None and os.path.exists(marker):
+			with open(marker) as f:
+				listed = int(f.read())
+		if listed is None or listed < after:
+			after = None
+
+		def terminator(seq):
+			with open(os.path.join(cache, str(seq)), 'rb') as f:
+				return struct.unpack('<I', f.read(4))[0] == TERMINATOR_MAGIC
+
 		if after is None:
 			seqs = self.chunk_seqs(tli)
 			present = set(seqs)
@@ -876,12 +905,13 @@ class OrioledbS3ObjectLoader:
 				if seq not in present:
 					os.unlink(os.path.join(cache, str(seq)))
 		else:
-			# what is before it puts nothing at lo or after
+			# what is before it puts nothing at lo or after; terminators
+			# stay, as their fences are read again
 			for seq in cached:
-				if seq < after:
+				if seq < after and not terminator(seq):
 					os.unlink(os.path.join(cache, str(seq)))
-			known = [seq for seq in cached if seq > after]
-			seqs = known + self.chunk_seqs(tli, cached[-1])
+			known = [seq for seq in cached if after < seq <= listed]
+			seqs = known + self.chunk_seqs(tli, listed)
 
 		def fetch(seq):
 			path = os.path.join(cache, str(seq))
@@ -902,6 +932,11 @@ class OrioledbS3ObjectLoader:
 
 		with ThreadPoolExecutor(16) as executor:
 			list(executor.map(fetch, seqs))
+		if seqs:
+			tmp = f"{marker}.tmp{os.getpid()}"
+			with open(tmp, 'w') as f:
+				f.write(str(max(seqs[-1], listed or 0)))
+			os.replace(tmp, marker)
 		result = []
 		fence = self.fence_through(terminators, after) \
 		    if after is not None else 0
@@ -971,7 +1006,11 @@ class OrioledbS3ObjectLoader:
 		if data is not None:
 			return bytearray(data)
 		lo, hi = segno * size, (segno + 1) * size
-		seg = bytearray(size)
+		# the segment a stop without the shipper left: what no chunk puts
+		# over it is that run's WAL (and past its end, what the file held,
+		# which recovery reads as the end, as from pg_wal)
+		partial = self.partial_segment(tli, segno)
+		seg = partial if partial is not None else bytearray(size)
 		pos = None
 		start_of = self.timeline_start(tli)
 		if start_of is not None and lo < start_of[1]:
@@ -996,13 +1035,12 @@ class OrioledbS3ObjectLoader:
 				# one before it is missing
 				if first is None:
 					first = self.first_chunk_seq(tli)
-				pos = lo if seq != first else max(start, lo)
-				if pos > lo:
-					# the first chunks of a run whose last shutdown had no
-					# shipper: before them, the segment it left
-					partial = self.partial_segment(tli, segno)
-					if partial is not None:
-						seg = partial
+				pos = lo if seq != first or partial is not None \
+				    else max(start, lo)
+			if start > pos and partial is not None:
+				# what a run whose stop had no shipper wrote before the chunks
+				# of the next: the segment it left has it
+				pos = start
 			if start > pos:
 				# a chunk missing between two that are there: the WAL
 				# after it was acknowledged and is not here; ending the
@@ -1017,7 +1055,7 @@ class OrioledbS3ObjectLoader:
 			a, b = max(start, lo), min(end, hi)
 			seg[a - lo:b - lo] = body[a - start:b - start]
 			pos = end
-		if pos is None:
+		if pos is None and partial is None:
 			return None
 		return seg
 
@@ -1234,14 +1272,17 @@ class ReaderPin:
 		self.edit(None)
 
 	def retain(self):
+		"""The oldest checkpoint the GC keeps whole: R, and what it folded
+		and collected up to."""
 		body = self.loader.read_object('gc')
 		if body is None:
 			return 0
+		kept = 0
 		for line in body.decode().splitlines():
 			key, _, value = line.partition(' ')
-			if key == 'retain':
-				return int(value)
-		return 0
+			if key in ('retain', 'folded', 'collected'):
+				kept = max(kept, int(value))
+		return kept
 
 	def renew(self):
 		while not self.stop.wait(PIN_TTL / 3):
@@ -1335,9 +1376,15 @@ def server_s3_settings(data_dir):
 	    'orioledb.s3_region': 'AWS_DEFAULT_REGION'
 	}
 	found = {}
-	pattern = re.compile(r"(orioledb\.s3_(?:accesskey|secretkey|region))\s*=\s*"
-	                     r"'?([^'\s\"]+)'?")
-	for name in ('postgresql.conf', 'postgresql.auto.conf', 'postmaster.opts'):
+	# a setting starts its line (a commented one does not count); in
+	# postmaster.opts each is one quoted argument
+	in_conf = re.compile(r"^\s*(orioledb\.s3_(?:accesskey|secretkey|region))"
+	                     r"\s*=\s*'?([^'\s\"#]+)'?", re.MULTILINE)
+	in_opts = re.compile(r'"(orioledb\.s3_(?:accesskey|secretkey|region))'
+	                     r'=([^"]+)"')
+	for name, pattern in (('postgresql.conf', in_conf),
+	                      ('postgresql.auto.conf', in_conf),
+	                      ('postmaster.opts', in_opts)):
 		try:
 			with open(os.path.join(data_dir, name)) as f:
 				text = f.read()
