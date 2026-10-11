@@ -66,7 +66,8 @@ class S3Test(S3BaseTest):
 		objects = self.client.list_objects(Bucket=self.bucket_name)
 		objects = objects.get("Contents", [])
 		objects = sorted(
-		    list(x["Key"] for x in objects if '/chunks/' not in x["Key"]))
+		    list(x["Key"] for x in objects if '/chunks/' not in x["Key"] and
+		         '/terminators/' not in x["Key"]))
 		self.assertEqual(objects, [
 		    '5/LICENSE', 'LICENSE', 'root', 'wal/314159', 'wal/926535',
 		    'writer'
