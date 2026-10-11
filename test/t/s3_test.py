@@ -3169,6 +3169,76 @@ class S3Test(S3BaseTest):
 				last.cleanup()
 			copy.cleanup()
 
+	def test_s3_takeover_of_a_writer_stalled_mid_commit(self):
+		"""The writer stalls while a commit waits for its chunk; another data
+		directory loads the bucket and takes it over.  Woken, the old writer
+		acknowledges nothing, stops, and the bucket has the new writer's
+		history alone."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_lease_duration = 15
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, who text) USING orioledb;
+			INSERT INTO o_test SELECT g, 'a' FROM generate_series(1, 10) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		flaky = FlakyPutObject(10**9, contains='/chunks/')
+		done = []
+		with patch('moto.s3.responses.S3Response.put_object',
+		           new=lambda response: flaky(response)):
+			def commit():
+				try:
+					node.safe_psql("INSERT INTO o_test VALUES (11, 'a');")
+					done.append('acked')
+				except Exception:
+					done.append('failed')
+			waiting = Thread(target=commit)
+			waiting.daemon = True
+			waiting.start()
+			deadline = time.time() + 30
+			while flaky.failed == 0 and time.time() < deadline:
+				time.sleep(0.2)
+			self.assertGreater(flaky.failed, 0)
+			pids = [node.pid] + [int(p) for p in os.popen(
+			    f"ps -o pid= --ppid {node.pid}").read().split()]
+			for pid in pids:
+				os.kill(pid, signal.SIGSTOP)
+		# the store serves the old writer's chunk again; it is asleep
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as b:
+			self.loader.download(b.data_dir)
+			b.append_conf(port=b.port)
+			b.start()
+			b.safe_psql("INSERT INTO o_test SELECT g, 'b' FROM generate_series(20, 29) g;")
+			for pid in pids:
+				try:
+					os.kill(pid, signal.SIGCONT)
+				except ProcessLookupError:
+					pass
+			waiting.join(60)
+			self.assertNotEqual(['acked'], done)
+			deadline = time.time() + 60
+			while node.status() == NodeStatus.Running and time.time() < deadline:
+				time.sleep(0.5)
+			self.assertNotEqual(NodeStatus.Running, node.status())
+			b.safe_psql("INSERT INTO o_test VALUES (30, 'b');")
+			b.stop(['-m', 'immediate'])
+
+			with self.initNode(self.getBasePort() + 2, 'tgsc') as last:
+				self.loader.download(last.data_dir)
+				last.append_conf(port=last.port)
+				last.start()
+				self.assertEqual(
+				    [(21, 0)],
+				    last.execute("SELECT count(*), count(*) FILTER (WHERE id = 11) FROM o_test"))
+				last.stop()
+				last.cleanup()
+			b.cleanup()
+
 	def copy_while_stopped(self, node, copy):
 		"""A crash-consistent copy of node's data directory into copy's:
 		the postmaster is stopped first, so no process starts while its
