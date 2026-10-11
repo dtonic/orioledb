@@ -1326,6 +1326,8 @@ s3_gc_cycle(void)
 	retain = committed - s3_gc_keep_checkpoints + 1;
 	if (s3_gc_keep_time > 0)
 		retain = retain_by_time(retain, collected);
+	/* a setting raised keeps more from now on; what is gone stays gone */
+	retain = Max(retain, Max(folded, collected));
 	if (s3_gc_max_pin_lag > 0 && committed > (uint32) s3_gc_max_pin_lag)
 	{
 		pinFloor = committed - s3_gc_max_pin_lag;

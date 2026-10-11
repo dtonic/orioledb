@@ -2252,6 +2252,103 @@ class S3Test(S3BaseTest):
 		                 node.execute("SELECT count(*), sum(v) FROM o_test"))
 		node.stop()
 
+	def test_s3_reader_whose_pin_lapsed_stops(self):
+		"""A reader whose renewals stopped for longer than its pin lives is
+		passed by the GC.  Renewing again, it finds the GC folded or collected
+		past its checkpoint, and stops rather than read parts that are
+		gone."""
+		node = self.gc_world()
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as reader:
+			self.loader.download(reader.data_dir)
+			reader.append_conf(port=reader.port)
+			reader.append_conf("""
+				orioledb.s3_reader = on
+				orioledb.s3_reader_pin_ttl = 30
+				hot_standby = on
+				orioledb.main_buffers = 8MB
+			""")
+			open(os.path.join(reader.data_dir, "standby.signal"), "w").close()
+			reader.start()
+			pinned = int(self.kv('root')['checkpoint'])
+			lease = [int(l.split()[0]) for l in os.popen(
+			    f"ps -o pid=,args= --ppid {reader.pid}").read().splitlines()
+			    if 'orioledb s3 lease' in l]
+			self.assertEqual(1, len(lease))
+			os.kill(lease[0], signal.SIGSTOP)
+			try:
+				# the pin runs out, and the GC goes past it
+				for v in range(1, 4):
+					node.safe_psql(f"UPDATE o_test SET v = {v};")
+					node.safe_psql("CHECKPOINT;")
+				time.sleep(31)
+				deadline = time.time() + 60
+				while time.time() < deadline and \
+				    int(self.kv('gc').get('collected', 0)) <= pinned:
+					node.safe_psql("CHECKPOINT;")
+					time.sleep(1)
+				self.assertGreater(int(self.kv('gc')['collected']), pinned)
+			finally:
+				os.kill(lease[0], signal.SIGCONT)
+			deadline = time.time() + 60
+			while reader.status() == NodeStatus.Running and time.time() < deadline:
+				time.sleep(1)
+			self.assertNotEqual(reader.status(), NodeStatus.Running)
+			with open(reader.pg_log_file) as f:
+				self.assertIn("the S3 GC passed this reader's checkpoint", f.read())
+			reader.cleanup()
+		node.stop()
+
+	def test_s3_reader_refuses_a_checkpoint_the_gc_collected(self):
+		"""R the GC publishes is not the only bound: a GC that keeps more
+		again (a setting raised) publishes an R below what it already
+		collected.  A reader is refused a checkpoint the GC folded or
+		collected past, and the GC publishes no R below them."""
+		node = self.gc_world()
+		for v in range(1, 6):
+			node.safe_psql(f"UPDATE o_test SET v = {v};")
+			node.safe_psql("CHECKPOINT;")
+		deadline = time.time() + 60
+		while time.time() < deadline and int(self.kv('gc').get('collected', 0)) < 4:
+			node.safe_psql("CHECKPOINT;")
+			time.sleep(1)
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as reader:
+			self.loader.download(reader.data_dir)
+			checkpoint = int(self.kv('root')['checkpoint'])
+			# keep every checkpoint from now on
+			node.append_conf(
+			    f"orioledb.s3_gc_keep_checkpoints = {checkpoint}")
+			node.restart()
+			published = self.s3_object('gc')
+			node.safe_psql("CHECKPOINT;")
+			deadline = time.time() + 30
+			while time.time() < deadline and self.s3_object('gc') == published:
+				time.sleep(0.5)
+			gc = self.kv('gc')
+			self.assertGreaterEqual(int(gc['collected']), 4)
+			self.assertGreaterEqual(int(gc['retain']), int(gc['collected']))
+			node.stop()
+			# the reader opens a checkpoint the GC has folded past
+			gc = self.kv('gc')
+			body = ''.join(f"{k} {checkpoint + 1 if k == 'folded' else v}\n"
+			               for k, v in gc.items())
+			self.client.put_object(Bucket=self.bucket_name, Key='gc',
+			                       Body=body.encode())
+			reader.append_conf(port=reader.port)
+			reader.append_conf("""
+				orioledb.s3_reader = on
+				hot_standby = on
+				orioledb.main_buffers = 8MB
+			""")
+			open(os.path.join(reader.data_dir, "standby.signal"), "w").close()
+			try:
+				reader.start()
+			except StartNodeException:
+				pass
+			with open(reader.pg_log_file) as f:
+				self.assertIn(f"the S3 bucket no longer keeps checkpoint {checkpoint}",
+				              f.read())
+			reader.cleanup()
+
 	def test_s3_two_takeovers_one_writer(self):
 		"""Two data directories loaded from the bucket start as writers at
 		once: one takes the bucket, the other is refused, and the bucket has

@@ -1546,25 +1546,23 @@ reader_pin(const char *id, uint32 chkp)
 	}
 }
 
+/*
+ * The oldest checkpoint the GC still keeps whole: R, and the checkpoints it
+ * has folded and collected up to, which a GC that kept more again (a setting
+ * raised) does not bring back.
+ */
 static uint32
-gc_retain(void)
+gc_kept(void)
 {
-	StringInfoData body;
-	char		etag[S3_ETAG_LEN];
-	unsigned int retain = 0;
-	char		value[32];
-	long		code;
+	uint32		retain,
+				folded,
+				collected;
 
-	initStringInfo(&body);
-	code = lease_get(GC_KEY, &body, etag, NULL);
-	if (code == S3_RESPONSE_OK && kv_get(body.data, "retain", value, sizeof(value)))
-		retain = (unsigned int) strtoul(value, NULL, 10);
-	else if (code != S3_RESPONSE_OK && code != S3_RESPONSE_NOT_FOUND)
+	if (!s3_gc_progress(&retain, &folded, &collected))
 		ereport(FATAL,
 				(errcode(ERRCODE_CONNECTION_EXCEPTION),
 				 errmsg("could not read \"%s\" from the S3 bucket", GC_KEY)));
-	pfree(body.data);
-	return retain;
+	return Max(retain, Max(folded, collected));
 }
 
 static char reader_id[64];
@@ -1586,7 +1584,7 @@ reader_pin_and_check(uint32 chkp)
 	snprintf(reader_id, sizeof(reader_id), "%016llx", (unsigned long long) nonce);
 	reader_checkpoint = chkp;
 	reader_pin(reader_id, chkp);
-	retain = gc_retain();
+	retain = gc_kept();
 	if (chkp < retain)
 		ereport(FATAL,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -1613,14 +1611,33 @@ s3_reader_pin_renew(void)
 	reader_pin(reader_id, reader_checkpoint);
 
 	initStringInfo(&body);
-	if (lease_get(GC_KEY, &body, etag, NULL) == S3_RESPONSE_OK &&
-		kv_get(body.data, "pin_warn", value, sizeof(value)) &&
-		reader_checkpoint < (uint32) strtoul(value, NULL, 10))
-		s3_stop_instance("this S3 reader is too far behind the writer",
-						 psprintf("It opened checkpoint %u; the GC is about to "
-								  "pass over pins below %s. Load the data "
-								  "directory from the bucket again.",
-								  reader_checkpoint, value));
+	if (lease_get(GC_KEY, &body, etag, NULL) == S3_RESPONSE_OK)
+	{
+		/*
+		 * The GC passed the pin: it lapsed (renewals failed for longer than
+		 * its time to live), or was below the floor.  What the GC folds and
+		 * collects up to never passes a pin it counted.
+		 */
+		for (int i = 0; i < 2; i++)
+		{
+			const char *name = i == 0 ? "folded" : "collected";
+
+			if (kv_get(body.data, name, value, sizeof(value)) &&
+				reader_checkpoint < (uint32) strtoul(value, NULL, 10))
+				s3_stop_instance("the S3 GC passed this reader's checkpoint",
+								 psprintf("It opened checkpoint %u; the GC has %s "
+										  "checkpoints up to %s. Load the data "
+										  "directory from the bucket again.",
+										  reader_checkpoint, name, value));
+		}
+		if (kv_get(body.data, "pin_warn", value, sizeof(value)) &&
+			reader_checkpoint < (uint32) strtoul(value, NULL, 10))
+			s3_stop_instance("this S3 reader is too far behind the writer",
+							 psprintf("It opened checkpoint %u; the GC is about to "
+									  "pass over pins below %s. Load the data "
+									  "directory from the bucket again.",
+									  reader_checkpoint, value));
+	}
 	pfree(body.data);
 }
 
