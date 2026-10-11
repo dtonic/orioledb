@@ -267,6 +267,7 @@ s3_request_is_transient(int sc, long http_code)
 void		(*s3_request_wait_hook) (void) = NULL;
 
 int			s3_auth_retry_time = 300;
+bool		s3_postmaster_retries = false;
 
 /*
  * The S3 bgworkers (lease, GC, S3 workers, WAL shipper) own their reloads:
@@ -539,7 +540,10 @@ s3_request(const char *method, char *objectname,
 		/*
 		 * At startup (the postmaster) an unreachable store is reported at
 		 * once: it is as likely to be a wrong setting as an outage, and the
-		 * service manager restarts us.  A running server waits it out.
+		 * service manager restarts us.  A running server waits it out.  A
+		 * crash restart takes the lease again in the postmaster: a setting
+		 * that worked a moment ago, so a transient failure is retried for
+		 * about a minute rather than end the postmaster.
 		 */
 		/*
 		 * A body the store received cut short (BadDigest, IncompleteBody) was
@@ -558,7 +562,9 @@ s3_request(const char *method, char *objectname,
 		}
 		else
 			authSince = 0;
-		if (!retry || !IsUnderPostmaster || request_deadline_passed() ||
+		if (!retry ||
+			(!IsUnderPostmaster && (!s3_postmaster_retries || attempt >= 6)) ||
+			request_deadline_passed() ||
 			!(s3_request_is_transient(sc, http_code) ||
 			  (authSince != 0 && s3_auth_retry_time > 0 &&
 			   !TimestampDifferenceExceeds(authSince, GetCurrentTimestamp(),
@@ -992,8 +998,8 @@ s3_get_object_etag(char *objectname, StringInfo str, bool missing_ok,
 		else
 			ereport(FATAL, (errcode(ERRCODE_CONNECTION_EXCEPTION),
 							errmsg("could not get object from S3"),
-							errdetail("return code = %d, http code = %ld, response = %s",
-									  sc, http_code, str->data)));
+							errdetail("object \"%s\", return code = %d, http code = %ld, response = %s",
+									  objectname, sc, http_code, str->data)));
 	}
 
 	return http_code;

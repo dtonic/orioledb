@@ -657,31 +657,18 @@ fold_unpublished(HTAB *trees, uint32 k, uint32 committed, List *folded)
 
 /*
  * A tree's map of checkpoint chkp is under the token of the run that did
- * chkp, or of the run after it (a build names its map with the last
- * checkpoint done).
+ * chkp, or of a run after it (a build names its map with the last
+ * checkpoint done): s3_map_tokens().
  */
-static int
-map_tokens(uint32 chkp, uint64 *tokens)
-{
-	int			n = 0;
-
-	if (s3_checkpoint_token_known(chkp + 1, &tokens[n]))
-		n++;
-	if (s3_checkpoint_token_known(chkp, &tokens[n]) &&
-		(n == 0 || tokens[n] != tokens[0]))
-		n++;
-	return n;
-}
-
 static void
 delete_map(Oid datoid, Oid relnode, uint32 chkp)
 {
-	uint64		tokens[2];
+	uint64	   *tokens;
 	int			n;
 
 	if (chkp == 0)
 		return;
-	n = map_tokens(chkp, tokens);
+	n = s3_map_tokens(chkp, &tokens);
 
 	for (int i = 0; i < n; i++)
 	{
@@ -691,6 +678,7 @@ delete_map(Oid datoid, Oid relnode, uint32 chkp)
 		gc_delete(key);
 		pfree(key);
 	}
+	pfree(tokens);
 }
 
 typedef struct
@@ -1274,7 +1262,13 @@ s3_gc_cycle(void)
 		pinWarn = pinFloor + Max(1, s3_gc_max_pin_lag / 4);
 	}
 	s3_gc_publish(retain, folded, collected, pinFloor, pinWarn);
-	r = Min(retain, s3_reader_pins_min(retain, pinFloor));
+	/*
+	 * A pin below what is folded or collected already holds nothing: its
+	 * reader stops at its next renewal.  Counted, a stopped reader's pin
+	 * would hold the GC for the pin's lifetime.
+	 */
+	r = Min(retain, s3_reader_pins_min(retain,
+									   Max(pinFloor, Max(folded, collected))));
 	{
 		uint32		scans = oldest_scan_checkpoint();
 

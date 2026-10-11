@@ -301,41 +301,40 @@ s3_map_object_name(OIndexKey key, uint64 token, uint32 chkpNum)
 /*
  * Fetch the map of checkpoint chkpNum.  It was written by the run that did
  * that checkpoint, or by a run that started after it (a build names its tree's
- * map with the last checkpoint done): the epochs of chkpNum and chkpNum + 1.
- * A run that never completed a checkpoint is not in the epochs, and its maps
- * are not taken.
+ * map with the last checkpoint done): s3_map_tokens().
  */
 static void
 s3_get_map(OIndexKey key, uint32 chkpNum, char *filename)
 {
-	uint64		later,
-				done;
-	bool		haveLater = s3_checkpoint_token_known(chkpNum + 1, &later),
-				haveDone = s3_checkpoint_token_known(chkpNum, &done);
+	uint64	   *tokens;
+	int			n = s3_map_tokens(chkpNum, &tokens);
 	StringInfoData buf;
 	char	   *objectname;
 
+	if (n == 0)
+		elog(ERROR, "no S3 writer token is known for checkpoint %u", chkpNum);
 	initStringInfo(&buf);
-	if (haveLater && (!haveDone || later != done))
+	for (int i = 0; i < n - 1; i++)
 	{
-		objectname = s3_map_object_name(key, later, chkpNum);
+		objectname = s3_map_object_name(key, tokens[i], chkpNum);
+		resetStringInfo(&buf);
 		if (s3_get_object(objectname, &buf, true) == S3_RESPONSE_OK)
 		{
 			elog(DEBUG1, "S3 map get %s %s", objectname, filename);
 			s3_write_file(filename, buf.data, buf.len);
 			pfree(objectname);
 			pfree(buf.data);
+			pfree(tokens);
 			return;
 		}
 		pfree(objectname);
 	}
-	if (!haveDone)
-		done = later;
-	objectname = s3_map_object_name(key, done, chkpNum);
+	objectname = s3_map_object_name(key, tokens[n - 1], chkpNum);
 	elog(DEBUG1, "S3 map get %s %s", objectname, filename);
 	s3_get_file(objectname, filename);
 	pfree(objectname);
 	pfree(buf.data);
+	pfree(tokens);
 }
 
 /*
@@ -1189,9 +1188,18 @@ s3worker_main(Datum main_arg)
 			 * persists (a refused key) would restart the worker at once, over
 			 * and over: a pause bounds that to an attempt a second.
 			 */
-			(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-							 1000L, PG_WAIT_EXTENSION);
-			ResetLatch(MyLatch);
+			TimestampTz until = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 1000);
+			long		left;
+
+			/* a latch set (a reload, a new task) does not cut it short */
+			while ((left = TimestampDifferenceMilliseconds(GetCurrentTimestamp(),
+														   until)) > 0)
+			{
+				(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+								 left, PG_WAIT_EXTENSION);
+				ResetLatch(MyLatch);
+				CHECK_FOR_INTERRUPTS();
+			}
 			s3process_task(workers_locations[worker_num]);
 			workers_locations[worker_num] = InvalidS3TaskLocation;
 		}

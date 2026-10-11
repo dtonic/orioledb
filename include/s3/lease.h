@@ -44,6 +44,7 @@ extern void s3_lease_loaded_done(void);
 extern void s3_stop_instance(const char *message, const char *detail);
 extern uint64 s3_checkpoint_token(uint32 chkpNum);
 extern bool s3_checkpoint_token_known(uint32 chkpNum, uint64 *token);
+extern int	s3_map_tokens(uint32 chkpNum, uint64 **tokens);
 extern void s3_lease_lost(const char *detail);
 extern TimestampTz s3_lease_hold(void);
 extern void s3_root_commit(uint32 checkpointNum, XLogRecPtr redoLsn,

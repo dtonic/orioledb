@@ -68,9 +68,12 @@ PG_FUNCTION_INFO_V1(orioledb_s3_status);
 #define EPOCHS_FILENAME			ORIOLEDB_DATA_DIR "/s3_epochs"
 #define LOADED_FILENAME			ORIOLEDB_DATA_DIR "/s3_loaded"
 #define AS_OF_FILENAME			ORIOLEDB_DATA_DIR "/s3_as_of"
+#define LINEAGE_FILENAME		ORIOLEDB_DATA_DIR "/s3_lineage"
+#define S3_MAX_LINEAGE			64
 #define GC_KEY					"gc"
 #define READERS_KEY				"readers"
 #define S3_MAX_EPOCHS			4096
+#define S3_MAX_SAME_START		64
 #define LEASE_FORMAT			1
 #define S3_ETAG_LEN				256
 #define OWNER_LEN				128
@@ -133,6 +136,8 @@ typedef struct
 	RootBody	root;
 	char		rootEtag[S3_ETAG_LEN];
 	int			numEpochs;
+	int			numLineage;
+	uint64		lineage[S3_MAX_LINEAGE];	/* this directory's runs' tokens */
 	uint32		gcPublished[3];	/* retain, folded, collected */
 	S3Epoch		epochs[S3_MAX_EPOCHS];
 } S3LeaseState;
@@ -536,7 +541,7 @@ read_epochs_file(S3LeaseState *state)
 	{
 		if (state->numEpochs >= S3_MAX_EPOCHS ||
 			(state->numEpochs > 0 &&
-			 state->epochs[state->numEpochs - 1].firstCheckpoint >= first))
+			 state->epochs[state->numEpochs - 1].firstCheckpoint > first))
 			ereport(FATAL,
 					(errmsg("invalid S3 epochs file \"%s\"", EPOCHS_FILENAME)));
 		state->epochs[state->numEpochs].firstCheckpoint = first;
@@ -547,6 +552,55 @@ read_epochs_file(S3LeaseState *state)
 		ereport(FATAL,
 				(errmsg("invalid S3 epochs file \"%s\"", EPOCHS_FILENAME)));
 	FreeFile(f);
+}
+
+/*
+ * The tokens of this data directory's runs, the newest last: the chunks and
+ * terminators any of them put are its own.  A data directory the loader made
+ * starts a lineage of its own.
+ */
+static void
+read_lineage_file(S3LeaseState *state)
+{
+	FILE	   *f;
+	unsigned long long token;
+
+	state->numLineage = 0;
+	f = AllocateFile(LINEAGE_FILENAME, "r");
+	if (f == NULL)
+		return;
+	while (fscanf(f, "%llu", &token) == 1)
+	{
+		if (state->numLineage == S3_MAX_LINEAGE)
+		{
+			memmove(state->lineage, state->lineage + 1,
+					sizeof(uint64) * (S3_MAX_LINEAGE - 1));
+			state->numLineage--;
+		}
+		state->lineage[state->numLineage++] = token;
+	}
+	FreeFile(f);
+}
+
+static void
+write_lineage_file(S3LeaseState *state)
+{
+	char		tmp[MAXPGPATH];
+	StringInfoData buf;
+	int			fd;
+
+	initStringInfo(&buf);
+	for (int i = 0; i < state->numLineage; i++)
+		appendStringInfo(&buf, UINT64_FORMAT "\n", state->lineage[i]);
+	snprintf(tmp, sizeof(tmp), "%s.tmp", LINEAGE_FILENAME);
+	fd = BasicOpenFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+	if (fd < 0 || write(fd, buf.data, buf.len) != buf.len || pg_fsync(fd) != 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", tmp)));
+	close(fd);
+	durable_rename(tmp, LINEAGE_FILENAME, FATAL);
+	pfree(buf.data);
 }
 
 static void
@@ -578,18 +632,41 @@ write_epochs_file(S3LeaseState *state)
 }
 
 /*
- * This run writes the checkpoints after the local one.  Epochs of runs that
- * never completed a checkpoint here are dropped: what they uploaded is not
- * part of anything this data directory goes on from.
+ * This run writes the checkpoints after the local one.  A run that started
+ * at the same checkpoint and never completed one keeps its line, before this
+ * run's: a build it did names its tree's map with the local checkpoint under
+ * its token, and recovery here went on from that map.  Checkpoint numbers
+ * are this run's; only s3_map_tokens() looks at the earlier lines.
  */
 static void
 start_epoch(S3LeaseState *state, uint32 localCheckpoint, uint64 token)
 {
 	uint32		first = localCheckpoint + 1;
 
+	int			same = 0;
+
 	while (state->numEpochs > 0 &&
-		   state->epochs[state->numEpochs - 1].firstCheckpoint >= first)
+		   state->epochs[state->numEpochs - 1].firstCheckpoint > first)
 		state->numEpochs--;
+
+	/*
+	 * A run that crashes again and again before its first checkpoint would
+	 * grow the table without end: keep the newest S3_MAX_SAME_START lines of
+	 * one start.  A build is done by a run that served clients, which a
+	 * crash loop at start does not.
+	 */
+	while (same < state->numEpochs &&
+		   state->epochs[state->numEpochs - 1 - same].firstCheckpoint == first)
+		same++;
+	if (same >= S3_MAX_SAME_START)
+	{
+		int			drop = same - S3_MAX_SAME_START + 1;
+		int			at = state->numEpochs - same;
+
+		memmove(&state->epochs[at], &state->epochs[at + drop],
+				sizeof(S3Epoch) * (same - drop));
+		state->numEpochs -= drop;
+	}
 	if (state->numEpochs >= S3_MAX_EPOCHS)
 		ereport(FATAL,
 				(errmsg("too many S3 writer epochs in \"%s\"", EPOCHS_FILENAME)));
@@ -638,8 +715,10 @@ s3_lease_prune_epochs(uint32 from, const uint32 *refs, int nrefs)
 			i--;
 		if (i >= 0)
 			keep[i] = true;
-		if (i + 1 < lease->numEpochs)
-			keep[i + 1] = true;
+		/* every run that started after refs[r]: s3_map_tokens() */
+		for (int j = i + 1; j < lease->numEpochs &&
+			 lease->epochs[j].firstCheckpoint == lease->epochs[i + 1].firstCheckpoint; j++)
+			keep[j] = true;
 	}
 	for (int i = 0; i < lease->numEpochs; i++)
 		if (keep[i])
@@ -671,6 +750,40 @@ s3_checkpoint_token_known(uint32 chkpNum, uint64 *token)
 	if (locked)
 		LWLockRelease(&lease->lock);
 	return found;
+}
+
+/*
+ * The tokens a tree's map of checkpoint chkpNum may be under, the likeliest
+ * first: the runs that started right after chkpNum, newest first (a build
+ * names its map with the last checkpoint done, and a run that crashed before
+ * its first checkpoint keeps its line), then the run of chkpNum + 1 and the
+ * run of chkpNum.  Returns their number; *tokens is palloc'd.
+ */
+int
+s3_map_tokens(uint32 chkpNum, uint64 **tokens)
+{
+	bool		locked = lock_epochs();
+	int			n = 0;
+	uint64		token;
+
+	*tokens = palloc(sizeof(uint64) * (lease->numEpochs + 2));
+	for (int i = lease->numEpochs - 1; i >= 0; i--)
+		if (lease->epochs[i].firstCheckpoint == chkpNum + 1)
+			(*tokens)[n++] = lease->epochs[i].token;
+	if (locked)
+		LWLockRelease(&lease->lock);
+	for (int pass = 0; pass < 2; pass++)
+	{
+		bool		dup = false;
+
+		if (!s3_checkpoint_token_known(chkpNum + 1 - pass, &token))
+			continue;
+		for (int i = 0; i < n; i++)
+			dup |= (*tokens)[i] == token;
+		if (!dup)
+			(*tokens)[n++] = token;
+	}
+	return n;
 }
 
 /*
@@ -919,7 +1032,8 @@ s3_lease_acquire(void)
 	pm_lease.clockOffset = storageNow - (int64) time(NULL);
 	pm_lease.bucket = bucket;
 	pm_lease.prevToken = local;
-	pm_lease.loaded = access(LOADED_FILENAME, F_OK) == 0;
+	/* a crash restart goes on from this postmaster's own run, loaded or not */
+	pm_lease.loaded = runToken == 0 && access(LOADED_FILENAME, F_OK) == 0;
 	make_owner(pm_lease.owner);
 	pm_lease.token = Max(Max(local, writer.token), root.token) + 1;
 
@@ -937,6 +1051,25 @@ s3_lease_acquire(void)
 		res = lease_cas(WRITER_KEY, &body, writerExists ? writerEtag : NULL,
 						pm_lease.token, pm_lease.owner, newWriter.attempt,
 						false, writerEtag, NULL, &current);
+		if (res == CAS_LOST && runToken != 0)
+		{
+			WriterBody	cur;
+
+			/*
+			 * A crash restart: a renewal the crashed run sent landed in
+			 * between.  The lease is still this postmaster's: go again on it.
+			 */
+			if (parse_writer(current.data, &cur) && cur.token == runToken &&
+				strcmp(cur.owner, runOwner) == 0)
+			{
+				StringInfoData again;
+
+				initStringInfo(&again);
+				writerExists = startup_get(WRITER_KEY, &again, writerEtag, NULL);
+				pfree(again.data);
+				continue;
+			}
+		}
 		if (res == CAS_DONE || res == CAS_LOST || res == CAS_ERROR)
 			break;
 		if (res == CAS_STALE)
@@ -955,6 +1088,23 @@ s3_lease_acquire(void)
 
 	/* the token is ours before root says so: a crash in between keeps it ours */
 	write_token_file(pm_lease.token, bucket);
+	if (pm_lease.loaded)
+		pm_lease.numLineage = 0;
+	else
+	{
+		read_lineage_file(&pm_lease);
+		/* a data directory from before the lineage file: its last run */
+		if (pm_lease.numLineage == 0 && local != 0)
+			pm_lease.lineage[pm_lease.numLineage++] = local;
+	}
+	if (pm_lease.numLineage == S3_MAX_LINEAGE)
+	{
+		memmove(pm_lease.lineage, pm_lease.lineage + 1,
+				sizeof(uint64) * (S3_MAX_LINEAGE - 1));
+		pm_lease.numLineage--;
+	}
+	pm_lease.lineage[pm_lease.numLineage++] = pm_lease.token;
+	write_lineage_file(&pm_lease);
 	read_epochs_file(&pm_lease);
 	start_epoch(&pm_lease, control.lastCheckpointNumber, pm_lease.token);
 	write_epochs_file(&pm_lease);
@@ -996,6 +1146,13 @@ s3_lease_acquire(void)
 	 * the previous run's token.
 	 */
 	s3_wal_place_terminator(pm_lease.token, pm_lease.loaded);
+
+	/*
+	 * The load is taken over: the next start goes on from this run, whether
+	 * or not its shipper ever ran (with shipping off it never does).
+	 */
+	if (pm_lease.loaded)
+		durable_unlink(LOADED_FILENAME, FATAL);
 
 	ereport(LOG,
 			(errmsg("took the S3 writer lease with token " UINT64_FORMAT,
@@ -1085,7 +1242,9 @@ s3_lease_shmem_init(Pointer ptr, bool found)
 		!orioledb_s3_reader)
 	{
 		lease = NULL;
+		s3_postmaster_retries = true;
 		s3_lease_acquire();
+		s3_postmaster_retries = false;
 	}
 	made = true;
 	lease = (S3LeaseState *) ptr;
@@ -1115,19 +1274,19 @@ s3_lease_token(void)
 bool
 s3_lease_own_token(uint64 token)
 {
-	return token == lease->token ||
-		(token == lease->prevToken && !lease->loaded);
+	if (token == lease->token)
+		return true;
+	for (int i = 0; i < lease->numLineage; i++)
+		if (lease->lineage[i] == token)
+			return true;
+	return false;
 }
 
 /* The data directory has gone on from what the loader made. */
 void
 s3_lease_loaded_done(void)
 {
-	if (lease->loaded)
-	{
-		durable_unlink(LOADED_FILENAME, LOG);
-		lease->loaded = false;
-	}
+	lease->loaded = false;
 }
 
 /*
