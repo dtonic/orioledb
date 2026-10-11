@@ -104,14 +104,16 @@ class RevokedKeyPut:
 	others.
 	"""
 
-	def __init__(self, revoked):
+	def __init__(self, revoked, spare=()):
 		self.revoked = revoked
+		self.spare = spare
 		self.refused = 0
 		self.accepted = 0
 
 	def __call__(self, response) -> TYPE_RESPONSE:
 		if f"Credential={self.revoked}/" in response.headers.get(
-		    "Authorization", ""):
+		    "Authorization", "") and \
+		    response.parse_key_name() not in self.spare:
 			self.refused += 1
 			raise AccessDenied()
 		self.accepted += 1

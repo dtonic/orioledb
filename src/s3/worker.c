@@ -1184,6 +1184,14 @@ s3worker_main(Datum main_arg)
 		 */
 		if (workers_locations[worker_num] != InvalidS3TaskLocation)
 		{
+			/*
+			 * The task the worker before this one died on.  A failure that
+			 * persists (a refused key) would restart the worker at once, over
+			 * and over: a pause bounds that to an attempt a second.
+			 */
+			(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							 1000L, PG_WAIT_EXTENSION);
+			ResetLatch(MyLatch);
 			s3process_task(workers_locations[worker_num]);
 			workers_locations[worker_num] = InvalidS3TaskLocation;
 		}

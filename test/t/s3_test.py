@@ -1282,26 +1282,46 @@ class S3Test(S3BaseTest):
 		node.stop()
 
 	def test_s3_a_refused_key_fails_with_no_retry_time(self):
-		"""With orioledb.s3_auth_retry_time = 0 a refusal is the answer."""
+		"""With orioledb.s3_auth_retry_time = 0 a refusal is the answer: the
+		request fails at once instead of being retried for the key to catch
+		up, and the worker that died on it tries again once a second, not
+		at once."""
 		node = self.node
 		node.append_conf(self.s3_conf())
 		node.append_conf("""
 			synchronous_standby_names = 's3'
 			orioledb.s3_auth_retry_time = 0
+			orioledb.s3_lease_duration = 30
 		""")
 		node.start()
 		node.safe_psql("""
 			CREATE EXTENSION orioledb;
 			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 100);
 		""")
-		revoked = RevokedKeyPut(self.access_key_id)
+		# the lease goes on: only the refusal can show
+		revoked = RevokedKeyPut(self.access_key_id, spare=('writer', ))
 		with patch('moto.s3.responses.S3Response.put_object',
 		           new=lambda response: revoked(response)):
-			with self.assertRaises(Exception):
-				node.safe_psql("CHECKPOINT;")
+			checkpoint = Thread(target=lambda: node.safe_psql("CHECKPOINT;"))
+			checkpoint.daemon = True
+			checkpoint.start()
+			deadline = time.time() + 10
+			refused = False
+			while time.time() < deadline and not refused:
+				with open(node.pg_log_file) as f:
+					refused = "http code = 403" in f.read()
+				time.sleep(0.2)
+			self.assertTrue(refused)
+			before = revoked.refused
+			time.sleep(3)
+			self.assertLess(revoked.refused - before, 3 * 3 * 2)
+		# the key works again: the checkpoint goes through
+		checkpoint.join(60)
+		self.assertFalse(checkpoint.is_alive())
 		with open(node.pg_log_file) as f:
-			self.assertIn("http code = 403", f.read())
-		node.stop(['-m', 'immediate'])
+			self.assertNotIn("lost the S3 writer lease", f.read())
+		node.stop()
 
 	def test_s3_status(self):
 		"""orioledb_s3_status() says where the writer and the bucket stand,
