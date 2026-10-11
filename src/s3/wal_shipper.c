@@ -1202,7 +1202,8 @@ s3_wal_shipper_main(Datum main_arg)
 	uint64		nextSeq = 0;
 	XLogRecPtr	start;
 	XLogRecPtr	slotRestart;
-	XLogRecPtr	replayEnd;
+	XLogRecPtr	replayEnd,
+				checkEnd;
 	ChunkHeader existing;
 	StringInfoData chunk;
 	XLogRecPtr	chunkStart = InvalidXLogRecPtr;
@@ -1342,13 +1343,34 @@ walk:
 	 * is lost: one is acknowledged only once its whole record is up.
 	 */
 	replayEnd = pg_atomic_read_u64(&shipper->replayEndLsn);
-	if (!XLogRecPtrIsInvalid(replayEnd) && replayEnd < start)
+	checkEnd = start;
+	if (!XLogRecPtrIsInvalid(replayEnd))
 	{
-		ReplayCheck check = chunks_pass_replay(tli, nextSeq, start, replayEnd);
+		XLogSegNo	segno;
+		char		name[MAXFNAMELEN];
+		char	   *key;
+
+		/*
+		 * The segment recovery ended in, archived complete: by the run this
+		 * data directory was copied from, which went on past the copy with
+		 * WAL its chunks may not hold yet.  A restore reads that segment, not
+		 * the chunks this run would ship into it.
+		 */
+		XLByteToSeg(replayEnd, segno, wal_segment_size);
+		XLogFileName(name, tli, segno, wal_segment_size);
+		key = psprintf("wal/%s", name);
+		if (s3_object_exists(key))
+			XLogSegNoOffsetToRecPtr(segno + 1, 0, wal_segment_size, checkEnd);
+		checkEnd = Max(checkEnd, start);
+		pfree(key);
+	}
+	if (!XLogRecPtrIsInvalid(replayEnd) && replayEnd < checkEnd)
+	{
+		ReplayCheck check = chunks_pass_replay(tli, nextSeq, checkEnd, replayEnd);
 
 		if (check == REPLAY_PASSED)
 			s3_stop_instance("the S3 bucket has WAL past this data directory",
-							 psprintf("The WAL chunks of timeline %u hold a whole record "
+							 psprintf("The bucket's WAL of timeline %u holds a whole record "
 									  "at %X/%08X, where recovery of this data directory "
 									  "ended: another copy of it went on writing.  Load "
 									  "the data directory from the bucket again.",
@@ -1360,7 +1382,7 @@ walk:
 									  "of this data directory ended.  Load the data "
 									  "directory from the bucket again.",
 									  tli, LSN_FORMAT_ARGS(replayEnd)));
-		start = replayEnd;
+		start = Min(start, replayEnd);
 	}
 	if (start < slotRestart - XLogSegmentOffset(slotRestart, wal_segment_size))
 		ereport(ERROR,

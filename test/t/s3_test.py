@@ -2674,6 +2674,63 @@ class S3Test(S3BaseTest):
 				last.cleanup()
 			copy.cleanup()
 
+	def test_s3_copy_is_stopped_by_a_segment_archived_past_its_chunks(self):
+		"""The writer goes on past the copy with WAL its shipper has not put
+		up yet, and archives the segment the copy's recovery ends in.  The
+		chunks then reach no further than the copy does, but a restore reads
+		that segment, not the chunks the copy would ship into it: the copy
+		stops."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_lease_duration = 15
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		token = int(self.kv('root')['token'])
+		hold = HoldChunksOf()
+		with self.initNode(self.getBasePort() + 1, 'tgsc') as copy, \
+		    patch('moto.s3.responses.S3Response.put_object',
+		          new=lambda response: hold(response)):
+			self.copy_while_stopped(node, copy)
+			segment = node.execute(
+			    "SELECT pg_walfile_name(pg_current_wal_lsn());")[0][0]
+			# the writer's shipper puts nothing more; its commits wait for
+			# no chunk
+			hold.token = token
+			node.safe_psql("""
+				SET synchronous_commit = local;
+				INSERT INTO o_test SELECT generate_series(11, 30);
+				SELECT pg_switch_wal();
+			""")
+			self.wait_for_object(f'wal/{segment}')
+			os.kill(node.pid, signal.SIGKILL)
+
+			copy.append_conf(port=copy.port)
+			try:
+				copy.start()
+			except StartNodeException:
+				pass
+			deadline = time.time() + 120
+			stopped = False
+			while time.time() < deadline and not stopped:
+				with open(copy.pg_log_file) as f:
+					log = f.read()
+				stopped = "another copy of it went on writing" in log
+				time.sleep(1)
+			self.assertTrue(stopped)
+			try:
+				copy.stop(['-m', 'immediate'])
+			except Exception:
+				pass
+			copy.cleanup()
+
 	def test_s3_restart_goes_on_past_a_lagging_hint(self):
 		"""The hint of where this directory's chunks end is not made durable
 		after every chunk: after a machine crash it may name a chunk the GC
