@@ -26,7 +26,7 @@
  * object of a checkpoint before R that R's manifest does not refer to is not
  * referred to from R on: the GC removes it, then the manifest.  A tree in an
  * older manifest and not in R's was dropped by R: its parts, maps and state
- * go.  The WAL segments before R's REDO go too, and the chunks of the live
+ * go.  The WAL segments before R's REDO go too, and the chunks of every
  * timeline that end before the segment of R's REDO.
  *
  * Progress is published in `gc` (folded, collected), so a writer that takes
@@ -872,34 +872,6 @@ collect_checkpoint(S3Manifest *m, S3Manifest *r, HTAB *dropped, HTAB *deleted)
 	}
 
 	/*
-	 * The chunks of a timeline a takeover left: no retained checkpoint is
-	 * before the switch any more.
-	 */
-	foreach(lc, m->retired)
-	{
-		S3ManifestRetired *t = lfirst(lc);
-		char	   *prefix = psprintf("wal/%08X/chunks/", t->timeline);
-		List	   *keys = s3_list_objects(prefix, NULL);
-		ListCell   *kc;
-
-		/*
-		 * The ones the bucket still has; the terminator stays, or its key
-		 * would be free for the writer it fenced.
-		 */
-		foreach(kc, keys)
-		{
-			char	   *key = lfirst(kc);
-			uint64		seq = strtou64(key + strlen(prefix), NULL, 10);
-
-			gc_check_stop();
-			if (seq < t->lastSeq)
-				gc_delete(key);
-		}
-		list_free_deep(keys);
-		pfree(prefix);
-	}
-
-	/*
 	 * Maps.  A dropped tree's are left for after its last map is read: it
 	 * says how many parts to remove.
 	 */
@@ -987,7 +959,14 @@ delete_wal(S3Manifest *from, S3Manifest *to)
 
 		XLByteToSeg(to->redoLsn, last, wal_segment_size);
 		XLogSegNoOffsetToRecPtr(last, 0, wal_segment_size, below);
-		delete_chunks_below(to->timeline, below);
+
+		/*
+		 * The timelines a takeover left too: the first segment of the next
+		 * timeline is assembled from its parent's chunks up to the switch,
+		 * so those stay while R's REDO is in that segment.
+		 */
+		for (TimeLineID tli = 1; tli <= to->timeline; tli++)
+			delete_chunks_below(tli, below);
 	}
 
 	if (from->redoLsn == InvalidXLogRecPtr || to->redoLsn == InvalidXLogRecPtr ||
@@ -1013,9 +992,10 @@ delete_wal(S3Manifest *from, S3Manifest *to)
 }
 
 /*
- * The chunks of the live timeline that end before the segment R's REDO is
- * in: restoring R, or anything after it, starts at that segment, and a
- * segment is assembled whole, so its first chunk stays.  The shipper removes
+ * The chunks of a timeline that end before the segment R's REDO is in:
+ * restoring R, or anything after it, starts at that segment, and a segment
+ * is assembled whole, so its first chunk stays (of the parent timeline too,
+ * up to the switch, when the switch is in that segment).  The shipper removes
  * chunks once their segments are archived; this is for a bucket whose
  * segments never are (archiving off, or another archive_library).  Chunks go
  * in their order, up to the first that cannot go; a terminator stays, or its

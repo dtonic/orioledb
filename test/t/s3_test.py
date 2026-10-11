@@ -862,6 +862,58 @@ class S3Test(S3BaseTest):
 			new_node.stop()
 			new_node.cleanup()
 
+	def test_s3_gc_keeps_what_a_retired_timeline_lends_the_next(self):
+		"""After a takeover the new timeline's first segment starts with the
+		old timeline's bytes up to the switch, and a restore assembles them
+		from the old timeline's chunks.  The GC removes those chunks once the
+		checkpoint that retired the timeline is collected; a later load must
+		still have every commit."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			archive_mode = off
+			synchronous_standby_names = 's3'
+			orioledb.s3_lease_duration = 15
+			orioledb.s3_gc_interval = 1
+			orioledb.s3_gc_keep_checkpoints = 1
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 100);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		node.safe_psql("INSERT INTO o_test VALUES (101);")
+		node.stop(['-m', 'immediate'])
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as b:
+			self.loader.download(b.data_dir)
+			b.append_conf(port=b.port)
+			b.start()
+			self.assertEqual([(101, )], b.execute("SELECT count(*) FROM o_test"))
+			for i in range(102, 106):
+				b.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+				b.safe_psql("CHECKPOINT;")
+			# the old timeline's chunks before the terminator go
+			deadline = time.time() + 90
+			while time.time() < deadline and [
+			    k for k in self.chunk_keys()
+			    if k.startswith('wal/00000001/chunks/')][:-1]:
+				b.safe_psql("CHECKPOINT;")
+				time.sleep(1)
+			b.safe_psql("INSERT INTO o_test VALUES (106);")
+			b.stop(['-m', 'immediate'])
+			b.cleanup()
+		with self.initNode(self.getBasePort() + 2, 'tgsc') as c:
+			self.loader.download(c.data_dir)
+			c.append_conf(port=c.port)
+			c.start()
+			self.assertEqual([(106, 106)],
+			                 c.execute("SELECT count(*), max(id) FROM o_test"))
+			c.stop()
+			c.cleanup()
+
 	def test_s3_local_wal_load(self):
 		"""--local-wal puts the bucket's WAL in pg_wal, for a server that
 		cannot run the loader: a load has every commit; one the writer went
