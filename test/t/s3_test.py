@@ -2836,8 +2836,11 @@ class S3Test(S3BaseTest):
 			while reader.status() == NodeStatus.Running and time.time() < deadline:
 				time.sleep(1)
 			self.assertNotEqual(reader.status(), NodeStatus.Running)
+			# warned, or, when the writer went past the floor between two
+			# renewals, passed over
 			with open(reader.pg_log_file) as f:
-				self.assertIn("this S3 reader is too far behind the writer", f.read())
+				self.assertRegex(f.read(), "this S3 reader is too far behind the writer|"
+				                 "the S3 GC passed this reader's checkpoint")
 			self.assertTrue(self.wait_for_gc(pinned))
 			reader.cleanup()
 		self.assert_bucket_restores(node, [(30000, 330000)])
