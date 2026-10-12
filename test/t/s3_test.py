@@ -502,6 +502,41 @@ class S3Test(S3BaseTest):
 		                 node.execute("SELECT COUNT(*) FROM o_test")[0][0])
 		node.stop()
 
+	def test_s3_eviction_bound_follows_a_reload(self):
+		"""
+		orioledb.s3_desired_size is a reloadable setting, but the background
+		writer that evicts by it took no reload: shrunk with ALTER SYSTEM and
+		pg_reload_conf(), the local data stayed above the new bound until a
+		restart.
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('1GB')
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION IF NOT EXISTS orioledb;
+			CREATE TABLE o_test (
+				id int PRIMARY KEY,
+				value text NOT NULL
+			) USING orioledb;
+			INSERT INTO o_test SELECT id, repeat('x', 1000)
+				FROM generate_series(1, 300000) id;
+			CHECKPOINT;
+		""")
+		# under the 1 GB bound nothing is evicted
+		self.assertGreater(self.get_data_size(), 256 * 1024 * 1024)
+		node.safe_psql("ALTER SYSTEM SET orioledb.s3_desired_size = '64MB'")
+		node.safe_psql("SELECT pg_reload_conf()")
+		node.safe_psql("CHECKPOINT")
+		deadline = time.time() + 120
+		while self.get_data_size() > 128 * 1024 * 1024:
+			self.assertLess(time.time(), deadline,
+			                f"local data stayed at {self.get_data_size() >> 20} MB "
+			                "after the bound was reloaded to 64 MB")
+			time.sleep(1)
+		self.assertEqual(300000,
+		                 node.execute("SELECT COUNT(*) FROM o_test")[0][0])
+		node.stop()
+
 	def s3_small_buffers_conf(self, desired_size):
 		self.node.append_conf(f"""
 			orioledb.s3_mode = true

@@ -659,6 +659,9 @@ RustFS, 같은 Docker 호스트, 릴리스 빌드. 100만 행 표에 8연결 무
   두는데, 축출이 파일 크기로 파트 수를 세어 하나 많았고 마지막 다음 헤더 값에서 끝없이 돌았다. 그 뒤로 백그라운드 writer 가
   축출도 정지도 하지 못해 로컬 데이터가 `s3_desired_size` 를 넘어 계속 늘었다(SF10 에서 로컬 108 GB, 디스크 가득 참).
   Guard: `test_s3_eviction_goes_on_past_a_full_segment`.
+- 2026-10-12 SNB SF1 S3 모드 재검증에서 찾은 결함(업스트림부터 있던 것): 축출을 돌리는 백그라운드 writer 가
+  설정 다시 읽기를 받지 않아(`SIGHUP` 처리기 없음), `s3_desired_size`·`s3_max_unsealed_size` 를 `pg_reload_conf()` 로
+  줄여도 재시작 전까지 시작 값에 머물렀다. Guard: `test_s3_eviction_bound_follows_a_reload`.
 
 ## Not done and open questions
 
