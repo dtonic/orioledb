@@ -1269,7 +1269,8 @@ eviction_callback(S3HeaderTag tag)
 {
 	int			fd;
 	char	   *filename;
-	off_t		fileSize;
+	off_t		fileSize,
+				dataSize;
 	int			i;
 	int			numParts;
 
@@ -1292,12 +1293,20 @@ eviction_callback(S3HeaderTag tag)
 		return;
 	}
 
-	numParts = (fileSize + ORIOLEDB_S3_PART_SIZE - 1) / ORIOLEDB_S3_PART_SIZE;
+	/*
+	 * Parts follow the header block: a full segment is S3_HEADER_NUM_VALUES
+	 * parts and one block.  Counted from the file size, it was one part more,
+	 * and the header value past the last one never reads (its change count
+	 * never matches), so this looped for ever and no part was evicted again.
+	 */
+	dataSize = fileSize - ORIOLEDB_BLCKSZ;
+	numParts = Min((dataSize + ORIOLEDB_S3_PART_SIZE - 1) / ORIOLEDB_S3_PART_SIZE,
+				   S3_HEADER_NUM_VALUES);
 	for (i = 0; i < numParts; i++)
 	{
 		uint32		value;
 
-		if (i == numParts - 1 && fileSize < (uint64) numParts * (uint64) ORIOLEDB_S3_PART_SIZE)
+		if (i == numParts - 1 && dataSize < (uint64) numParts * (uint64) ORIOLEDB_S3_PART_SIZE)
 		{
 			static pg_prng_state random_state;
 			static bool seed_initialized = false;
@@ -1309,7 +1318,7 @@ eviction_callback(S3HeaderTag tag)
 			}
 
 			if (pg_prng_int32(&random_state) % ORIOLEDB_S3_PART_SIZE >
-				fileSize - (uint64) (numParts - 1) * (uint64) ORIOLEDB_S3_PART_SIZE)
+				dataSize - (uint64) (numParts - 1) * (uint64) ORIOLEDB_S3_PART_SIZE)
 			{
 				continue;
 			}

@@ -457,6 +457,51 @@ class S3Test(S3BaseTest):
 		                 node.execute("SELECT COUNT(*) FROM o_test")[0][0])
 		node.stop()
 
+	def test_s3_eviction_goes_on_past_a_full_segment(self):
+		"""
+		A tree file whose segment is full holds 1024 parts after its header
+		block.  Eviction counted the parts from the file size, one too many,
+		and spun on the header value past the last one: the background
+		writer never got back to evicting (nor to its shutdown), and the
+		local data grew with everything written after (an SF10 load filled
+		the disk).
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('64MB')
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION IF NOT EXISTS orioledb;
+			CREATE TABLE o_test (
+				id int PRIMARY KEY,
+				value text NOT NULL
+			) USING orioledb;
+		""")
+		# past one full 1 GB segment of the primary tree
+		for i in range(12):
+			node.safe_psql(f"""
+				INSERT INTO o_test SELECT id, repeat('x', 1000)
+					FROM generate_series({i * 100000 + 1}, {(i + 1) * 100000}) id;
+			""")
+		# the first eviction pass empties the parts before the header value
+		# past the last one, and then spun there; what is written after is
+		# what stays
+		for rows in (1200000, 1400000):
+			if rows > 1200000:
+				node.safe_psql(f"""
+					INSERT INTO o_test SELECT id, repeat('y', 1000)
+						FROM generate_series(1200001, {rows}) id;
+				""")
+			node.safe_psql("CHECKPOINT")
+			deadline = time.time() + 300
+			while self.get_data_size() > 128 * 1024 * 1024:
+				self.assertLess(time.time(), deadline,
+				                f"local data stayed at {self.get_data_size() >> 20} MB "
+				                f"with {rows} rows")
+				time.sleep(1)
+		self.assertEqual(1400000,
+		                 node.execute("SELECT COUNT(*) FROM o_test")[0][0])
+		node.stop()
+
 	def s3_small_buffers_conf(self, desired_size):
 		self.node.append_conf(f"""
 			orioledb.s3_mode = true
