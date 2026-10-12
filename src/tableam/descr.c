@@ -28,6 +28,7 @@
 #include "catalog/sys_trees.h"
 #include "postgres_ext.h"
 #include "recovery/recovery.h"
+#include "s3/manifest.h"
 #include "tableam/handler.h"
 #include "tableam/toast.h"
 #include "tableam/tree.h"
@@ -1526,14 +1527,35 @@ o_move_tree_meta(Oid datoid, Oid relnode, Oid old_tablespace,
 void
 cleanup_btree(OIndexKey ix_key, bool files, bool fsync)
 {
+	cleanup_btree_extended(ix_key, files, fsync, false);
+}
+
+/*
+ * keepPartFloor: the tree is emptied in place and lives on under its
+ * relnode; in S3 mode it numbers its parts on from where it was.
+ */
+void
+cleanup_btree_extended(OIndexKey ix_key, bool files, bool fsync,
+					   bool keepPartFloor)
+{
 	SharedRootInfoKey key;
 	SharedRootInfo *shared = NULL;
+	uint64		next = 0;
 
 	key.datoid = ix_key.oids.datoid;
 	key.relnode = ix_key.oids.relnode;
 	key.tablespace = ix_key.oids.spcoid;
 
 	shared = o_find_shared_root_info(&key);
+
+	if (keepPartFloor && orioledb_s3_mode)
+	{
+		if (shared && !shared->placeholder)
+			next = pg_atomic_read_u64(&((BTreeMetaPage *) O_GET_IN_MEMORY_PAGE(shared->rootInfo.metaPageBlkno))->s3NextPart);
+		next = s3_keep_part_floor(ix_key, next);
+		if (next > 0)
+			s3_tree_parts_gone(ix_key.oids.datoid, ix_key.oids.relnode, next);
+	}
 
 	if (shared)
 	{
@@ -1550,6 +1572,8 @@ cleanup_btree(OIndexKey ix_key, bool files, bool fsync)
 	}
 	if (files)
 		cleanup_btree_files(ix_key, fsync);
+	if (files && keepPartFloor && orioledb_s3_mode)
+		s3_write_empty_map(ix_key, next);
 }
 
 bool

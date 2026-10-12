@@ -40,6 +40,11 @@
 #include "recovery/recovery.h"
 #include "recovery/wal.h"
 #include "s3/checkpoint.h"
+#include "s3/gc.h"
+#include "s3/lease.h"
+#include "s3/manifest.h"
+#include "s3/wal_shipper.h"
+#include "common/controldata_utils.h"
 #include "s3/worker.h"
 #include "tableam/toast.h"
 #include "transam/oxid.h"
@@ -169,6 +174,7 @@ static char xidFilename[MAXPGPATH] = "";
 static uint32 xidFileCheckpointnum = 0;
 static File xidFile = -1;
 static S3TaskLocation maxLocation = 0;
+
 
 static void init_writeback(CheckpointWriteBack *writeback, int flags, bool isCompressed);
 static void writeback_put_extent(CheckpointWriteBack *writeback, FileExtent *extent);
@@ -462,8 +468,6 @@ writeback_put_extent(CheckpointWriteBack *writeback, FileExtent *extent)
 													 sizeof(FileExtent) * writeback->extentsAllocated);
 	}
 	writeback->extents[writeback->extentsNumber] = *extent;
-	if (orioledb_s3_mode)
-		writeback->extents[writeback->extentsNumber].off &= S3_OFFSET_MASK;
 	if (!writeback->isCompressed && use_device)
 		writeback->extents[writeback->extentsNumber].len *= ORIOLEDB_BLCKSZ / ORIOLEDB_COMP_BLCKSZ;
 	writeback->extentsNumber++;
@@ -794,9 +798,12 @@ static void
 unlink_xids_file(uint32 checkpointnum)
 {
 	char	   *xip_filename = psprintf(XID_FILENAME_FORMAT, checkpointnum);
+	char	   *range_filename = psprintf(XIDMAP_RANGE_FILENAME_FORMAT, checkpointnum);
 
 	unlink(xip_filename);
+	(void) unlink(range_filename);
 	pfree(xip_filename);
+	pfree(range_filename);
 }
 
 /*
@@ -1225,6 +1232,16 @@ wait_recovery_undo_loc_flushed(uint32 chkpnum, bool shutdown)
 				}
 				continue;
 			}
+
+			/*
+			 * At a shutdown restartpoint the startup process and every
+			 * recovery worker are gone, and a worker that ran left the flag
+			 * above on exit: one without it never started (the index build
+			 * leader lowers the index pool in its own process only when the
+			 * workers do not fit in max_worker_processes), and owes nothing.
+			 */
+			if (shutdown)
+				continue;
 
 			if (worker_ptrs[i].flushedUndoLocCompletedCheckpointNumber <
 				recovery_undo_loc_flush->immediateRequestCheckpointNumber)
@@ -1769,6 +1786,10 @@ o_perform_checkpoint_guts(int flags)
 
 	prev_context = MemoryContextSwitchTo(chkp_main_context);
 
+	/* collect what this checkpoint uploads, for its manifest */
+	if (S3_WRITER_MODE)
+		s3_manifest_begin(cur_chkp_num);
+
 	for (i = 1; i <= SYS_TREES_NUM; i++)
 		(void) get_sys_tree(i);
 
@@ -2005,7 +2026,7 @@ o_perform_checkpoint_guts(int flags)
 						 checkpoint_end_loc[i],
 						 WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC);
 
-		if (orioledb_s3_mode && checkpoint_end_loc[i] > checkpoint_start_loc[i])
+		if (S3_WRITER_MODE && checkpoint_end_loc[i] > checkpoint_start_loc[i])
 		{
 			uint64		undoFileNum;
 
@@ -2016,7 +2037,8 @@ o_perform_checkpoint_guts(int flags)
 				S3TaskLocation location;
 
 				location = s3_schedule_undo_file_write(undoType,
-													   undoFileNum);
+													   undoFileNum,
+													   cur_chkp_num);
 				maxLocation = Max(maxLocation, location);
 			}
 		}
@@ -2025,6 +2047,15 @@ o_perform_checkpoint_guts(int flags)
 	fsync_xidmap_range(checkpoint_xmin,
 					   checkpoint_xmax,
 					   WAIT_EVENT_DATA_FILE_IMMEDIATE_SYNC);
+
+	/* the bucket's copy of what recovery reads from the xidmap */
+	if (S3_WRITER_MODE)
+	{
+		char	   *range = psprintf(XIDMAP_RANGE_FILENAME_FORMAT, cur_chkp_num);
+
+		write_xidmap_range_file(range, checkpoint_xmin, checkpoint_xmax);
+		pfree(range);
+	}
 
 	if (checkpoint_state->controlIdentifier == 0)
 	{
@@ -2065,6 +2096,14 @@ o_perform_checkpoint_guts(int flags)
 	control.s3Mode = orioledb_s3_mode;
 	control.checksums_enabled = orioledb_checksums_enabled;
 	control.controlFileVersion = ORIOLEDB_CHECKPOINT_CONTROL_VERSION;
+
+	/*
+	 * In S3 mode the checkpoint is local only after its parts, maps and undo
+	 * are up: a restart forgets which parts were waiting, and the next
+	 * checkpoint would commit a bucket that names parts never uploaded.
+	 */
+	if (S3_WRITER_MODE)
+		s3_queue_wait_for_location(maxLocation);
 
 	write_checkpoint_control(&control);
 
@@ -2208,7 +2247,7 @@ o_perform_checkpoint_guts(int flags)
 	elog(LOG, "orioledb checkpoint %u complete",
 		 checkpoint_state->lastCheckpointNumber);
 
-	if (orioledb_s3_mode)
+	if (S3_WRITER_MODE)
 		s3_perform_backup(flags, maxLocation);
 
 #if PG_VERSION_NUM >= 180000
@@ -2235,9 +2274,29 @@ checkpoint_init_new_seq_bufs(BTreeDescr *descr, int chkpNum)
 				next_tmp_tag = {0};
 	bool		success;
 
+	/*
+	 * S3 mode reuses no space: the stream cursors live in the meta page and
+	 * only ever grow (s3_alloc_extent).  It keeps one seq buf, the extents
+	 * that die at the next checkpoint, for the GC.
+	 */
 	if (orioledb_s3_mode)
 	{
-		pg_atomic_write_u64(&meta_page->datafileLength[next_chkp_index], 0);
+		if (!s3_tree_records_dead(descr))
+			return;
+		ppool_reserve_pages(descr->ppool, PPOOL_RESERVE_META, 2);
+		init_seq_buf_pages(descr, &meta_page->nextChkp[next_chkp_index]);
+		memset(&next_chkp_tag, 0, sizeof(next_chkp_tag));
+		next_chkp_tag.key.oids = descr->oids;
+		next_chkp_tag.key.oids.spcoid = descr->oids.spcoid;
+		next_chkp_tag.num = chkpNum + 1;
+		next_chkp_tag.type = 'd';
+		if (!init_seq_buf(&descr->nextChkp[next_chkp_index],
+						  &meta_page->nextChkp[next_chkp_index],
+						  &next_chkp_tag, true, true, 0, NULL))
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("could not create a new sequence buffer file %s: %m",
+							get_seq_buf_filename(&next_chkp_tag))));
 		return;
 	}
 
@@ -2388,6 +2447,13 @@ check_archive_done(const char *xlog)
 	return false;
 }
 
+/*
+ * The WAL a shutdown without the shipper leaves unarchived.  The segment the
+ * WAL ends in goes up as "<name>.partial": under the archive's key a restore
+ * takes it as complete, and reads no chunk a later run ships into it.  The
+ * segments past it are recycled ones, old WAL under a future name, and stay
+ * here.
+ */
 static S3TaskLocation
 after_checkpoint_sync_wal(void)
 {
@@ -2395,11 +2461,17 @@ after_checkpoint_sync_wal(void)
 	struct dirent *xlde;
 	S3TaskLocation maxLocation = 0;
 	S3TaskLocation location;
+	TimeLineID	endTli = GetWALInsertionTimeLine();
+	XLogSegNo	endSeg;
 
+	XLByteToSeg(GetFlushRecPtr(NULL), endSeg, wal_segment_size);
 	xldir = AllocateDir(XLOGDIR);
 
 	while ((xlde = ReadDir(xldir, XLOGDIR)) != NULL)
 	{
+		TimeLineID	tli;
+		XLogSegNo	segno;
+
 		/* Ignore files that are not XLOG segments */
 		if (!IsXLogFileName(xlde->d_name))
 			continue;
@@ -2408,7 +2480,18 @@ after_checkpoint_sync_wal(void)
 		if (check_archive_done(xlde->d_name))
 			continue;
 
-		location = s3_schedule_wal_file_write(xlde->d_name);
+		XLogFromFileName(xlde->d_name, &tli, &segno, wal_segment_size);
+		if (tli == endTli && segno > endSeg)
+			continue;
+		if (tli == endTli && segno == endSeg)
+		{
+			char	   *partial = psprintf("%s.partial", xlde->d_name);
+
+			location = s3_schedule_wal_file_write(partial, false);
+			pfree(partial);
+		}
+		else
+			location = s3_schedule_wal_file_write(xlde->d_name, false);
 		maxLocation = Max(location, maxLocation);
 	}
 
@@ -2433,7 +2516,11 @@ o_after_checkpoint_cleanup_hook(XLogRecPtr checkPointRedo, int flags)
 	 * #876).
 	 */
 	if (flags == 0)
+	{
 		o_emit_recovery_finish_rollbacks();
+		if (orioledb_s3_mode)
+			s3_wal_shipper_set_catch_up(GetXLogInsertRecPtr());
+	}
 
 	if (!(flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY)))
 	{
@@ -2446,25 +2533,33 @@ o_after_checkpoint_cleanup_hook(XLogRecPtr checkPointRedo, int flags)
 	if (GetRecoveryState() != RECOVERY_STATE_DONE)
 		return;
 
-	if (XLogInsertAllowed())
+	if (XLogInsertAllowed() && s3_wal_shipping)
+	{
+		/*
+		 * The shipper puts the checkpoint record up: root waits for it
+		 * below, and no segment is switched for it.
+		 */
+	}
+	else if (XLogInsertAllowed())
 	{
 		XLogRecPtr	switchpoint;
 		XLogSegNo	xlogsegno;
 		char		xlogfilename[MAXFNAMELEN];
 
 		/*
-		 * Wait till archiver finishes with the checkpoint record.
+		 * Without the shipper the checkpoint record reaches the bucket in an
+		 * archived segment: switch, and wait for the archiver.
 		 */
 		switchpoint = RequestXLogSwitch(false);
 		XLByteToPrevSeg(switchpoint, xlogsegno, wal_segment_size);
-		XLogFileName(xlogfilename, 1,
+		XLogFileName(xlogfilename, GetWALInsertionTimeLine(),
 					 xlogsegno, wal_segment_size);
 		while (!check_archive_done(xlogfilename))
 		{
 			pg_usleep(100000L);
 		}
 	}
-	else
+	else if (!s3_wal_shipping || !s3_wal_ship_rest(GetWALInsertionTimeLine()))
 	{
 		location = after_checkpoint_sync_wal();
 		maxLocation = Max(maxLocation, location);
@@ -2474,9 +2569,38 @@ o_after_checkpoint_cleanup_hook(XLogRecPtr checkPointRedo, int flags)
 	maxLocation = Max(maxLocation, location);
 	location = s3_schedule_file_write(chkpNum, CONTROL_FILENAME, false);
 	maxLocation = Max(maxLocation, location);
-	location = s3_schedule_root_file_write(CONTROL_FILENAME, false);
-	maxLocation = Max(maxLocation, location);
 	s3_queue_wait_for_location(maxLocation);
+
+	{
+		bool		crc_ok;
+		ControlFileData *cf = get_controlfile(DataDir, &crc_ok);
+
+		if (!crc_ok)
+			elog(ERROR, "pg_control checksum mismatch");
+
+		/*
+		 * Root names a checkpoint only with its manifest up: a checkpoint
+		 * whose PG file backup did not finish (a crash in it, then this hook
+		 * at the end of recovery) is not committed, the next one is.
+		 */
+		/*
+		 * Nor before its checkpoint record is in the bucket: a restore from
+		 * root starts by reading it.  A checkpoint the shipper cannot vouch
+		 * for (it stopped) is left for the next one.
+		 */
+		if (XLogInsertAllowed() && s3_wal_shipping &&
+			!s3_wal_shipper_wait(GetFlushRecPtr(NULL)))
+			ereport(LOG,
+					(errmsg("S3 checkpoint %u is not committed: the WAL shipper is not running",
+							chkpNum)));
+		else if (s3_manifest_publish(chkpNum, cf->checkPointCopy.redo, cf->checkPoint,
+									 cf->checkPointCopy.ThisTimeLineID))
+		{
+			s3_root_commit(chkpNum, cf->checkPointCopy.redo, cf->checkPoint);
+			s3_manifest_committed(chkpNum);
+		}
+		pfree(cf);
+	}
 }
 
 
@@ -2796,6 +2920,20 @@ free_extent_for_checkpoint(BTreeDescr *desc, FileExtent *extent, uint32 chkp_num
 
 	if (orioledb_s3_mode)
 	{
+		/*
+		 * Nothing is reused: the extent is recorded as dead from chkp_num on,
+		 * for the GC.  A tree without the buffer (temporary, a reader's) has
+		 * nothing in the bucket to collect; a dead extent missed is a leak,
+		 * never a loss.
+		 */
+		if (s3_tree_records_dead(desc) &&
+			SEQ_BUF_SHARED_EXIST(desc->nextChkp[chkp_num % 2].shared) &&
+			(!s3_dead_list_start(desc, &desc->nextChkp[chkp_num % 2]) ||
+			 !seq_buf_write_file_extent(&desc->nextChkp[chkp_num % 2], *extent)))
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("could not record a dead extent of %s: %m",
+							get_seq_buf_filename(&desc->nextChkp[chkp_num % 2].shared->tag))));
 		extent->len = InvalidFileExtentLen;
 		extent->off = InvalidFileExtentOff;
 		return;
@@ -3274,6 +3412,7 @@ backend_set_autonomous_level(CheckpointState *state, uint32 level)
 static BTreeDescr *
 checkpoint_ix(int flags, BTreeDescr *descr)
 {
+	S3TreeCursors s3Cursors;
 	FileExtentsArray *free_extents = NULL;
 	char	   *filename,
 			   *finalize_filename;
@@ -3333,19 +3472,23 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 
 	if (!use_device)
 	{
-		int			index = orioledb_s3_mode ? (chkpNum % 2) : 0;
-
-		if (is_compressed)
-			file_length = pg_atomic_read_u64(&meta_page->datafileLength[index]) * ORIOLEDB_COMP_BLCKSZ;
+		if (orioledb_s3_mode)
+			file_length = pg_atomic_read_u64(&meta_page->s3NextPart) * ORIOLEDB_S3_PART_SIZE;
+		else if (is_compressed)
+			file_length = pg_atomic_read_u64(&meta_page->datafileLength[0]) * ORIOLEDB_COMP_BLCKSZ;
 		else
-			file_length = pg_atomic_read_u64(&meta_page->datafileLength[index]) * ORIOLEDB_BLCKSZ;
+			file_length = pg_atomic_read_u64(&meta_page->datafileLength[0]) * ORIOLEDB_BLCKSZ;
 		btree_smgr_sync(descr, chkpNum, file_length);
 
 		if (orioledb_s3_mode)
 		{
-			S3TaskLocation location = BTREE_GET_META(descr)->partsInfo[chkpNum % 2].writeMaxLocation;
-
-			maxLocation = Max(maxLocation, location);
+			/*
+			 * Every write of this checkpoint's stream to the tree is on disk:
+			 * seal the stream's parts and queue their upload.  The map below
+			 * then names only blocks in parts that are on their way.
+			 */
+			btree_s3_seal_stream(descr, meta_page, chkpNum % 2);
+			maxLocation = Max(maxLocation, meta_page->partsInfo[chkpNum % 2].writeMaxLocation);
 		}
 	}
 
@@ -3371,7 +3514,16 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 	/* Make header for the map file... */
 	header.rootDownlink = root_downlink;
 	if (orioledb_s3_mode)
-		header.datafileLength = pg_atomic_read_u64(&meta_page->datafileLength[chkpNum % 2]);
+	{
+		int			i;
+
+		header.datafileLength = pg_atomic_read_u64(&meta_page->s3NextPart);
+		for (i = 0; i < 2; i++)
+		{
+			s3Cursors.cursor[i] = pg_atomic_read_u64(&meta_page->datafileLength[i]);
+			s3Cursors.sealFrom[i] = meta_page->partsInfo[i].sealFrom;
+		}
+	}
 	else
 		header.datafileLength = pg_atomic_read_u64(&meta_page->datafileLength[0]);
 	header.leafPagesNum = pg_atomic_read_u32(&meta_page->leafPagesNum);
@@ -3589,6 +3741,9 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 
 	if (OFileWrite(file, (Pointer) &header, sizeof(header), 0,
 				   WAIT_EVENT_SLRU_WRITE) != sizeof(header) ||
+		(orioledb_s3_mode &&
+		 OFileWrite(file, (Pointer) &s3Cursors, sizeof(s3Cursors), sizeof(header),
+					WAIT_EVENT_SLRU_WRITE) != sizeof(s3Cursors)) ||
 		FileSync(file, WAIT_EVENT_SLRU_SYNC) != 0)
 	{
 		ereport(FATAL, (errcode_for_file_access(),
@@ -3598,13 +3753,30 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 	FileClose(file);
 	pfree(filename);
 
-	if (orioledb_s3_mode)
+	if (S3_WRITER_MODE)
 	{
 		OIndexKey	key = {.oids = descr->oids};
 		S3TaskLocation location;
 
-		location = s3_schedule_file_part_write(chkpNum, key, -1, -1);
+		location = s3_schedule_map_file_write(chkpNum, key);
 		maxLocation = Max(maxLocation, location);
+
+		/* the extents that died at this checkpoint, for the GC */
+		if (s3_tree_records_dead(descr) &&
+			SEQ_BUF_SHARED_EXIST(descr->nextChkp[cur_chkp_index].shared))
+		{
+			char	   *dead_name = get_seq_buf_filename(&descr->nextChkp[cur_chkp_index].tag);
+
+			if (seq_buf_finalize(&descr->nextChkp[cur_chkp_index]) > 0)
+			{
+				location = s3_schedule_dead_file_write(chkpNum, key);
+				maxLocation = Max(maxLocation, location);
+			}
+			else
+				(void) unlink(dead_name);
+			free_seq_buf_pages(descr, descr->nextChkp[cur_chkp_index].shared);
+			pfree(dead_name);
+		}
 	}
 
 	chkp_inc_changecount_before(checkpoint_state);
@@ -4324,18 +4496,14 @@ checkpoint_btree_loop(BTreeDescr **descrPtr,
 				header->o_header.checkpointNum = 0;
 				if (FileExtentIsValid(page_desc->fileExtent))
 				{
-					if (orioledb_s3_mode)
-					{
-						page_desc->fileExtent.len = InvalidFileExtentLen;
-						page_desc->fileExtent.off = InvalidFileExtentOff;
-					}
-					else
-					{
-						/* the offset will not be used in current checkpoint */
-						free_extent_for_checkpoint(descr, &page_desc->fileExtent,
-												   chkpNum);
-						MARK_DIRTY(descr, blkno);
-					}
+					/*
+					 * The offset will not be used in current checkpoint.  In
+					 * S3 mode the extent is recorded dead from it on, as at
+					 * every other place a checkpoint stops referring to one.
+					 */
+					free_extent_for_checkpoint(descr, &page_desc->fileExtent,
+											   chkpNum);
+					MARK_DIRTY(descr, blkno);
 				}
 			}
 
@@ -4392,9 +4560,6 @@ checkpoint_btree_loop(BTreeDescr **descrPtr,
 					if (!DiskDownlinkIsValid(downlink))
 					{
 						uint64		offset = page_desc->fileExtent.off;
-
-						if (orioledb_s3_mode)
-							offset &= S3_OFFSET_MASK;
 
 						elog(ERROR, "unable to perform page IO for page %d to file %s with offset " UINT64_FORMAT,
 							 blkno,
@@ -5516,9 +5681,6 @@ checkpoint_internal_pass(BTreeDescr *descr, CheckpointState *state,
 			{
 				uint64		offset = page_desc->fileExtent.off;
 
-				if (orioledb_s3_mode)
-					offset &= S3_OFFSET_MASK;
-
 				Assert(page_desc != NULL);
 				elog(ERROR, "Unable to perform page IO for page %d to file %s with offset " UINT64_FORMAT,
 					 blkno,
@@ -5675,6 +5837,11 @@ checkpoint_tables_callback(OIndexType type, ORelOids treeOids,
 
 	prev_context = MemoryContextSwitchTo(chkp_tree_context);
 
+	/* every tree of the catalog goes in the manifest */
+	if (S3_WRITER_MODE)
+		s3_manifest_note_tree(treeOids.datoid, treeOids.relnode,
+							  treeOids.spcoid);
+
 	if (!check_tree_needs_checkpointing(type, treeOids))
 	{
 		MemoryContextSwitchTo(prev_context);
@@ -5763,7 +5930,16 @@ checkpoint_tables_callback(OIndexType type, ORelOids treeOids,
 
 		if (skip)
 		{
-			if (!orioledb_s3_mode)
+			if (orioledb_s3_mode)
+			{
+				if (s3_tree_records_dead(td) &&
+					SEQ_BUF_SHARED_EXIST(td->nextChkp[cur_chkp_index].shared))
+				{
+					free_seq_buf_pages(td, td->nextChkp[cur_chkp_index].shared);
+					seq_buf_close_file(&td->nextChkp[cur_chkp_index]);
+				}
+			}
+			else
 			{
 				if (td->storageType == BTreeStoragePersistence ||
 					td->storageType == BTreeStorageUnlogged)
@@ -5927,6 +6103,74 @@ free_seq_buf_pages(BTreeDescr *desc, SeqBufDescShared *shared)
 	FREE_PAGE_IF_VALID(desc->ppool, shared->pages[1]);
 }
 
+/*
+ * A list of dead extents opens with the tree's blocks per part (an entry of
+ * length S3_DEAD_UNIT_LEN): the GC maps offsets to parts with it, and never
+ * guesses.  Two writers may both see an empty list and both write it, which
+ * is harmless.
+ */
+bool
+s3_dead_list_start(BTreeDescr *desc, SeqBufDescPrivate *buf)
+{
+	FileExtent	unit = {.off = S3_PART_BLOCKS(OCompressIsValid(desc->compress) ?
+											  ORIOLEDB_COMP_BLCKSZ :
+											  ORIOLEDB_BLCKSZ),
+	.len = S3_DEAD_UNIT_LEN};
+
+	if (seq_buf_get_offset(buf) != 0)
+		return true;
+	return seq_buf_write_file_extent(buf, unit);
+}
+
+/*
+ * Whether the tree records its dead extents: a persistent tree of a writer.
+ */
+bool
+s3_tree_records_dead(BTreeDescr *desc)
+{
+	return S3_WRITER_MODE &&
+		(desc->storageType == BTreeStoragePersistence ||
+		 desc->storageType == BTreeStorageUnlogged) &&
+		!btree_desc_is_local_temp(desc);
+}
+
+/*
+ * The S3 counterpart of checkpointable_tree_fill_seq_buffers(): only the
+ * dead extents of the checkpoint after chkp_num.
+ */
+static bool
+s3_tree_fill_dead_buffers(BTreeDescr *td, bool init,
+						  EvictedTreeData *evicted_tree_data, uint32 chkp_num)
+{
+	BTreeMetaPage *meta_page = BTREE_GET_META(td);
+	int			chkp_index = (chkp_num + 1) % 2;
+	SeqBufTag	tag;
+	EvictedSeqBufData *evicted_next = NULL;
+
+	memset(&tag, 0, sizeof(tag));
+	tag.key.oids = td->oids;
+	tag.key.oids.spcoid = td->oids.spcoid;
+	tag.num = chkp_num + 1;
+	tag.type = 'd';
+
+	if (evicted_tree_data && evicted_tree_data->nextChkp.tag.type == 'd' &&
+		SeqBufTagEqual(&tag, &evicted_tree_data->nextChkp.tag))
+		evicted_next = &evicted_tree_data->nextChkp;
+
+	if (init)
+		init_seq_buf_pages(td, &meta_page->nextChkp[chkp_index]);
+
+	if (!init_seq_buf(&td->nextChkp[chkp_index],
+					  &meta_page->nextChkp[chkp_index],
+					  &tag, true, init, 0, evicted_next))
+		return false;
+	if (!init_seq_buf(&td->nextChkp[1 - chkp_index],
+					  &meta_page->nextChkp[1 - chkp_index],
+					  NULL, true, false, 0, NULL))
+		return false;
+	return true;
+}
+
 static bool
 checkpointable_tree_fill_seq_buffers(BTreeDescr *td, bool init,
 									 EvictedTreeData *evicted_tree_data,
@@ -6043,9 +6287,14 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 						 uint32 *map_chkp_num, bool clear_tree)
 {
 	CheckpointFileHeader file_header = {0};
+	S3TreeCursors s3Cursors = {
+		.cursor = {InvalidFileExtentOff, InvalidFileExtentOff},
+		.sealFrom = {InvalidFileExtentOff, InvalidFileExtentOff}
+	};
 	BTreeMetaPage *meta_page;
 	uint32		chkp_num = *map_chkp_num;
 	bool		result = false;
+	bool		header_lost = false;
 
 	Assert(TREE_HAS_OIDS(desc));
 	Assert(evicted_data);
@@ -6058,6 +6307,7 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 	if (*evicted_data != NULL)
 	{
 		file_header = (*evicted_data)->file_header;
+		s3Cursors = (*evicted_data)->s3Cursors;
 	}
 	else if (clear_tree)
 	{
@@ -6122,6 +6372,18 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 			*map_chkp_num = prev_chkp_tag.num;
 			ferror = OFileRead(prev_chkp_file, (Pointer) &file_header,
 							   sizeof(file_header), 0, WAIT_EVENT_SLRU_READ) != sizeof(file_header);
+
+			/*
+			 * S3 mode: the map's stream cursors are not taken.  The map's
+			 * checkpoint sealed its own stream before writing it, so every
+			 * block the map names is in a sealed part.  What the other
+			 * stream wrote since it was last sealed is for the next
+			 * checkpoint, which never committed if we load from here (a tree
+			 * in memory since then has evicted data instead).  Those blocks
+			 * are named by nothing: both streams start on fresh parts, so the
+			 * parts that hold them are never sealed nor uploaded, rather than
+			 * one going on and uploading a part whose first blocks never die.
+			 */
 			if (ferror)
 			{
 				ereport(FATAL, (errcode_for_file_access(),
@@ -6155,6 +6417,7 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 				file_header.leafPagesNum = 1;
 				file_header.ctid = 0;
 				file_header.bridgeCtid = 0;
+				header_lost = true;
 			}
 			else if (!DiskDownlinkIsValid(file_header.rootDownlink) &&
 					 file_header.datafileLength == 0 &&
@@ -6173,6 +6436,7 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 				file_header.leafPagesNum = 1;
 				file_header.ctid = 0;
 				file_header.bridgeCtid = 0;
+				header_lost = true;
 			}
 		}
 
@@ -6214,7 +6478,27 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 	meta_page = BTREE_GET_META(desc);
 	pg_atomic_write_u64(&meta_page->numFreeBlocks, file_header.numFreeBlocks);
 	if (orioledb_s3_mode)
-		pg_atomic_write_u64(&meta_page->datafileLength[chkp_num % 2], file_header.datafileLength);
+	{
+		int			i;
+		uint64		next;
+
+		for (i = 0; i < 2; i++)
+		{
+			pg_atomic_write_u64(&meta_page->datafileLength[i], s3Cursors.cursor[i]);
+			meta_page->partsInfo[i].sealFrom = s3Cursors.sealFrom[i];
+		}
+		next = Max(file_header.datafileLength,
+				   s3_part_floor((OIndexKey) {.oids = desc->oids}));
+
+		/*
+		 * A map with its header lost does not say how many parts the tree
+		 * handed out: number on past every part the bucket has, never over
+		 * one of them.
+		 */
+		if (header_lost)
+			next = Max(next, s3_bucket_next_part((OIndexKey) {.oids = desc->oids}));
+		pg_atomic_write_u64(&meta_page->s3NextPart, next);
+	}
 	else
 		pg_atomic_write_u64(&meta_page->datafileLength[0], file_header.datafileLength);
 	pg_atomic_write_u32(&meta_page->leafPagesNum, file_header.leafPagesNum);
@@ -6278,6 +6562,83 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 }
 
 /* TODO: move this method ? */
+/*
+ * S3 mode: a tree emptied in place that a committed checkpoint has a map of
+ * (the unlogged trees reset after a crash, a TRUNCATE of a table created in
+ * the same transaction) gets an empty map.  Without one, the tree is opened
+ * from the bucket's map, and what was emptied comes back -- here, and in a
+ * load of any later checkpoint that does not write the tree again, as its
+ * manifest names the tree's latest map.  As a build does, the map is of the
+ * checkpoint going on (or next), under this run's token, never over the
+ * committed one, and is up before this returns.  The tree numbers its parts
+ * on from next.
+ */
+static void
+write_empty_map_file(OIndexKey key, uint32 num, uint64 next)
+{
+	SeqBufTag	tag = {0};
+	CheckpointFileHeader header = {0};
+	S3TreeCursors cursors = {
+		.cursor = {InvalidFileExtentOff, InvalidFileExtentOff},
+		.sealFrom = {InvalidFileExtentOff, InvalidFileExtentOff}
+	};
+	char	   *filename,
+			   *tmp;
+	int			fd;
+
+	tag.key = key;
+	tag.type = 'm';
+	tag.num = num;
+	header.rootDownlink = InvalidDiskDownlink;
+	header.datafileLength = next;
+	header.leafPagesNum = 1;
+	filename = get_seq_buf_filename(&tag);
+	tmp = psprintf("%s.tmp", filename);
+	fd = BasicOpenFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+	if (fd < 0 ||
+		write(fd, &header, sizeof(header)) != sizeof(header) ||
+		write(fd, &cursors, sizeof(cursors)) != sizeof(cursors) ||
+		pg_fsync(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", tmp)));
+	close(fd);
+	durable_rename(tmp, filename, ERROR);
+	pfree(tmp);
+	pfree(filename);
+	o_update_latest_chkp_num(key.oids.datoid, key.oids.relnode,
+							 key.oids.spcoid, num);
+}
+
+void
+s3_write_empty_map(OIndexKey key, uint64 next)
+{
+	uint32		last = checkpoint_state->lastCheckpointNumber;
+	bool		found;
+
+	(void) o_get_latest_chkp_num(key.oids.datoid, key.oids.relnode,
+								 key.oids.spcoid, PG_UINT32_MAX, &found);
+	if (!found)
+		return;
+
+	/*
+	 * Twice.  Under the last checkpoint's number, locally: this run opens
+	 * the tree at that number.  Under the next one, uploaded before going
+	 * on: the bucket's map of the last checkpoint is committed and stays,
+	 * and the next checkpoint names this one for a tree it did not change,
+	 * so a load from it finds the tree empty.
+	 */
+	write_empty_map_file(key, last, next);
+	write_empty_map_file(key, last + 1, next);
+	if (S3_WRITER_MODE)
+	{
+		S3TaskLocation location = s3_schedule_map_file_write(last + 1, key);
+
+		if (location > 0)
+			s3_queue_wait_for_location(location);
+	}
+}
+
 bool
 tbl_data_exists(ORelOids *oids)
 {
@@ -6509,11 +6870,18 @@ checkpointable_tree_init(BTreeDescr *desc, bool init_shmem, bool *was_evicted)
 		map_file_exists = evictable_tree_init_meta(desc, &evicted_tree_data,
 												   &map_chkp_num, false);
 
-	if (!orioledb_s3_mode &&
-		!checkpointable_tree_fill_seq_buffers(desc, init_shmem,
-											  evicted_tree_data, chkp_num,
-											  map_chkp_num,
-											  map_file_exists))
+	if (orioledb_s3_mode)
+	{
+		if (s3_tree_records_dead(desc) &&
+			!s3_tree_fill_dead_buffers(desc, init_shmem, evicted_tree_data,
+									   chkp_num))
+			ereport(FATAL, (errcode_for_file_access(),
+							errmsg("could not fill the dead extents buffer: %m")));
+	}
+	else if (!checkpointable_tree_fill_seq_buffers(desc, init_shmem,
+												   evicted_tree_data, chkp_num,
+												   map_chkp_num,
+												   map_file_exists))
 	{
 		ereport(FATAL, (errcode_for_file_access(),
 						errmsg("could not fill sequence buffers: %m")));

@@ -35,9 +35,11 @@ class S3UnloggedTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)
 
 	def test_2(self):
 
@@ -63,9 +65,11 @@ class S3UnloggedTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)
 
 	def test_3(self):
 
@@ -94,9 +98,11 @@ class S3UnloggedTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)
 
 	def test_4(self):
 
@@ -133,6 +139,8 @@ class S3UnloggedTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)

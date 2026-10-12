@@ -2,6 +2,9 @@ import inspect
 import json
 import logging
 import os
+import io
+import threading
+import struct
 import re
 from re import RegexFlag
 import runpy
@@ -41,6 +44,9 @@ def s3_test_attrs(**_):
 
 
 orig_put_object = S3Response.put_object
+orig_get_object = S3Response.get_object
+orig_list_objects_v2 = S3Response.list_objects_v2
+orig_delete_object = S3Response.delete_object
 
 
 # moto[s3] doesn't implement 409 HTTP error code therefore we need to do that
@@ -81,6 +87,232 @@ def mock_moto_unkown_error(self) -> TYPE_RESPONSE:
 	raise InvalidRequest("mock_moto_unkown_error")
 
 
+class TransientServerError(S3ClientError):
+	code = 503
+
+	def __init__(self, **kwargs: Any):
+		super().__init__("SlowDown", "Please reduce your request rate.",
+		                 **kwargs)
+
+
+class AccessDenied(S3ClientError):
+	code = 403
+
+	def __init__(self, **kwargs: Any):
+		super().__init__("AccessDenied", "Access Denied", **kwargs)
+
+
+class RevokedKeyPut:
+	"""
+	A put_object() that refuses (403) requests signed with a revoked access
+	key, as a store does once a rotated key is withdrawn, and stores the
+	others.
+	"""
+
+	def __init__(self, revoked, spare=()):
+		self.revoked = revoked
+		self.spare = spare
+		self.refused = 0
+		self.accepted = 0
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		if f"Credential={self.revoked}/" in response.headers.get(
+		    "Authorization", "") and \
+		    response.parse_key_name() not in self.spare:
+			self.refused += 1
+			raise AccessDenied()
+		self.accepted += 1
+		return orig_put_object(response)
+
+
+class RevokedKey:
+	"""
+	Refuses (403) every request signed with a revoked access key: a
+	put_object(), get_object() and list_objects_v2() in one, given the
+	handler each stands for.
+	"""
+
+	def __init__(self, revoked):
+		self.revoked = revoked
+		self.refused = 0
+
+	def __call__(self, response, handler) -> TYPE_RESPONSE:
+		if f"Credential={self.revoked}/" in response.headers.get(
+		    "Authorization", ""):
+			self.refused += 1
+			raise AccessDenied()
+		return handler(response)
+
+
+class AmbiguousPut:
+	"""
+	A put_object() that stores every `every`-th request for each kind of key
+	in `contains` and then answers it 503, as when the answer to a PUT that
+	went through is lost: the client cannot tell it from one that did not.
+	"""
+
+	def __init__(self, every=3, contains=('root', 'writer', '/chunks/',
+	                                      '/parts/', 'manifests/')):
+		self.every = every
+		self.contains = contains
+		self.seen = {c: 0 for c in contains}
+		self.landed = {c: 0 for c in contains}
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		key = response.parse_key_name()
+		kind = next((c for c in self.contains
+		             if (key == c if '/' not in c else c in key)), None)
+		if kind is not None:
+			self.seen[kind] += 1
+			if self.seen[kind] % self.every == 0:
+				orig_put_object(response)
+				self.landed[kind] += 1
+				raise TransientServerError()
+		return orig_put_object(response)
+
+
+class HoldChunksOf:
+	"""
+	A put_object() that answers 503 to WAL chunks of writer token `token`
+	until `release` is set, and stores everything else: one writer's
+	shipper waits while another's goes on.
+	"""
+
+	def __init__(self):
+		self.token = None
+		self.release = False
+		self.held = 0
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		if '/chunks/' in response.parse_key_name() and \
+		    self.token is not None and not self.release:
+			body = response.body
+			if isinstance(body, str):
+				body = body.encode()
+			if len(body) >= 16 and \
+			    struct.unpack('<I', body[0:4])[0] == 0x3143574f and \
+			    struct.unpack('<Q', body[8:16])[0] == self.token:
+				self.held += 1
+				raise TransientServerError()
+		return orig_put_object(response)
+
+
+class ConflictingPut:
+	"""
+	A put_object() that answers the first `conflicts` PUTs of keys holding
+	`contains` with 409 ConditionalRequestConflict, as AWS does to a
+	conditional PUT racing another write of the key, without storing.
+	"""
+
+	def __init__(self, conflicts, contains='/parts/'):
+		self.conflicts = conflicts
+		self.contains = contains
+		self.answered = 0
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		if self.contains in response.parse_key_name() and \
+		    self.answered < self.conflicts:
+			self.answered += 1
+			raise ConditionalRequestConflict("If-None-Match")
+		return orig_put_object(response)
+
+
+class FailingGet:
+	"""A get_object() that answers 503 to GETs of keys holding `contains`."""
+
+	def __init__(self, contains):
+		self.contains = contains
+		self.failed = 0
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		if self.contains in response.parse_key_name():
+			self.failed += 1
+			raise TransientServerError()
+		return orig_get_object(response)
+
+
+class FailingDelete:
+	"""
+	A delete_object() that answers the first `failures` DELETEs of keys
+	holding `contains` with 503, removing nothing.
+	"""
+
+	def __init__(self, failures, contains='/parts/'):
+		self.failures = failures
+		self.contains = contains
+		self.failed = 0
+		self.lock = threading.Lock()
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		if self.contains in response.parse_key_name():
+			with self.lock:
+				fail = self.failed < self.failures
+				if fail:
+					self.failed += 1
+			if fail:
+				raise TransientServerError()
+		return orig_delete_object(response)
+
+
+class HoldFirstGet:
+	"""
+	A get_object() that, once armed, holds the next GET of `key` (for which
+	`when()`, if given, holds) until `release` is set, and serves every
+	other request meanwhile: one process stops between two of its requests
+	while the others go on.
+	"""
+
+	def __init__(self, key, when=None):
+		self.key = key
+		self.when = when
+		self.armed = False
+		self.entered = threading.Event()
+		self.release = threading.Event()
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		if self.armed and response.parse_key_name() == self.key and \
+		    (self.when is None or self.when()):
+			self.armed = False
+			self.entered.set()
+			self.release.wait(120)
+		return orig_get_object(response)
+
+
+class FlakyPutObject:
+	"""
+	A put_object() that answers the first `failures` requests for a part
+	(or for keys under `prefix`) with 503, as a store under load does, then
+	stores them.
+	"""
+
+	def __init__(self, failures, prefix=None, contains='/parts/'):
+		self.failures = failures
+		self.failed = 0
+		self.prefix = prefix
+		self.contains = contains
+
+	def matches(self, key):
+		if self.prefix is not None:
+			return key.startswith(self.prefix)
+		return self.contains in key
+
+	def __call__(self, response) -> TYPE_RESPONSE:
+		if self.matches(response.parse_key_name()) and \
+		    self.failed < self.failures and not self.terminator(response):
+			self.failed += 1
+			raise TransientServerError()
+		return orig_put_object(response)
+
+	@staticmethod
+	def terminator(response):
+		# a start's terminator goes: the failures are the shipper's
+		body = response.body
+		if isinstance(body, str):
+			body = body.encode()
+		return len(body) >= 4 and \
+		    struct.unpack('<I', body[0:4])[0] == 0x3154574f
+
+
 # TODO: re-enable under valgrind once s3_header_mark_part_loaded race is fixed
 @unittest.skipIf(
     os.environ.get('USE_VALGRIND') == '1', 'S3 tests flaky under valgrind')
@@ -92,6 +324,36 @@ class S3BaseTest(BaseTest):
 	region = "us-east-1"
 	policy_name = "ORDB_POLICY"
 	optional_prefix = "prefix/test/"
+
+	def table_contents(self, node):
+		"""Every user table's rows (its own, not its children's), and whether
+		it is unlogged."""
+		result = {}
+		for name, persistence in node.execute("""
+			SELECT c.oid::regclass::text, c.relpersistence FROM pg_class c
+			JOIN pg_namespace n ON n.oid = c.relnamespace
+			WHERE c.relkind = 'r' AND n.nspname = 'public'
+		"""):
+			rows = node.execute(
+			    f"SELECT coalesce(string_agg(t::text, ';' ORDER BY t::text), '') "
+			    f"FROM ONLY {name} t")[0][0]
+			result[name] = (persistence, rows)
+		return result
+
+	def assert_contents_after_crash(self, node, before):
+		"""What a crash restart and a load from the bucket give: the logged
+		tables' rows as they were, the unlogged ones empty."""
+		expected = {name: (p, '' if p == 'u' else rows)
+		            for name, (p, rows) in before.items()}
+		self.assertEqual(expected, self.table_contents(node))
+		node.stop()
+		with self.initNode(self.getBasePort() + 1, 'tgsr') as loaded:
+			self.loader.download(loaded.data_dir)
+			loaded.append_conf(port=loaded.port)
+			loaded.start()
+			self.assertEqual(expected, self.table_contents(loaded))
+			loaded.stop()
+			loaded.cleanup()
 
 	def setUp(self):
 		super().setUp()
@@ -244,7 +506,8 @@ class OrioledbS3Loader:
 		self._prefix = prefix
 		self._verify = verify
 
-	def download(self, path, verbose=False):
+	def download(self, path, verbose=False, checkpoint_only=False, as_of=None,
+	             keep_parts=False, local_wal=False, repair_root=False):
 		dir_path = os.path.dirname(os.path.realpath(__file__))
 		old_argv = sys.argv
 		sys.argv = [f"{dir_path}/../../orioledb_s3_loader.py"]
@@ -256,6 +519,18 @@ class OrioledbS3Loader:
 		sys.argv += ["-d", path]
 		if verbose:
 			sys.argv += ["--verbose"]
+		if checkpoint_only:
+			sys.argv += ["--checkpoint-only"]
+		if as_of is not None:
+			sys.argv += ["--as-of", str(as_of)]
+		if keep_parts:
+			sys.argv += ["--keep-parts"]
+		if local_wal:
+			sys.argv += ["--local-wal"]
+		if path is None:
+			sys.argv.remove("-d")
+			sys.argv.remove(None)
+			sys.argv += ["--repair-root" if repair_root else "--sweep"]
 		runpy.run_path(sys.argv[0], None, "__main__")
 		sys.argv = old_argv
 
@@ -274,12 +549,32 @@ class MotoServerSSL:
 		self._ssl_context = ssl_context
 
 	def _server_entry(self) -> None:
-		app = DomainDispatcherApplication(create_backend_app)
+		backend = DomainDispatcherApplication(create_backend_app)
+		puts = threading.Lock()
+
+		def app(environ, start_response):
+			# requests are served concurrently, as a store does; writes
+			# (PUT, POST, DELETE) one at a time, so a conditional PUT is
+			# judged and stored atomically against deletes too, and the
+			# fault injectors count without races. The body is read before
+			# the lock: a slow upload must not hold the other writes.
+			if environ.get('REQUEST_METHOD') in ('PUT', 'POST', 'DELETE'):
+				length = environ.get('CONTENT_LENGTH')
+				if length:
+					body = environ['wsgi.input'].read(int(length))
+				elif environ.get('wsgi.input_terminated'):
+					body = environ['wsgi.input'].read()  # chunked
+				else:
+					body = b''
+				environ['wsgi.input'] = io.BytesIO(body)
+				with puts:
+					return list(backend(environ, start_response))
+			return backend(environ, start_response)
 
 		self._server = make_server(self._host,
 		                           self._port,
 		                           app,
-		                           False,
+		                           True,
 		                           ssl_context=self._ssl_context,
 		                           passthrough_errors=True)
 		self._server_ready = True

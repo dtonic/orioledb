@@ -31,6 +31,27 @@ struct CheckpointFileHeader
 	uint32		leafPagesNum;
 };
 
+/*
+ * S3 mode: where a tree's two streams stand.  datafileLength of the
+ * CheckpointFileHeader holds the tree's next part number; these follow the
+ * header in the tree's map, and travel with an evicted tree.  A tree loaded
+ * from its map starts both streams on fresh parts instead (see
+ * evictable_tree_init_meta()).
+ */
+typedef struct
+{
+	uint64		cursor[2];		/* block offset of each stream's next
+								 * extent, or InvalidFileExtentOff */
+	uint64		sealFrom[2];	/* first part each stream opened since it was
+								 * last sealed, or InvalidFileExtentOff */
+} S3TreeCursors;
+
+#define S3_TREE_CURSORS_INIT(c) \
+	do { \
+		(c).cursor[0] = (c).cursor[1] = InvalidFileExtentOff; \
+		(c).sealFrom[0] = (c).sealFrom[1] = InvalidFileExtentOff; \
+	} while (0)
+
 typedef enum
 {
 	NextKeyNone,
@@ -241,6 +262,7 @@ typedef struct
 } CheckpointState;
 
 #define XID_FILENAME_FORMAT (ORIOLEDB_DATA_DIR"/%u.xid")
+#define XIDMAP_RANGE_FILENAME_FORMAT (ORIOLEDB_DATA_DIR"/%u.xidrange")
 
 #define chkp_inc_changecount_before(state)	\
 	do {	\
@@ -291,8 +313,11 @@ extern bool get_checkpoint_number(BTreeDescr *desc, OInMemoryBlkno blkno, uint32
 extern uint32 get_cur_checkpoint_number(ORelOids *oids, OIndexType type, bool *checkpoint_concurrent);
 extern bool can_use_checkpoint_extents(BTreeDescr *desc, uint32 chkp_num);
 extern void free_extent_for_checkpoint(BTreeDescr *desc, FileExtent *extent, uint32 chkp_num);
+extern bool s3_tree_records_dead(BTreeDescr *desc);
+extern bool s3_dead_list_start(BTreeDescr *desc, SeqBufDescPrivate *buf);
 extern void backend_set_autonomous_level(CheckpointState *state, uint32 level);
 extern bool tbl_data_exists(ORelOids *oids);
+extern void s3_write_empty_map(OIndexKey key, uint64 next);
 extern void evictable_tree_init(BTreeDescr *desc, bool init_shmem,
 								bool *was_evicted);
 extern void checkpointable_tree_init(BTreeDescr *desc, bool init_shmem,

@@ -25,6 +25,7 @@
 #include "catalog/o_tables.h"
 #include "recovery/recovery.h"
 #include "rewind/rewind.h"
+#include "s3/manifest.h"
 #include "tableam/descr.h"
 #include "transam/oxid.h"
 #include "transam/undo.h"
@@ -1176,7 +1177,12 @@ check_pending_truncates(void)
 		offset += length;
 
 		for (int i = 0; i < numTrees; i++)
+		{
 			cleanup_btree_files(trees[i], true);
+			if (orioledb_s3_mode)
+				s3_note_dropped_tree(trees[i].oids.datoid,
+									 trees[i].oids.relnode);
+		}
 	}
 
 	pending_truncates_meta->pendingTruncatesLocation = 0;
@@ -1350,6 +1356,9 @@ btree_relnode_undo_callback(UndoLogType undoType, UndoLocation location,
 			if (doCleanup)
 			{
 				cleanup_btree(dropTrees[i], cleanupFiles, true);
+				if (orioledb_s3_mode && cleanupFiles)
+					s3_note_dropped_tree(dropTrees[i].oids.datoid,
+										 dropTrees[i].oids.relnode);
 				o_delete_chkp_num(dropTrees[i].oids.datoid,
 								  dropTrees[i].oids.relnode,
 								  dropTrees[i].oids.spcoid);

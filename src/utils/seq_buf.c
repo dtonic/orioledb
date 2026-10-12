@@ -145,6 +145,8 @@ get_seq_buf_filename(SeqBufTag *tag)
 		typename = "tmp";
 	else if (tag->type == 'm')
 		typename = "map";
+	else if (tag->type == 'd')
+		typename = "dead";
 	else
 	{
 		Assert(false);

@@ -308,7 +308,6 @@ btree_write_index_data(BTreeDescr *desc, TupleDesc tupdesc,
 	int			i;
 	Datum	   *values;
 	bool	   *isnull;
-	uint32		chkpNum;
 
 	btree_open_smgr(desc);
 
@@ -316,8 +315,20 @@ btree_write_index_data(BTreeDescr *desc, TupleDesc tupdesc,
 	values = (Datum *) palloc(sizeof(Datum) * tupdesc->natts);
 	isnull = (bool *) palloc(sizeof(bool) * tupdesc->natts);
 
-	pg_atomic_init_u64(&metaPage.datafileLength[0], 0);
-	pg_atomic_init_u64(&metaPage.datafileLength[1], 0);
+	if (orioledb_s3_mode)
+	{
+		/* a fresh tree: no open part, parts numbered from 0, stream 0 */
+		pg_atomic_init_u64(&metaPage.datafileLength[0], InvalidFileExtentOff);
+		pg_atomic_init_u64(&metaPage.datafileLength[1], InvalidFileExtentOff);
+		pg_atomic_init_u64(&metaPage.s3NextPart, 0);
+		metaPage.partsInfo[0].sealFrom = InvalidFileExtentOff;
+		metaPage.partsInfo[1].sealFrom = InvalidFileExtentOff;
+	}
+	else
+	{
+		pg_atomic_init_u64(&metaPage.datafileLength[0], 0);
+		pg_atomic_init_u64(&metaPage.datafileLength[1], 0);
+	}
 	pg_atomic_init_u64(&metaPage.numFreeBlocks, 0);
 	pg_atomic_init_u32(&metaPage.leafPagesNum, 0);
 	pg_atomic_init_u64(&metaPage.ctid, ctid);
@@ -390,17 +401,22 @@ btree_write_index_data(BTreeDescr *desc, TupleDesc tupdesc,
 	if (root_level == 0)
 		pg_atomic_add_fetch_u32(&metaPage.leafPagesNum, 1);
 
+	if (orioledb_s3_mode)
+	{
+		/* the build is complete: seal its parts before the map names them */
+		desc->buildNextPart = pg_atomic_read_u64(&metaPage.s3NextPart);
+		desc->buildSealFrom = metaPage.partsInfo[0].sealFrom;
+		btree_s3_seal_build(desc, pg_atomic_read_u64(&metaPage.datafileLength[0]));
+	}
 	btree_close_smgr(desc);
 	pfree(stack);
 
-	if (orioledb_s3_mode)
-		chkpNum = S3_GET_CHKP_NUM(DOWNLINK_GET_DISK_OFF(downlink));
-	else
-		chkpNum = 0;
-
 	memset(file_header, 0, sizeof(*file_header));
 	file_header->rootDownlink = downlink;
-	file_header->datafileLength = pg_atomic_read_u64(&metaPage.datafileLength[chkpNum % 2]);
+	if (orioledb_s3_mode)
+		file_header->datafileLength = pg_atomic_read_u64(&metaPage.s3NextPart);
+	else
+		file_header->datafileLength = pg_atomic_read_u64(&metaPage.datafileLength[0]);
 	file_header->numFreeBlocks = pg_atomic_read_u64(&metaPage.numFreeBlocks);
 	file_header->leafPagesNum = pg_atomic_read_u32(&metaPage.leafPagesNum);
 	file_header->ctid = pg_atomic_read_u64(&metaPage.ctid);
@@ -466,17 +482,18 @@ btree_write_file_header(BTreeDescr *desc, CheckpointFileHeader *file_header)
 								 desc->oids.spcoid,
 								 checkpoint_number);
 
-		if (orioledb_s3_mode)
+		if (S3_WRITER_MODE)
 		{
 			OIndexKey	key = {.oids = desc->oids};
 
-			result = s3_schedule_file_part_write(checkpoint_number, key, -1, -1);
+			result = s3_schedule_map_file_write(checkpoint_number, key);
 		}
 	}
 	else
 	{
 		EvictedTreeData evicted_tree_data = {{0}};
 
+		S3_TREE_CURSORS_INIT(evicted_tree_data.s3Cursors);
 		evicted_tree_data.key.datoid = desc->oids.datoid;
 		evicted_tree_data.key.relnode = desc->oids.relnode;
 		evicted_tree_data.key.tablespace = desc->oids.spcoid;

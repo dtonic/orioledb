@@ -20,8 +20,12 @@
 #include "catalog/o_sys_cache.h"
 #include "s3/checksum.h"
 #include "s3/headers.h"
+#include "s3/gc.h"
+#include "s3/lease.h"
+#include "s3/manifest.h"
 #include "s3/queue.h"
 #include "s3/requests.h"
+#include "s3/wal_shipper.h"
 #include "s3/worker.h"
 
 #include "access/xlog_internal.h"
@@ -47,7 +51,7 @@
 
 
 static S3TaskLocation s3_schedule_file_part_read(uint32 chkpNum, OIndexKey key,
-												 int32 segNum, int32 partNum);
+												 int64 partNum);
 
 #define WORKERS_FILE_CHECKSUMS_MAX_LEN 100
 
@@ -275,6 +279,65 @@ flush_worker_checksum_state(void)
 }
 
 /*
+ * Object names of a tree's data.  A part is named by its number in the
+ * tree's own address space, nothing else: it is written once and read back
+ * by that name for as long as any checkpoint refers to it.  A map is the
+ * tree's state at one checkpoint.
+ */
+static char *
+s3_part_object_name(OIndexKey key, int64 partNum)
+{
+	return psprintf("trees/%u/%u/parts/" INT64_FORMAT,
+					key.oids.datoid, key.oids.relnode, partNum);
+}
+
+static char *
+s3_map_object_name(OIndexKey key, uint64 token, uint32 chkpNum)
+{
+	return psprintf("trees/%u/%u/maps/" UINT64_FORMAT "-%u",
+					key.oids.datoid, key.oids.relnode, token, chkpNum);
+}
+
+/*
+ * Fetch the map of checkpoint chkpNum.  It was written by the run that did
+ * that checkpoint, or by a run that started after it (a build names its tree's
+ * map with the last checkpoint done): s3_map_tokens().
+ */
+static void
+s3_get_map(OIndexKey key, uint32 chkpNum, char *filename)
+{
+	uint64	   *tokens;
+	int			n = s3_map_tokens(chkpNum, &tokens);
+	StringInfoData buf;
+	char	   *objectname;
+
+	if (n == 0)
+		elog(ERROR, "no S3 writer token is known for checkpoint %u", chkpNum);
+	initStringInfo(&buf);
+	for (int i = 0; i < n - 1; i++)
+	{
+		objectname = s3_map_object_name(key, tokens[i], chkpNum);
+		resetStringInfo(&buf);
+		if (s3_get_object(objectname, &buf, true) == S3_RESPONSE_OK)
+		{
+			elog(DEBUG1, "S3 map get %s %s", objectname, filename);
+			s3_write_file(filename, buf.data, buf.len);
+			pfree(objectname);
+			pfree(buf.data);
+			pfree(tokens);
+			return;
+		}
+		pfree(objectname);
+	}
+	objectname = s3_map_object_name(key, tokens[n - 1], chkpNum);
+	elog(DEBUG1, "S3 map get %s %s", objectname, filename);
+	s3_get_file(objectname, filename);
+	pfree(objectname);
+	pfree(buf.data);
+	pfree(tokens);
+}
+
+/*
  * Process the task at given location.
  */
 static void
@@ -293,7 +356,8 @@ s3process_task(uint64 taskLocation)
 		if (filename[0] == '.' && filename[1] == '/')
 			filename += 2;
 
-		objectname = psprintf("data/%u/%s",
+		objectname = psprintf("data/" UINT64_FORMAT "-%u/%s",
+							  s3_checkpoint_token(task->typeSpecific.writeFile.chkpNum),
 							  task->typeSpecific.writeFile.chkpNum,
 							  filename);
 
@@ -313,8 +377,9 @@ s3process_task(uint64 taskLocation)
 		if (dirname[0] == '.' && dirname[1] == '/')
 			dirname += 2;
 
-		objectname = psprintf("data/%u/%s/",
-							  task->typeSpecific.writeFile.chkpNum,
+		objectname = psprintf("data/" UINT64_FORMAT "-%u/%s/",
+							  s3_checkpoint_token(task->typeSpecific.writeEmptyDir.chkpNum),
+							  task->typeSpecific.writeEmptyDir.chkpNum,
 							  dirname);
 
 		elog(DEBUG1, "S3 dir put %s %s", objectname, dirname);
@@ -323,7 +388,7 @@ s3process_task(uint64 taskLocation)
 		pfree(objectname);
 	}
 	else if (task->type == S3TaskTypeReadFilePart &&
-			 task->typeSpecific.filePart.segNum < 0)
+			 task->typeSpecific.filePart.partNum < 0)
 	{
 		char	   *filename;
 		SeqBufTag	chkp_tag;
@@ -334,42 +399,27 @@ s3process_task(uint64 taskLocation)
 		chkp_tag.type = 'm';
 
 		filename = get_seq_buf_filename(&chkp_tag);
-
-		objectname = psprintf("orioledb_data/%u/%u/%u.map",
-							  task->typeSpecific.filePart.chkpNum,
-							  task->typeSpecific.filePart.key.oids.datoid,
-							  task->typeSpecific.filePart.key.oids.relnode);
-
-		elog(DEBUG1, "S3 map get %s %s", objectname, filename);
-
-		s3_get_file(objectname, filename);
-
+		s3_get_map(task->typeSpecific.filePart.key,
+				   task->typeSpecific.filePart.chkpNum, filename);
 		pfree(filename);
-		pfree(objectname);
 	}
 	else if (task->type == S3TaskTypeReadFilePart)
 	{
 		char	   *filename;
 		S3HeaderTag tag;
+		int64		partNum = task->typeSpecific.filePart.partNum;
+		int32		segNum = partNum / S3_PARTS_PER_SEGMENT,
+					index = partNum % S3_PARTS_PER_SEGMENT;
 
-		filename = btree_filename(task->typeSpecific.filePart.key,
-								  task->typeSpecific.filePart.segNum,
-								  task->typeSpecific.filePart.chkpNum);
-
-		objectname = psprintf("orioledb_data/%u/%u/%u.%u.%u",
-							  task->typeSpecific.filePart.chkpNum,
-							  task->typeSpecific.filePart.key.oids.datoid,
-							  task->typeSpecific.filePart.key.oids.relnode,
-							  task->typeSpecific.filePart.segNum,
-							  task->typeSpecific.filePart.partNum);
+		filename = btree_filename(task->typeSpecific.filePart.key, segNum, 0);
+		objectname = s3_part_object_name(task->typeSpecific.filePart.key, partNum);
 
 		elog(DEBUG1, "S3 part get %s %s", objectname, filename);
 
-		s3_get_file_part(objectname, filename, task->typeSpecific.filePart.partNum);
+		s3_get_file_part(objectname, filename, index);
 
 		tag.key = task->typeSpecific.filePart.key;
-		tag.checkpointNum = task->typeSpecific.filePart.chkpNum;
-		tag.segNum = task->typeSpecific.filePart.segNum;
+		tag.segNum = segNum;
 
 		/*
 		 * A worker that errors out is restarted with bgw_restart_time 0 and
@@ -386,55 +436,75 @@ s3process_task(uint64 taskLocation)
 		 * evicted in between and it just claimed it back for us, and Loaded
 		 * means the first attempt already finished this.
 		 */
-		if (s3_header_mark_part_loading(tag, task->typeSpecific.filePart.partNum) !=
-			S3PartStatusLoaded)
-			s3_header_mark_part_loaded(tag, task->typeSpecific.filePart.partNum);
+		if (s3_header_mark_part_loading(tag, index) != S3PartStatusLoaded)
+			s3_header_mark_part_loaded(tag, index);
 
 		pfree(filename);
 		pfree(objectname);
 	}
 	else if (task->type == S3TaskTypeWriteFilePart &&
-			 task->typeSpecific.filePart.segNum >= 0)
+			 task->typeSpecific.filePart.partNum >= 0)
 	{
 		char	   *filename;
 		S3HeaderTag tag;
+		int64		partNum = task->typeSpecific.filePart.partNum;
+		int32		segNum = partNum / S3_PARTS_PER_SEGMENT,
+					index = partNum % S3_PARTS_PER_SEGMENT;
 
-		filename = btree_filename(task->typeSpecific.filePart.key,
-								  task->typeSpecific.filePart.segNum,
-								  task->typeSpecific.filePart.chkpNum);
-
-		objectname = psprintf("orioledb_data/%u/%u/%u.%u.%u",
-							  task->typeSpecific.filePart.chkpNum,
-							  task->typeSpecific.filePart.key.oids.datoid,
-							  task->typeSpecific.filePart.key.oids.relnode,
-							  task->typeSpecific.filePart.segNum,
-							  task->typeSpecific.filePart.partNum);
+		filename = btree_filename(task->typeSpecific.filePart.key, segNum, 0);
+		objectname = s3_part_object_name(task->typeSpecific.filePart.key, partNum);
 
 		elog(DEBUG1, "S3 part put %s %s", objectname, filename);
 
 		tag.key = task->typeSpecific.filePart.key;
-		tag.checkpointNum = task->typeSpecific.filePart.chkpNum;
-		tag.segNum = task->typeSpecific.filePart.segNum;
+		tag.segNum = segNum;
 
-		s3_header_mark_part_writing(tag, task->typeSpecific.filePart.partNum);
+		s3_header_mark_part_writing(tag, index);
 
 		PG_TRY();
 		{
-			(void) s3_put_file_part(objectname, filename, task->typeSpecific.filePart.partNum);
+			(void) s3_put_file_part(objectname, filename, index);
 		}
 		PG_CATCH();
 		{
-			s3_header_mark_part_not_written(tag, task->typeSpecific.filePart.partNum);
+			s3_header_mark_part_not_written(tag, index);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
 
-		s3_header_mark_part_written(tag, task->typeSpecific.filePart.partNum);
+		s3_header_mark_part_written(tag, index);
 		pfree(filename);
 		pfree(objectname);
 	}
 	else if (task->type == S3TaskTypeWriteFilePart &&
-			 task->typeSpecific.filePart.segNum < 0)
+			 task->typeSpecific.filePart.partNum == S3_DEAD_FILE_PART)
+	{
+		char	   *filename;
+		SeqBufTag	dead_tag;
+		OIndexKey	key = task->typeSpecific.filePart.key;
+
+		memset(&dead_tag, 0, sizeof(dead_tag));
+		dead_tag.key = key;
+		dead_tag.num = task->typeSpecific.filePart.chkpNum;
+		dead_tag.type = 'd';
+
+		filename = get_seq_buf_filename(&dead_tag);
+		objectname = psprintf("trees/%u/%u/dead/" UINT64_FORMAT "-%u",
+							  key.oids.datoid, key.oids.relnode,
+							  s3_checkpoint_token(dead_tag.num), dead_tag.num);
+
+		elog(DEBUG1, "S3 dead extents put %s %s", objectname, filename);
+
+		/* the GC folds the local copy; without a GC nothing reads it here */
+		if (s3_put_file(objectname, filename, false) == S3_RESPONSE_OK &&
+			s3_gc_interval == 0)
+			(void) unlink(filename);
+
+		pfree(filename);
+		pfree(objectname);
+	}
+	else if (task->type == S3TaskTypeWriteFilePart &&
+			 task->typeSpecific.filePart.partNum < 0)
 	{
 		char	   *filename;
 		SeqBufTag	chkp_tag;
@@ -445,14 +515,17 @@ s3process_task(uint64 taskLocation)
 		chkp_tag.type = 'm';
 
 		filename = get_seq_buf_filename(&chkp_tag);
-
-		objectname = psprintf("orioledb_data/%u/%u/%u.map",
-							  task->typeSpecific.filePart.chkpNum,
-							  task->typeSpecific.filePart.key.oids.datoid,
-							  task->typeSpecific.filePart.key.oids.relnode);
+		/* the run that writes a map is the one whose key it is */
+		objectname = s3_map_object_name(task->typeSpecific.filePart.key,
+										s3_lease_token(),
+										task->typeSpecific.filePart.chkpNum);
 
 		elog(DEBUG1, "S3 map put %s %s", objectname, filename);
 
+		/*
+		 * The key names the writer: no other writer's map is ever here, and
+		 * ours may be written again (a build, then the checkpoint).
+		 */
 		s3_put_file(objectname, filename, false);
 
 		pfree(filename);
@@ -461,18 +534,60 @@ s3process_task(uint64 taskLocation)
 	else if (task->type == S3TaskTypeWriteWALFile)
 	{
 		char	   *filename;
+		Pointer		data;
+		uint64		size;
 
+		/*
+		 * The WAL a checkpoint without the shipper leaves unarchived, the
+		 * segment it ends in named "<segment>.partial": tagged and fenced
+		 * like an archived one, so a writer fenced off cannot put its
+		 * version over the bucket's.
+		 */
+		filename = psprintf(XLOGDIR "/%.*s", XLOG_FNAME_LEN,
+							task->typeSpecific.walFilename);
+		objectname = psprintf("wal/%s", task->typeSpecific.walFilename);
+		data = read_file(filename, &size);
+		if (data == NULL)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read file \"%s\"", filename)));
+		while (s3_put_object_fenced_until(objectname, data, size, NULL,
+										  s3_lease_hold()) != S3_RESPONSE_OK)
+			;
+		pfree(data);
+		pfree(filename);
+		pfree(objectname);
+	}
+	else if (task->type == S3TaskTypeWriteArchiveFile)
+	{
+		char	   *filename;
+		Pointer		data;
+		uint64		size;
+
+		/*
+		 * A completed segment or a timeline history is written once: a
+		 * writer that was fenced off can neither put its version of a
+		 * segment over ours nor start a timeline another writer started.
+		 */
 		filename = psprintf(XLOGDIR "/%s", task->typeSpecific.walFilename);
 		objectname = psprintf("wal/%s", task->typeSpecific.walFilename);
-
-		s3_put_file(objectname, filename, false);
-
+		data = read_file(filename, &size);
+		if (data == NULL)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read file \"%s\"", filename)));
+		/* a key not taken yet is no fence: the lease is, while it lasts */
+		while (s3_put_object_fenced_until(objectname, data, size, NULL,
+										  s3_lease_hold()) != S3_RESPONSE_OK)
+			;
+		pfree(data);
 		pfree(filename);
 		pfree(objectname);
 	}
 	else if (task->type == S3TaskTypeWriteUndoFile)
 	{
 		uint64		fileNum = task->typeSpecific.writeUndoFile.fileNum;
+		uint32		chkpNum = task->typeSpecific.writeUndoFile.chkpNum;
 		char	   *filename;
 
 		if (task->typeSpecific.writeUndoFile.undoType == UndoLogRegular)
@@ -480,27 +595,30 @@ s3process_task(uint64 taskLocation)
 			filename = psprintf(ORIOLEDB_UNDO_DATA_ROW_FILENAME_TEMPLATE,
 								(uint32) (fileNum >> 32),
 								(uint32) fileNum);
-			objectname = psprintf("orioledb_undo/%02X%08Xrow",
+			objectname = psprintf("orioledb_undo/%02X%08Xrow/" UINT64_FORMAT "-%u",
 								  (uint32) (fileNum >> 32),
-								  (uint32) fileNum);
+								  (uint32) fileNum,
+								  s3_checkpoint_token(chkpNum), chkpNum);
 		}
 		else if (task->typeSpecific.writeUndoFile.undoType == UndoLogRegularPageLevel)
 		{
 			filename = psprintf(ORIOLEDB_UNDO_DATA_PAGE_FILENAME_TEMPLATE,
 								(uint32) (fileNum >> 32),
 								(uint32) fileNum);
-			objectname = psprintf("orioledb_undo/%02X%08Xpage",
+			objectname = psprintf("orioledb_undo/%02X%08Xpage/" UINT64_FORMAT "-%u",
 								  (uint32) (fileNum >> 32),
-								  (uint32) fileNum);
+								  (uint32) fileNum,
+								  s3_checkpoint_token(chkpNum), chkpNum);
 		}
 		else if (task->typeSpecific.writeUndoFile.undoType == UndoLogSystem)
 		{
 			filename = psprintf(ORIOLEDB_UNDO_SYSTEM_FILENAME_TEMPLATE,
 								(uint32) (fileNum >> 32),
 								(uint32) fileNum);
-			objectname = psprintf("orioledb_undo/%02X%08Xsystem",
+			objectname = psprintf("orioledb_undo/%02X%08Xsystem/" UINT64_FORMAT "-%u",
 								  (uint32) (fileNum >> 32),
-								  (uint32) fileNum);
+								  (uint32) fileNum,
+								  s3_checkpoint_token(chkpNum), chkpNum);
 		}
 		else
 		{
@@ -533,6 +651,21 @@ s3process_task(uint64 taskLocation)
 		if ((result == S3_RESPONSE_OK) && task->typeSpecific.writeRootFile.delete)
 			unlink(filename);
 	}
+	else if (task->type == S3TaskTypeDeleteWalChunks)
+	{
+		uint64		from = task->typeSpecific.deleteWalChunks.fromSeq,
+					to = task->typeSpecific.deleteWalChunks.toSeq;
+		int			count = (int) (to - from);
+		char	  **keys = palloc(sizeof(char *) * Max(count, 1));
+
+		for (int i = 0; i < count; i++)
+			keys[i] = s3_wal_chunk_key(task->typeSpecific.deleteWalChunks.timeline,
+									   from + i);
+		s3_delete_objects(keys, count);
+		for (int i = 0; i < count; i++)
+			pfree(keys[i]);
+		pfree(keys);
+	}
 	else if (task->type == S3TaskTypeWritePGFile)
 	{
 		char	   *filename = task->typeSpecific.writePGFile.filename;
@@ -542,7 +675,8 @@ s3process_task(uint64 taskLocation)
 		if (filename[0] == '.' && filename[1] == '/')
 			filename += 2;
 
-		objectname = psprintf("data/%u/%s",
+		objectname = psprintf("data/" UINT64_FORMAT "-%u/%s",
+							  s3_checkpoint_token(task->typeSpecific.writePGFile.chkpNum),
 							  task->typeSpecific.writePGFile.chkpNum,
 							  filename);
 
@@ -606,6 +740,8 @@ s3_schedule_file_write(uint32 chkpNum, char *filename, bool delete)
 	memcpy(task->typeSpecific.writeFile.filename, filename, filenameLen + 1);
 
 	location = s3_queue_put_task((Pointer) task, taskLen);
+	s3_manifest_note(chkpNum, "data %s",
+					 (filename[0] == '.' && filename[1] == '/') ? filename + 2 : filename);
 
 	elog(DEBUG1, "S3 schedule file write: %s %u %u (%llu)",
 		 filename, chkpNum, delete ? 1 : 0, (unsigned long long) location);
@@ -635,6 +771,8 @@ s3_schedule_empty_dir_write(uint32 chkpNum, char *dirname)
 	memcpy(task->typeSpecific.writeEmptyDir.dirname, dirname, dirnameLen + 1);
 
 	location = s3_queue_put_task((Pointer) task, taskLen);
+	s3_manifest_note(chkpNum, "data %s/",
+					 (dirname[0] == '.' && dirname[1] == '/') ? dirname + 2 : dirname);
 
 	elog(DEBUG1, "S3 schedule empty dir write: %s %u (%llu)",
 		 dirname, chkpNum, (unsigned long long) location);
@@ -645,30 +783,29 @@ s3_schedule_empty_dir_write(uint32 chkpNum, char *dirname)
 }
 
 /*
- * Schedule a synchronization of given data file part to S3.
+ * Schedule the upload of a sealed part.  The caller sealed it
+ * (s3_header_seal_part); a part already queued or clean is left alone.
  */
 S3TaskLocation
-s3_schedule_file_part_write(uint32 chkpNum, OIndexKey key,
-							int32 segNum, int32 partNum)
+s3_schedule_file_part_write(OIndexKey key, int64 partNum)
 {
 	S3Task	   *task;
 	S3TaskLocation location;
-	S3HeaderTag tag = {.key = key,.checkpointNum = chkpNum,.segNum = segNum};
+	S3HeaderTag tag = {.key = key,.segNum = partNum / S3_PARTS_PER_SEGMENT};
 
-	if (partNum >= 0 && !s3_header_mark_part_scheduled_for_write(tag, partNum))
+	if (!s3_header_mark_part_scheduled_for_write(tag, partNum % S3_PARTS_PER_SEGMENT))
 		return (S3TaskLocation) 0;
 
 	task = (S3Task *) palloc0(sizeof(S3Task));
 	task->type = S3TaskTypeWriteFilePart;
-	task->typeSpecific.filePart.chkpNum = chkpNum;
+	task->typeSpecific.filePart.chkpNum = 0;
 	task->typeSpecific.filePart.key = key;
-	task->typeSpecific.filePart.segNum = segNum;
 	task->typeSpecific.filePart.partNum = partNum;
 
 	location = s3_queue_put_task((Pointer) task, sizeof(S3Task));
 
-	elog(DEBUG1, "S3 schedule file part write: %u %u %u %d %d (%llu)",
-		 key.oids.datoid, key.oids.relnode, chkpNum, segNum, partNum,
+	elog(DEBUG1, "S3 schedule file part write: %u %u " INT64_FORMAT " (%llu)",
+		 key.oids.datoid, key.oids.relnode, partNum,
 		 (unsigned long long) location);
 
 	pfree(task);
@@ -677,20 +814,64 @@ s3_schedule_file_part_write(uint32 chkpNum, OIndexKey key,
 }
 
 /*
- * Schedule the read of given data file part from S3.
+ * Schedule the upload of a tree's map of the given checkpoint.
  */
-static S3TaskLocation
-s3_schedule_file_part_read(uint32 chkpNum, OIndexKey key, int32 segNum,
-						   int32 partNum)
+S3TaskLocation
+s3_schedule_map_file_write(uint32 chkpNum, OIndexKey key)
 {
 	S3Task	   *task;
 	S3TaskLocation location;
-	S3PartStatus status;
-	S3HeaderTag tag = {
-		.key = key,
-		.checkpointNum = chkpNum,
-		.segNum = segNum
-	};
+
+	task = (S3Task *) palloc0(sizeof(S3Task));
+	task->type = S3TaskTypeWriteFilePart;
+	task->typeSpecific.filePart.chkpNum = chkpNum;
+	task->typeSpecific.filePart.key = key;
+	task->typeSpecific.filePart.partNum = -1;
+
+	location = s3_queue_put_task((Pointer) task, sizeof(S3Task));
+	s3_manifest_note(chkpNum, "map %u %u %u", key.oids.datoid, key.oids.relnode,
+					 key.oids.spcoid);
+
+	elog(DEBUG1, "S3 schedule map write: %u %u %u (%llu)",
+		 key.oids.datoid, key.oids.relnode, chkpNum,
+		 (unsigned long long) location);
+
+	pfree(task);
+
+	return location;
+}
+
+/*
+ * Schedule the upload of the extents of a tree that died at chkpNum.
+ */
+S3TaskLocation
+s3_schedule_dead_file_write(uint32 chkpNum, OIndexKey key)
+{
+	S3Task	   *task;
+	S3TaskLocation location;
+
+	task = (S3Task *) palloc0(sizeof(S3Task));
+	task->type = S3TaskTypeWriteFilePart;
+	task->typeSpecific.filePart.chkpNum = chkpNum;
+	task->typeSpecific.filePart.key = key;
+	task->typeSpecific.filePart.partNum = S3_DEAD_FILE_PART;
+
+	location = s3_queue_put_task((Pointer) task, sizeof(S3Task));
+	s3_manifest_note(chkpNum, "dead %u %u %u", key.oids.datoid, key.oids.relnode,
+					 key.oids.spcoid);
+	pfree(task);
+	return location;
+}
+
+/*
+ * Schedule the read of a tree's part from S3, or of its map of checkpoint
+ * chkpNum when partNum < 0.
+ */
+static S3TaskLocation
+s3_schedule_file_part_read(uint32 chkpNum, OIndexKey key, int64 partNum)
+{
+	S3Task	   *task;
+	S3TaskLocation location;
 	char	   *prefix;
 	char	   *db_prefix;
 
@@ -700,43 +881,48 @@ s3_schedule_file_part_read(uint32 chkpNum, OIndexKey key, int32 segNum,
 	o_verify_dir_exists_or_create(db_prefix, NULL, NULL);
 	pfree(db_prefix);
 
-	status = s3_header_mark_part_loading(tag, partNum);
-	if (status == S3PartStatusLoading)
+	if (partNum >= 0)
 	{
-		S3TaskLocation insertLocation = s3_queue_get_insert_location();
+		S3PartStatus status;
+		S3HeaderTag tag = {.key = key,.segNum = partNum / S3_PARTS_PER_SEGMENT};
 
-		/*
-		 * The task is already scheduled.  We don't know the location, but we
-		 * know it's lower than current insert location, so it is done once
-		 * everything up to there is erased.  s3_queue_wait_for_location()
-		 * waits for the given location itself to be erased: given the insert
-		 * location, it waited for a task nobody has scheduled yet, and with
-		 * the queue idle that took until the next unrelated task (a WAL file,
-		 * a checkpoint) came and went.
-		 *
-		 * The process marking the part loading may not have put its task yet,
-		 * and then this returns early; s3_header_lock_part() looks at the
-		 * part's status again and waits for it to be loaded.
-		 */
-		return insertLocation > 0 ? insertLocation - 1 : 0;
+		status = s3_header_mark_part_loading(tag, partNum % S3_PARTS_PER_SEGMENT);
+		if (status == S3PartStatusLoading)
+		{
+			S3TaskLocation insertLocation = s3_queue_get_insert_location();
+
+			/*
+			 * The task is already scheduled.  We don't know the location, but
+			 * we know it's lower than current insert location, so it is done
+			 * once everything up to there is erased.  s3_queue_wait_for_location()
+			 * waits for the given location itself to be erased: given the
+			 * insert location, it waited for a task nobody has scheduled yet,
+			 * and with the queue idle that took until the next unrelated task
+			 * (a WAL file, a checkpoint) came and went.
+			 *
+			 * The process marking the part loading may not have put its task
+			 * yet, and then this returns early; s3_header_lock_part() looks
+			 * at the part's status again and waits for it to be loaded.
+			 */
+			return insertLocation > 0 ? insertLocation - 1 : 0;
+		}
+		else if (status == S3PartStatusLoaded)
+		{
+			return 0;
+		}
+		Assert(status == S3PartStatusNotLoaded);
 	}
-	else if (status == S3PartStatusLoaded)
-	{
-		return 0;
-	}
-	Assert(status == S3PartStatusNotLoaded);
 
 	task = (S3Task *) palloc0(sizeof(S3Task));
 	task->type = S3TaskTypeReadFilePart;
 	task->typeSpecific.filePart.chkpNum = chkpNum;
 	task->typeSpecific.filePart.key = key;
-	task->typeSpecific.filePart.segNum = segNum;
 	task->typeSpecific.filePart.partNum = partNum;
 
 	location = s3_queue_put_task((Pointer) task, sizeof(S3Task));
 
-	elog(DEBUG1, "S3 schedule file part read: %u %u %u %d %d (%llu)",
-		 key.oids.datoid, key.oids.relnode, chkpNum, segNum, partNum,
+	elog(DEBUG1, "S3 schedule file part read: %u %u %u " INT64_FORMAT " (%llu)",
+		 key.oids.datoid, key.oids.relnode, chkpNum, partNum,
 		 (unsigned long long) location);
 
 	pfree(task);
@@ -748,7 +934,7 @@ s3_schedule_file_part_read(uint32 chkpNum, OIndexKey key, int32 segNum,
  * Schedule a synchronization of given WAL file to S3.
  */
 S3TaskLocation
-s3_schedule_wal_file_write(char *filename)
+s3_schedule_wal_file_write(char *filename, bool archived)
 {
 	S3Task	   *task;
 	int			filenameLen,
@@ -758,7 +944,7 @@ s3_schedule_wal_file_write(char *filename)
 	filenameLen = strlen(filename);
 	taskLen = INTALIGN(offsetof(S3Task, typeSpecific.walFilename) + filenameLen + 1);
 	task = (S3Task *) palloc0(taskLen);
-	task->type = S3TaskTypeWriteWALFile;
+	task->type = archived ? S3TaskTypeWriteArchiveFile : S3TaskTypeWriteWALFile;
 	memcpy(task->typeSpecific.walFilename, filename, filenameLen + 1);
 
 	location = s3_queue_put_task((Pointer) task, taskLen);
@@ -772,10 +958,32 @@ s3_schedule_wal_file_write(char *filename)
 }
 
 /*
+ * Schedule the removal of WAL chunks [fromSeq, toSeq) of a timeline: the
+ * shipper hands it over rather than waiting on the deletes itself, as every
+ * commit waits on the shipper.
+ */
+S3TaskLocation
+s3_schedule_wal_chunks_delete(uint32 timeline, uint64 fromSeq, uint64 toSeq)
+{
+	S3Task	   *task;
+	S3TaskLocation location;
+
+	task = (S3Task *) palloc0(sizeof(S3Task));
+	task->type = S3TaskTypeDeleteWalChunks;
+	task->typeSpecific.deleteWalChunks.timeline = timeline;
+	task->typeSpecific.deleteWalChunks.fromSeq = fromSeq;
+	task->typeSpecific.deleteWalChunks.toSeq = toSeq;
+	location = s3_queue_put_task((Pointer) task, sizeof(S3Task));
+	pfree(task);
+	return location;
+}
+
+/*
  * Schedule a synchronization of given UNDO file to S3.
  */
 S3TaskLocation
-s3_schedule_undo_file_write(UndoLogType undoType, uint64 fileNum)
+s3_schedule_undo_file_write(UndoLogType undoType, uint64 fileNum,
+							uint32 chkpNum)
 {
 	S3Task	   *task;
 	S3TaskLocation location;
@@ -784,8 +992,13 @@ s3_schedule_undo_file_write(UndoLogType undoType, uint64 fileNum)
 	task->type = S3TaskTypeWriteUndoFile;
 	task->typeSpecific.writeUndoFile.undoType = undoType;
 	task->typeSpecific.writeUndoFile.fileNum = fileNum;
+	task->typeSpecific.writeUndoFile.chkpNum = chkpNum;
 
 	location = s3_queue_put_task((Pointer) task, sizeof(S3Task));
+	s3_manifest_note(chkpNum, "undo %02X%08X%s",
+					 (uint32) (fileNum >> 32), (uint32) fileNum,
+					 undoType == UndoLogRegular ? "row" :
+					 undoType == UndoLogSystem ? "system" : "page");
 
 	elog(DEBUG1, "S3 schedule UNDO file write: %llu (%llu)",
 		 (unsigned long long) fileNum, (unsigned long long) location);
@@ -806,13 +1019,7 @@ s3_schedule_downlink_load(BTreeDescr *desc, uint64 downlink)
 	uint16		len = DOWNLINK_GET_DISK_LEN(downlink);
 	off_t		byte_offset,
 				read_size;
-	uint32		chkpNum;
-	int32		segNum,
-				partNum;
 	S3TaskLocation result = 0;
-
-	chkpNum = S3_GET_CHKP_NUM(offset);
-	offset &= S3_OFFSET_MASK;
 
 	if (!OCompressIsValid(desc->compress))
 	{
@@ -830,9 +1037,7 @@ s3_schedule_downlink_load(BTreeDescr *desc, uint64 downlink)
 		OIndexKey	key = {.oids = desc->oids};
 		S3TaskLocation location;
 
-		segNum = byte_offset / ORIOLEDB_SEGMENT_SIZE;
-		partNum = (byte_offset % ORIOLEDB_SEGMENT_SIZE) / ORIOLEDB_S3_PART_SIZE;
-		location = s3_schedule_file_part_read(chkpNum, key, segNum, partNum);
+		location = s3_schedule_file_part_read(0, key, byte_offset / ORIOLEDB_S3_PART_SIZE);
 		result = Max(result, location);
 		if (byte_offset % ORIOLEDB_S3_PART_SIZE + read_size > ORIOLEDB_S3_PART_SIZE)
 		{
@@ -911,11 +1116,12 @@ s3_schedule_pg_file_write(uint32 chkpNum, char *filename)
 }
 
 void
-s3_load_file_part(uint32 chkpNum, OIndexKey key, int32 segNum, int32 partNum)
+s3_load_file_part(OIndexKey key, int32 segNum, int32 partNum)
 {
 	S3TaskLocation location;
 
-	location = s3_schedule_file_part_read(chkpNum, key, segNum, partNum);
+	location = s3_schedule_file_part_read(0, key,
+										  (int64) segNum * S3_PARTS_PER_SEGMENT + partNum);
 
 	if (location > 0)
 		s3_queue_wait_for_location(location);
@@ -926,7 +1132,7 @@ s3_load_map_file(uint32 chkpNum, OIndexKey key)
 {
 	S3TaskLocation location;
 
-	location = s3_schedule_file_part_read(chkpNum, key, -1, 0);
+	location = s3_schedule_file_part_read(chkpNum, key, -1);
 
 	if (location > 0)
 		s3_queue_wait_for_location(location);
@@ -953,6 +1159,7 @@ s3worker_main(Datum main_arg)
 
 	/* catch SIGTERM signal for reason to not interrupt background writing */
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	BackgroundWorkerUnblockSignals();
 
 	elog(LOG, "orioledb s3 worker %d started", worker_num);
@@ -976,6 +1183,23 @@ s3worker_main(Datum main_arg)
 		 */
 		if (workers_locations[worker_num] != InvalidS3TaskLocation)
 		{
+			/*
+			 * The task the worker before this one died on.  A failure that
+			 * persists (a refused key) would restart the worker at once, over
+			 * and over: a pause bounds that to an attempt a second.
+			 */
+			TimestampTz until = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 1000);
+			long		left;
+
+			/* a latch set (a reload, a new task) does not cut it short */
+			while ((left = TimestampDifferenceMilliseconds(GetCurrentTimestamp(),
+														   until)) > 0)
+			{
+				(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+								 left, PG_WAIT_EXTENSION);
+				ResetLatch(MyLatch);
+				CHECK_FOR_INTERRUPTS();
+			}
 			s3process_task(workers_locations[worker_num]);
 			workers_locations[worker_num] = InvalidS3TaskLocation;
 		}
@@ -986,6 +1210,7 @@ s3worker_main(Datum main_arg)
 
 			if (ShutdownRequestPending)
 				break;
+			s3_take_config_reload();
 
 			/*
 			 * Sleep until we are signaled or it's time to check the queue.

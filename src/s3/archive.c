@@ -112,7 +112,7 @@ _PG_archive_module_init(void)
 static bool
 s3_archive_configured(ArchiveModuleState *state)
 {
-	return orioledb_s3_mode;
+	return S3_WRITER_MODE;
 }
 
 /*
@@ -140,7 +140,7 @@ s3_archive_preload_file(ArchiveModuleState *state,
 		return;
 	}
 
-	item->location = s3_schedule_wal_file_write((char *) file);
+	item->location = s3_schedule_wal_file_write((char *) file, true);
 }
 
 /*
@@ -170,7 +170,7 @@ s3_archive_file(ArchiveModuleState *state,
 	}
 	else
 	{
-		location = s3_schedule_wal_file_write((char *) file);
+		location = s3_schedule_wal_file_write((char *) file, true);
 	}
 
 	s3_queue_wait_for_location(location);

@@ -20,6 +20,7 @@
 #include "s3/checkpoint.h"
 #include "s3/checksum.h"
 #include "s3/headers.h"
+#include "s3/manifest.h"
 #include "s3/requests.h"
 #include "s3/worker.h"
 
@@ -288,6 +289,12 @@ s3_perform_backup(int flags, S3TaskLocation maxLocation)
 			maxLocation = Max(maxLocation, location);
 			pfree(xidFilename);
 
+			xidFilename = psprintf(XIDMAP_RANGE_FILENAME_FORMAT,
+								   checkpoint_state->lastCheckpointNumber);
+			location = s3_schedule_file_write(chkpNum, xidFilename, false);
+			maxLocation = Max(maxLocation, location);
+			pfree(xidFilename);
+
 		}
 		else
 		{
@@ -300,6 +307,17 @@ s3_perform_backup(int flags, S3TaskLocation maxLocation)
 	}
 	location = flush_small_files(&state);
 	maxLocation = Max(maxLocation, location);
+
+	/*
+	 * Write out the checksums still buffered.  The buffer is flushed only when
+	 * it is full, so without this the last entries are missing from the
+	 * checksum file: an unchanged file among them is neither uploaded with
+	 * this checkpoint nor recorded as unchanged, and a restore from this
+	 * checkpoint loses it.
+	 */
+	if (state.checksumState->fileChecksumsLen > 0)
+		flushS3ChecksumState(state.checksumState,
+							 SMALL_FILE_CHECKSUMS_TMP_FILENAME);
 
 	freeS3ChecksumState(state.checksumState);
 	list_free_deep(state.tablespaces);
@@ -317,6 +335,8 @@ s3_perform_backup(int flags, S3TaskLocation maxLocation)
 	maxLocation = Max(maxLocation, location);
 
 	s3_queue_wait_for_location(maxLocation);
+
+	s3_manifest_prepare(chkpNum, state.smallFilesNum);
 }
 
 static int64

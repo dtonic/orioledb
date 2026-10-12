@@ -3450,7 +3450,7 @@ o_truncate_table(ORelOids oids, bool missingOK)
 	{
 		o_tables_rel_lock_extended(&trees[i].oids, AccessExclusiveLock, false);
 		o_tables_rel_lock_extended(&trees[i].oids, AccessExclusiveLock, true);
-		cleanup_btree(trees[i], true, !is_temp);
+		cleanup_btree_extended(trees[i], true, !is_temp, !is_temp);
 		o_invalidate_oids(trees[i].oids);
 /*		if (is_recovery_process())
 			o_invalidate_descrs(trees[i].datoid, trees[i].reloid,
@@ -3478,7 +3478,7 @@ o_truncate_table(ORelOids oids, bool missingOK)
 		 * seq_buf_finalize().
 		 */
 		o_tables_rel_lock_extended(&oids, AccessExclusiveLock, true);
-		cleanup_btree(key, true, !is_temp);
+		cleanup_btree_extended(key, true, !is_temp, !is_temp);
 		o_invalidate_oids(oids);
 		o_tables_rel_unlock_extended(&oids, AccessExclusiveLock, true);
 /*		if (is_recovery_process())

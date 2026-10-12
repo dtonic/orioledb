@@ -65,7 +65,12 @@ OBJS = src/btree/btree.o \
 	   src/s3/checkpoint.o \
 	   src/s3/control.o \
 	   src/s3/checksum.o \
+	   src/s3/compact.o \
 	   src/s3/headers.o \
+	   src/s3/gc.o \
+	   src/s3/manifest.o \
+	   src/s3/lease.o \
+	   src/s3/wal_shipper.o \
 	   src/s3/queue.o \
 	   src/s3/requests.o \
 	   src/s3/worker.o \

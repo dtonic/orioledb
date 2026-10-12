@@ -14,6 +14,9 @@
 #include "c.h"
 #include "postgres.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include "orioledb.h"
 
 #include "recovery/recovery.h"
@@ -33,6 +36,7 @@
 #if PG_VERSION_NUM >= 180000
 #include "utils/memutils.h"
 #endif
+#include "storage/fd.h"
 #include "utils/snapmgr.h"
 #include "utils/stopevent.h"
 #include "recovery/wal.h"
@@ -1344,6 +1348,92 @@ fsync_xidmap_range(OXid xmin, OXid xmax, uint32 wait_event_info)
 				   xmin * sizeof(OXidMapItem),
 				   xmax * sizeof(OXidMapItem),
 				   wait_event_info);
+}
+
+/*
+ * Write the xidmap range [xmin, xmax) to a file of its own: the checkpoint's
+ * copy of what recovery reads from the xidmap.  A transaction between xmin
+ * and xmax that finished before the checkpoint is known as such only from
+ * here (the xid file lists the ones in progress), and in S3 mode the xidmap
+ * itself never leaves the data directory.
+ *
+ * The range is as long as the oldest transaction in progress is old, so the
+ * items go as the differences from the item before (CSNs and commit LSNs
+ * mostly grow by a little), zigzag varints: (XIDMAP_RANGE_ENCODED,
+ * XIDMAP_RANGE_VERSION), (xmin, xmax), then per item the differences of its
+ * csn and its commitPtr.  The first word tells it from the files written
+ * before, which hold (xmin, xmax) and the items as they are.
+ */
+#define XIDMAP_RANGE_ENCODED	UINT64_MAX
+#define XIDMAP_RANGE_VERSION	1
+
+static int
+put_zigzag(uint8 *out, uint64 value, uint64 prev)
+{
+	int64		d = (int64) (value - prev);
+	uint64		zz = ((uint64) d << 1) ^ (uint64) (d >> 63);
+	int			n = 0;
+
+	while (zz >= 0x80)
+	{
+		out[n++] = (uint8) (zz | 0x80);
+		zz >>= 7;
+	}
+	out[n++] = (uint8) zz;
+	return n;
+}
+
+void
+write_xidmap_range_file(const char *filename, OXid xmin, OXid xmax)
+{
+	char	   *tmp = psprintf("%s.tmp", filename);
+	int			fd;
+	uint64		header[4] = {XIDMAP_RANGE_ENCODED, XIDMAP_RANGE_VERSION,
+	xmin, xmax};
+	const int64 chunk = 64 * 1024;
+	OXidMapItem *items = palloc(chunk);
+	uint8	   *out = palloc(chunk / sizeof(OXidMapItem) * 20);
+	uint64		prevCsn = 0,
+				prevPtr = 0;
+
+	fd = BasicOpenFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
+	if (fd < 0 || write(fd, header, sizeof(header)) != sizeof(header))
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m", tmp)));
+	for (int64 off = (int64) xmin * sizeof(OXidMapItem);
+		 off < (int64) xmax * sizeof(OXidMapItem); off += chunk)
+	{
+		int64		len = Min(chunk, (int64) xmax * sizeof(OXidMapItem) - off);
+		int			n = 0;
+
+		memset(items, 0, len);
+		(void) o_buffers_read(&buffersDesc, (Pointer) items, OXID_BUFFERS_TAG,
+							  off, len, true);
+		for (int64 i = 0; i < len / (int64) sizeof(OXidMapItem); i++)
+		{
+			uint64		csn = pg_atomic_read_u64(&items[i].csn);
+			uint64		ptr = pg_atomic_read_u64(&items[i].commitPtr);
+
+			n += put_zigzag(out + n, csn, prevCsn);
+			n += put_zigzag(out + n, ptr, prevPtr);
+			prevCsn = csn;
+			prevPtr = ptr;
+		}
+		if (write(fd, out, n) != n)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write file \"%s\": %m", tmp)));
+	}
+	pfree(items);
+	pfree(out);
+	if (pg_fsync(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not fsync file \"%s\": %m", tmp)));
+	close(fd);
+	durable_rename(tmp, filename, ERROR);
+	pfree(tmp);
 }
 
 /*

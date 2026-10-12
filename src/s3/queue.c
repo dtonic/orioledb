@@ -117,7 +117,8 @@ s3_queue_put_task(Pointer data, uint32 len)
 	 */
 	while (insertLocation + totallen > pg_atomic_read_u64(&s3_queue_meta->erasedLocation) + s3_queue_size)
 	{
-		ConditionVariableSleep(&s3_queue_meta->erasedLocationCV, WAIT_EVENT_MQ_PUT_MESSAGE);
+		(void) ConditionVariableTimedSleep(&s3_queue_meta->erasedLocationCV,
+										   1000, WAIT_EVENT_MQ_PUT_MESSAGE);
 		slept = true;
 	}
 	if (slept)
@@ -337,10 +338,15 @@ s3_queue_wait_for_location(S3TaskLocation location)
 {
 	bool		slept = false;
 
+	/*
+	 * Look again every second whatever the broadcasts say: a wakeup that is
+	 * missed would otherwise leave the waiter asleep with the task long done
+	 * (seen as a checkpoint that never finished, the queue empty).
+	 */
 	while (pg_atomic_read_u64(&s3_queue_meta->erasedLocation) <= location)
 	{
-		ConditionVariableSleep(&s3_queue_meta->erasedLocationCV,
-							   WAIT_EVENT_MQ_PUT_MESSAGE);
+		(void) ConditionVariableTimedSleep(&s3_queue_meta->erasedLocationCV,
+										   1000, WAIT_EVENT_MQ_PUT_MESSAGE);
 		slept = true;
 	}
 	if (slept)

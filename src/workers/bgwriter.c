@@ -32,6 +32,7 @@
 #include "storage/proc.h"
 #include "storage/procsignal.h"
 #include "storage/sinvaladt.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
@@ -102,6 +103,14 @@ bgwriter_main(Datum main_arg)
 	/* catch SIGTERM signal for reason to not interrupt background writing */
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	pqsignal(SIGUSR1, procsignal_sigusr1_handler);
+
+	/*
+	 * A reload reaches the settings this loop reads: the S3 eviction bound
+	 * (orioledb.s3_desired_size, orioledb.s3_max_unsealed_size) and the
+	 * bgwriter's own pacing.  Without it they kept their startup values
+	 * until a restart.
+	 */
+	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	BackgroundWorkerUnblockSignals();
 
 	elog(LOG, "orioledb background writer %d started", BGWriterNum);
@@ -148,6 +157,12 @@ bgwriter_main(Datum main_arg)
 				ShutdownRequestPending = true;
 
 			CHECK_FOR_INTERRUPTS();
+
+			if (ConfigReloadPending)
+			{
+				ConfigReloadPending = false;
+				ProcessConfigFile(PGC_SIGHUP);
+			}
 
 			for (poolType = 0; poolType < OPagePoolTypesCount && !ShutdownRequestPending; poolType++)
 			{

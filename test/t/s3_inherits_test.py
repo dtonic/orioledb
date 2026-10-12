@@ -43,9 +43,11 @@ class S3InheritsTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)
 
 	def test_2(self):
 
@@ -77,9 +79,11 @@ class S3InheritsTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)
 
 	def test_3(self):
 
@@ -114,9 +118,11 @@ class S3InheritsTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)
 
 	def test_4(self):
 
@@ -147,9 +153,11 @@ class S3InheritsTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)
 
 	def test_5(self):
 
@@ -185,9 +193,11 @@ class S3InheritsTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)
 
 	def test_6(self):
 
@@ -220,9 +230,11 @@ class S3InheritsTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)
 
 	def test_7(self):
 
@@ -254,9 +266,11 @@ class S3InheritsTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)
 
 	def test_8(self):
 
@@ -288,9 +302,11 @@ class S3InheritsTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)
 
 	def test_9(self):
 
@@ -321,9 +337,11 @@ class S3InheritsTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)
 
 	def test_10(self):
 
@@ -360,9 +378,11 @@ class S3InheritsTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)
 
 	def test_11(self):
 
@@ -395,9 +415,11 @@ class S3InheritsTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)
 
 	def test_12(self):
 
@@ -432,6 +454,8 @@ class S3InheritsTest(S3BaseTest):
 
 		""")
 
+		before = self.table_contents(node)
 		node.stop(['-m', 'immediate'])
 
 		node.start()
+		self.assert_contents_after_crash(node, before)

@@ -33,6 +33,9 @@
 #include "recovery/wal_reader.h"
 #include "replication/snapbuild.h"
 #include "s3/control.h"
+#include "s3/gc.h"
+#include "s3/lease.h"
+#include "s3/wal_shipper.h"
 #include "s3/headers.h"
 #include "s3/queue.h"
 #include "s3/requests.h"
@@ -156,8 +159,10 @@ bool		orioledb_table_description_compress = false;
 char	   *max_bridge_ctid_string = NULL;
 BlockNumber max_bridge_ctid_blkno = 0;
 bool		orioledb_s3_mode = false;
+bool		orioledb_s3_reader = false;
 int			s3_num_workers = 3;
 int			s3_desired_size = 10000;
+int			s3_max_unsealed_size = 1024;
 int			s3_queue_size_guc;
 char	   *s3_host = NULL;
 bool		s3_use_https = true;
@@ -248,6 +253,9 @@ static ShmemItem shmemItems[] = {
 	{s3_queue_shmem_needs, s3_queue_init_shmem},
 	{s3_workers_shmem_needs, s3_workers_init_shmem},
 	{s3_headers_shmem_needs, s3_headers_shmem_init},
+	{s3_lease_shmem_needs, s3_lease_shmem_init},
+	{s3_wal_shipper_shmem_needs, s3_wal_shipper_shmem_init},
+	{s3_gc_shmem_needs, s3_gc_shmem_init},
 	{rewind_shmem_needs, rewind_init_shmem}
 };
 
@@ -1155,6 +1163,17 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	DefineCustomBoolVariable("orioledb.s3_reader",
+							 "Reads the S3 bucket's committed checkpoint without writing to it",
+							 "Start it as a hot standby on a data directory the loader made.",
+							 &orioledb_s3_reader,
+							 false,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	DefineCustomIntVariable("orioledb.s3_queue_size",
 							"The size of queue for S3 tasks",
 							NULL,
@@ -1181,6 +1200,173 @@ _PG_init(void)
 							NULL,
 							NULL);
 
+	DefineCustomBoolVariable("orioledb.s3_wal_shipping",
+							 "Ships WAL to S3 as it is written",
+							 "With synchronous_standby_names = 's3', a commit returns once its WAL is in the bucket.",
+							 &s3_wal_shipping,
+							 true,
+							 PGC_POSTMASTER,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomStringVariable("orioledb.s3_wal_conninfo",
+							   "How the WAL shipper connects to this server",
+							   "Empty: the first Unix socket, as the bootstrap superuser.",
+							   &s3_wal_conninfo,
+							   "",
+							   PGC_POSTMASTER,
+							   GUC_SUPERUSER_ONLY,
+							   NULL,
+							   NULL,
+							   NULL);
+
+	DefineCustomIntVariable("orioledb.s3_gc_interval",
+							"How often the S3 GC removes parts no retained checkpoint refers to",
+							"0 turns the GC off.",
+							&s3_gc_interval,
+							60,
+							0,
+							86400,
+							PGC_POSTMASTER,
+							GUC_UNIT_S,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomStringVariable("orioledb.s3_compact_database",
+							   "Database the S3 compaction worker connects to",
+							   "Empty turns periodic compaction off; orioledb_s3_compact() runs it by hand.",
+							   &s3_compact_database,
+							   "",
+							   PGC_POSTMASTER,
+							   0,
+							   NULL,
+							   NULL,
+							   NULL);
+
+	DefineCustomIntVariable("orioledb.s3_compact_interval",
+							"How often the S3 compaction worker moves pages out of sparse parts",
+							"0 turns it off.",
+							&s3_compact_interval,
+							3600,
+							0,
+							7 * 86400,
+							PGC_POSTMASTER,
+							GUC_UNIT_S,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomRealVariable("orioledb.s3_compact_threshold",
+							 "A part with fewer live blocks than this share of it is compacted",
+							 NULL,
+							 &s3_compact_threshold,
+							 0.3,
+							 0.01,
+							 1.0,
+							 PGC_SIGHUP,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomIntVariable("orioledb.s3_wal_chunk_delay",
+							"Longest time the WAL shipper gathers WAL into one chunk while more keeps coming",
+							"Commits waiting for the bucket wait for the chunk's put.",
+							&s3_wal_chunk_delay,
+							1,
+							0,
+							1000,
+							PGC_SIGHUP,
+							GUC_UNIT_MS,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("orioledb.s3_gc_max_pin_lag",
+							"How far behind the committed checkpoint a reader's pin still holds the S3 GC",
+							"A pin further behind is passed over; a reader stops a quarter of this before it is. 0 means pins always hold.",
+							&s3_gc_max_pin_lag,
+							1000,
+							0,
+							INT_MAX,
+							PGC_SIGHUP,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("orioledb.s3_gc_keep_checkpoints",
+							"How many committed checkpoints the S3 GC keeps restorable",
+							NULL,
+							&s3_gc_keep_checkpoints,
+							2,
+							1,
+							1000000,
+							PGC_POSTMASTER,
+							0,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("orioledb.s3_auth_retry_time",
+							"How long an S3 request refused as unauthorized is retried",
+							"New credentials take effect on a configuration reload; "
+							"a refusal within this long is taken for keys being "
+							"rotated.  0 fails at once.",
+							&s3_auth_retry_time,
+							300,
+							0,
+							INT_MAX / 1000,
+							PGC_SIGHUP,
+							GUC_UNIT_S,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("orioledb.s3_gc_keep_time",
+							"How long the S3 GC keeps committed checkpoints restorable",
+							"It keeps what this or orioledb.s3_gc_keep_checkpoints "
+							"keeps, whichever is more.  0 keeps by count only.",
+							&s3_gc_keep_time,
+							0,
+							0,
+							INT_MAX,
+							PGC_POSTMASTER,
+							GUC_UNIT_S,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("orioledb.s3_reader_pin_ttl",
+							"How long an S3 reader's pin keeps its checkpoint from the GC without a renewal",
+							NULL,
+							&s3_reader_pin_ttl,
+							600,
+							30,
+							86400,
+							PGC_POSTMASTER,
+							GUC_UNIT_S,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("orioledb.s3_lease_duration",
+							"How long the S3 writer lease lasts without a renewal",
+							"Another instance may take the bucket over this long after the "
+							"writer stops renewing.",
+							&s3_lease_duration,
+							30,
+							15,
+							3600,
+							PGC_POSTMASTER,
+							GUC_UNIT_S,
+							NULL,
+							NULL,
+							NULL);
+
 	DefineCustomIntVariable("orioledb.s3_num_workers",
 							"The number of workers to make S3 requests",
 							NULL,
@@ -1190,6 +1376,20 @@ _PG_init(void)
 							MAX_BACKENDS,
 							PGC_POSTMASTER,
 							GUC_UNIT_KB,
+							NULL,
+							NULL,
+							NULL);
+
+	DefineCustomIntVariable("orioledb.s3_max_unsealed_size",
+							"Local data written since the last checkpoint at which a checkpoint is requested.",
+							"A part stays local until the checkpoint of the stream that wrote it "
+							"seals it, so this bounds the local disk a checkpoint interval needs.",
+							&s3_max_unsealed_size,
+							1024,
+							1,
+							INT_MAX,
+							PGC_SIGHUP,
+							GUC_UNIT_MB,
 							NULL,
 							NULL,
 							NULL);
@@ -1256,7 +1456,7 @@ _PG_init(void)
 							   NULL,
 							   &s3_accesskey,
 							   NULL,
-							   PGC_POSTMASTER,
+							   PGC_SIGHUP,
 							   0,
 							   NULL,
 							   NULL,
@@ -1267,7 +1467,7 @@ _PG_init(void)
 							   NULL,
 							   &s3_secretkey,
 							   NULL,
-							   PGC_POSTMASTER,
+							   PGC_SIGHUP,
 							   0,
 							   NULL,
 							   NULL,
@@ -1491,26 +1691,23 @@ _PG_init(void)
 	if (enable_rewind)
 		register_rewind_worker();
 
-	if (orioledb_s3_mode)
-	{
-		const char *check_errmsg = NULL;
-		const char *check_errdetail = NULL;
-
-		s3_put_lock_file();
-		if (!s3_check_control(&check_errmsg, &check_errdetail))
-		{
-			s3_delete_lock_file();
-
-			ereport(FATAL,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("%s", check_errmsg),
-					 errdetail("%s", check_errdetail)));
-		}
-	}
+	if (orioledb_s3_mode && orioledb_s3_reader)
+		s3_lease_reader_init();
+	else if (orioledb_s3_mode)
+		s3_lease_acquire();
 
 	/* Register S3 workers */
 	for (i = 0; orioledb_s3_mode && (i < s3_num_workers); i++)
 		register_s3worker(i);
+	if (orioledb_s3_mode)
+		register_s3_lease_worker();
+	if (S3_WRITER_MODE && s3_gc_interval > 0)
+		register_s3_gc_worker();
+	if (S3_WRITER_MODE && s3_compact_interval > 0 &&
+		s3_compact_database && s3_compact_database[0])
+		register_s3_compact_worker();
+	if (S3_WRITER_MODE)
+		s3_wal_shipper_init();
 
 	/* Register custom deTOAST function */
 	register_o_detoast_func(o_detoast);
@@ -1738,8 +1935,9 @@ orioledb_on_shmem_exit(int code, Datum arg)
 		btree_release_meta_page_claim();
 	}
 
-	if (orioledb_s3_mode)
-		s3_delete_lock_file();
+	/* the postmaster at a clean stop; a crash restart passes code 1 */
+	if (S3_WRITER_MODE && !IsUnderPostmaster && code == 0)
+		s3_lease_release();
 }
 
 /*

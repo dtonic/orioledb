@@ -28,12 +28,16 @@ typedef enum
 	S3TaskTypeWriteUndoFile,
 	S3TaskTypeWriteEmptyDir,
 	S3TaskTypeWriteRootFile,
-	S3TaskTypeWritePGFile
+	S3TaskTypeWritePGFile,
+	S3TaskTypeWriteArchiveFile,	/* a complete WAL file: put once, fenced */
+	S3TaskTypeDeleteWalChunks	/* WAL chunks an archived segment holds */
 } S3TaskType;
 
 /*
  * The data structure representing the task for S3 worker.
  */
+#define S3_DEAD_FILE_PART (-2)
+
 typedef struct
 {
 	S3TaskType	type;
@@ -49,13 +53,18 @@ typedef struct
 		{
 			UndoLogType undoType;
 			uint64		fileNum;
+			uint32		chkpNum;
 		}			writeUndoFile;
+		/*
+		 * A tree's part (partNum >= 0, the part's number in the tree's own
+		 * address space; chkpNum unused) or its map of checkpoint chkpNum
+		 * (partNum < 0).
+		 */
 		struct
 		{
 			OIndexKey	key;
 			uint32		chkpNum;
-			int32		segNum;
-			int32		partNum;
+			int64		partNum;
 		}			filePart;
 		char		walFilename[1];
 		struct
@@ -73,6 +82,12 @@ typedef struct
 			uint32		chkpNum;
 			char		filename[FLEXIBLE_ARRAY_MEMBER];
 		}			writePGFile;
+		struct
+		{
+			uint32		timeline;
+			uint64		fromSeq;	/* first chunk */
+			uint64		toSeq;		/* past the last */
+		}			deleteWalChunks;
 	}			typeSpecific;
 } S3Task;
 
@@ -89,17 +104,21 @@ extern S3TaskLocation s3_schedule_file_write(uint32 chkpNum, char *filename,
 											 bool delete);
 extern S3TaskLocation s3_schedule_empty_dir_write(uint32 chkpNum,
 												  char *dirname);
-extern S3TaskLocation s3_schedule_file_part_write(uint32 chkpNum, OIndexKey key,
-												  int32 segNum, int32 partNum);
-extern S3TaskLocation s3_schedule_wal_file_write(char *filename);
+extern S3TaskLocation s3_schedule_file_part_write(OIndexKey key, int64 partNum);
+extern S3TaskLocation s3_schedule_map_file_write(uint32 chkpNum, OIndexKey key);
+extern S3TaskLocation s3_schedule_dead_file_write(uint32 chkpNum, OIndexKey key);
+extern S3TaskLocation s3_schedule_wal_file_write(char *filename, bool archived);
 extern S3TaskLocation s3_schedule_undo_file_write(UndoLogType undoType,
-												  uint64 fileNum);
+												  uint64 fileNum,
+												  uint32 chkpNum);
 extern S3TaskLocation s3_schedule_downlink_load(struct BTreeDescr *desc,
 												uint64 downlink);
 extern S3TaskLocation s3_schedule_root_file_write(char *filename, bool delete);
 extern S3TaskLocation s3_schedule_pg_file_write(uint32 chkpNum, char *filename);
-extern void s3_load_file_part(uint32 chkpNum, OIndexKey key, int32 segNum,
-							  int32 partNum);
+extern S3TaskLocation s3_schedule_wal_chunks_delete(uint32 timeline,
+													uint64 fromSeq,
+													uint64 toSeq);
+extern void s3_load_file_part(OIndexKey key, int32 segNum, int32 partNum);
 extern void s3_load_map_file(uint32 chkpNum, OIndexKey key);
 
 
