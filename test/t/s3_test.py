@@ -5335,8 +5335,12 @@ class S3Test(S3BaseTest):
 		"""
 		node = self.node
 		self.s3_small_buffers_conf('1MB')
+		# a request under twice the bound is a spread checkpoint: with the
+		# hour s3_small_buffers_conf() sets, a slow machine had not finished
+		# it in a minute
 		node.append_conf("""
 			orioledb.s3_max_unsealed_size = 1MB
+			checkpoint_timeout = 30s
 		""")
 		node.start()
 		node.safe_psql("CREATE EXTENSION IF NOT EXISTS orioledb;")

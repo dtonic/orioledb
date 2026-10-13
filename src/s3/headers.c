@@ -1504,11 +1504,11 @@ recount_unsealed_parts(void)
  * A pass first evicts the cold parts only: parts with no usage count, which a
  * sequential scan or a read ahead leaves (s3_header_lock_part() does not count
  * a scan's read, and takes one that only the read ahead counted back to
- * zero).  Only when they are not enough does it go on as a clock sweep over
- * the files' parts, from where the last one stopped (the hand): a part with a
- * usage count is spared and its count halved, one without is evicted.  A
- * sweep halving every part a scan passed over took the parts queries used
- * with them.
+ * zero), then parts counted once.  Only when they are not enough does it go
+ * on as a clock sweep over the files' parts, from where the last one stopped
+ * (the hand): a part with a usage count is spared and its count halved, one
+ * without is evicted.  A sweep halving every part a scan passed over took the
+ * parts queries used with them.
  */
 typedef enum
 {
@@ -1521,9 +1521,11 @@ typedef enum
 static EvictionPhase evictionPhase;
 static S3HeaderTag evictionHand;
 static bool evictionHandValid = false;
-static bool evictionColdOnly = false;
+/* a cold pass evicts parts counted up to this, the clock sweep is -1 */
+static int	evictionColdLimit = -1;
 static uint64 evictionBytes;
 static uint64 evictionTargetBytes;
+static TimestampTz lastMeasure = 0;
 
 
 void
@@ -1590,7 +1592,7 @@ eviction_callback(S3HeaderTag tag)
 
 	if (evictionBytes <= evictionTargetBytes)
 	{
-		if (!evictionColdOnly)
+		if (evictionColdLimit < 0)
 			eviction_done_at(tag);
 		else
 			evictionPhase = EvictionDone;
@@ -1631,7 +1633,7 @@ eviction_callback(S3HeaderTag tag)
 
 		if (evictionBytes <= evictionTargetBytes)
 		{
-			if (!evictionColdOnly)
+			if (evictionColdLimit < 0)
 				eviction_done_at(tag);
 			else
 				evictionPhase = EvictionDone;
@@ -1664,12 +1666,13 @@ eviction_callback(S3HeaderTag tag)
 						usageCount = S3_PART_GET_USAGE_COUNT(value);
 
 			if (S3_PART_GET_STATUS(value) == S3PartStatusLoaded &&
-				S3_PART_GET_LOCKS_NUM(value) == 0 && usageCount == 0 &&
+				S3_PART_GET_LOCKS_NUM(value) == 0 &&
+				usageCount <= (uint32) Max(evictionColdLimit, 0) &&
 				(value & (S3_PART_DIRTY_FLAG | S3_PART_WRITING_FLAG | S3_PART_LOCAL_FLAG)) == 0)
 			{
 				newValue = S3_PART_SET_STATUS(newValue, S3PartStatusEvicting);
 			}
-			else if (evictionColdOnly)
+			else if (evictionColdLimit >= 0)
 			{
 				/* the cold pass leaves the others as they are */
 				break;
@@ -1755,7 +1758,6 @@ s3_headers_try_eviction_cycle(void)
 		return;
 
 	{
-		static TimestampTz lastMeasure = 0;
 		TimestampTz now = GetCurrentTimestamp();
 		uint64		desiredBytes = (uint64) s3_desired_size * 1024 * 1024;
 
@@ -1768,17 +1770,30 @@ s3_headers_try_eviction_cycle(void)
 			return;
 		evictionBytes = occupiedBytes;
 		evictionTargetBytes = desiredBytes - desiredBytes / 10;
-		/* measure again at the next cycle: this one evicts */
-		lastMeasure = 0;
 	}
 
-	/* the cold parts first, whatever the hand */
-	evictionColdOnly = true;
-	evictionPhase = EvictionSweeping;
-	iterate_files(eviction_callback);
-	evictionColdOnly = false;
+	/*
+	 * The cold parts first, whatever the hand: those nothing counted, then
+	 * those counted once (read ahead, or read once).  A part queries keep
+	 * using is swept only when they are not enough: on a slow machine a long
+	 * scan made many sweeps, each halving every count, and took the parts
+	 * queries used.
+	 */
+	for (int limit = 0; limit <= 1; limit++)
+	{
+		evictionColdLimit = limit;
+		evictionPhase = EvictionSweeping;
+		iterate_files(eviction_callback);
+		evictionColdLimit = -1;
+		if (evictionBytes <= evictionTargetBytes)
+			break;
+	}
 	if (evictionBytes <= evictionTargetBytes)
+	{
+		/* this cycle evicted: measure again at the next one */
+		lastMeasure = 0;
 		return;
+	}
 
 	evictionPhase = EvictionSeekingHand;
 	if (evictionHandValid)
@@ -1795,4 +1810,12 @@ s3_headers_try_eviction_cycle(void)
 		evictionPhase = EvictionWrapped;
 		iterate_files(eviction_callback);
 	}
+
+	/*
+	 * Measure again at the next cycle if this one evicted; if nothing could
+	 * go (the parts are unsealed or in use), not before a second: the passes
+	 * over every file each cycle slowed a checkpoint on a slow machine.
+	 */
+	if (evictionBytes < occupiedBytes)
+		lastMeasure = 0;
 }
