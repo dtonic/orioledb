@@ -159,7 +159,9 @@ shipper). 한 버킷에 writer 하나와 reader 여럿이 붙는다. writer 는 
   이름한다. 워커에 넘기면 워커가 404 로 죽고 1초 뒤 다시 떠 같은 작업을 영원히 재생하는 동안 백엔드는 아무 메시지 없이
   파트 상태를 기다렸다. 워커가 받는 claimed 파트(임계 구역, 그 밖의 4xx)를 저장소가 주지 않으면 워커는 파트를 Failed 로
   표시하고(`s3_header_mark_part_failed`, WARNING) 다음 작업으로 간다; 기다리던 쪽은 Failed 를 보고 ERROR 를 내며 파트를
-  NotLoaded 로 되돌려 다음 읽기가 다시 시도한다. Failed 는 적재 수에서 NotLoaded 와 같다.
+  NotLoaded 로 되돌려 다음 읽기가 다시 시도한다. Failed 는 적재 수에서 NotLoaded 와 같다. 이 ERROR 는 `load_page` 가
+  부모의 downlink 를 "I/O 진행 중" 으로 바꾼 뒤의 읽기 안에서 나므로, `load_page` 는 읽기 안의 ERROR(취소된 대기도)에
+  downlink 를 되돌린다: 되돌리지 않으면 그 페이지의 모든 뒤 읽기가 아무도 하지 않는 I/O 를 영원히 기다렸다.
   Guards: `test_s3_a_part_missing_from_the_bucket_is_an_error`, `test_s3_a_part_the_store_refuses_is_an_error`,
   `test_s3_a_part_refused_past_the_retry_time_is_an_error`.
 - 다른 프로세스가 받는 중인 파트는 **그 파트의 상태**를 기다린다(`s3_header_wait_part_settled`, `partSettledCV`). 큐에
