@@ -330,6 +330,8 @@ s3_perform_backup(int flags, S3TaskLocation maxLocation)
 	location = s3_schedule_file_write(chkpNum, FILE_CHECKSUMS_FILENAME, false);
 	maxLocation = Max(maxLocation, location);
 
+	/* the count the manifest will carry, before the checksums refer to it */
+	s3_manifest_note_bundles(chkpNum, state.smallFilesNum);
 	durable_rename(SMALL_FILE_CHECKSUMS_TMP_FILENAME, SMALL_FILE_CHECKSUMS_FILENAME, ERROR);
 	location = s3_schedule_file_write(chkpNum, SMALL_FILE_CHECKSUMS_FILENAME, false);
 	maxLocation = Max(maxLocation, location);

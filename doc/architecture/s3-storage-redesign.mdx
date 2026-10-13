@@ -242,8 +242,14 @@ shipper). 한 버킷에 writer 하나와 reader 여럿이 붙는다. writer 는 
 3. **큐에 넣은 업로드가 모두 끝나야** OrioleDB control 에 K 를 쓴다. 이 대기가 없으면 control 뒤 크래시에서 재시작이
    올라간 적 없는 파트를 가리키는 체크포인트를 커밋한다. Guard: `test_s3_crash_while_parts_upload`.
 4. PG 파일 백업(`s3_perform_backup`): 체크섬이 바뀐 파일, 64 KiB 미만 파일의 묶음, xid 파일, `.xidrange`, 체크섬 파일을
-   `data/<T>-<K>/` 로 올린다. 끝나면 매니페스트를 `s3_manifest.pending` 과 `manifests/<T>-<K>` 에 쓴다. 이때 카탈로그에
-   들어온 재구축 트리의 `.bend` 를 `dead/<T>-<K>.build` 로 올리고 `bdead` 줄을 단다.
+   `data/<T>-<K>/` 로 올린다. 작은 파일 체크섬을 현재 것으로 바꾸기 전에 묶음 수를 로컬 `s3_bundles`(`<K> <n>` 줄, 최근 16개 체크포인트의 것을 둔다)에
+   적는다:
+   바꾼 뒤부터 체크섬은 K 의 묶음을 가리키는데 그 수는 매니페스트만 말하므로, 그 사이의 크래시는 수를 영영 잃고 뒤의 모든
+   매니페스트가 `complete 0` 이 되었다. 끝나면 매니페스트를 `s3_manifest.pending` 과 `manifests/<T>-<K>` 에 쓴다. 이때
+   카탈로그에 들어온 재구축 트리의 `.bend` 를 `dead/<T>-<K>.build` 로 올리고 `bdead` 줄을 단다. 매니페스트 준비는 커밋된·
+   pending 매니페스트에 없는 묶음 수를 그 쪽지에서, 쪽지도 다른 체크포인트의 것이면
+   `data/<T>-<K>/orioledb_data/small_files_` 를 목록으로 세어(묶음은 0 부터 빈틈없이 번호를 받는다) 채운다. Guard:
+   `test_s3_bundle_count_survives_a_crash_before_the_manifest`, `test_s3_bundle_count_is_listed_when_the_note_is_gone`.
 5. PG 가 체크포인트 레코드와 `pg_control` 을 쓴다.
 6. after-hook(`o_after_checkpoint_cleanup_hook`, 복구가 끝난 writer 에서만): `pg_control` 과 OrioleDB control 을
    `data/<T>-<K>/` 로 올린다.
@@ -556,6 +562,7 @@ Guard: `test_s3_terminator_goes_after_the_last_chunk_path_style`, `test_s3_http_
 | --- | --- | --- |
 | 체크포인트 K 의 트리 걷기 중(control 은 K−1) | 새 토큰, epoch 가 K 부터. K 를 새 키로 다시 함. map 에서 올린 트리는 두 흐름 모두 새 파트에서 시작 | 다음 흐름이 쓴 블록의 파트는 봉인되지 않음. 올라간 옛 파트 번호는 새 실행이 펜싱된 PUT 으로 덮음. 옛 토큰의 `maps/`·`dead/` 는 `--sweep`. Guard: `test_s3_gc_removes_parts_written_before_a_crash` |
 | control 은 K, PG 파일 백업 끝 전 | 복구 끝 hook 은 K 의 pending 매니페스트가 없어 커밋하지 않음. 다음 체크포인트가 커밋 | K 의 죽은 목록은 `fold_unpublished` 가 접음. `data/<T>-<K>/` 는 `--sweep`. Guard: `test_s3_crash_while_pg_files_upload` |
+| 작은 파일 체크섬을 바꾼 뒤, 매니페스트 전 | 같음. 다음 매니페스트는 K 의 묶음 수를 `s3_bundles` 쪽지에서, 없으면 버킷의 묶음을 세어 안다 | 매니페스트는 `complete 1`. Guard: `test_s3_bundle_count_survives_a_crash_before_the_manifest` |
 | 매니페스트는 올라갔고 `root` 교체 전 | 다음 체크포인트가 커밋 | K 의 매니페스트는 커밋되지 않았어도 R 아래로 가면 GC 가 접고 거둠 |
 | `root` 교체의 답을 잃음 | `root` 를 읽어 토큰·owner·attempt 로 판정 | 없음 |
 | `root` 교체 뒤 `roots/<K>` 전 | 없음 | `--repair-root` 는 그 앞 사본을 쓴다 |
