@@ -312,14 +312,18 @@ PERFCHECKS = $(sort $(wildcard perf/*_perf.py))
 PG_REGRESS_ARGS=--no-locale --inputdir=test --outputdir=test --temp-instance=./test/tmp_check
 PG_ISOLATION_REGRESS_ARGS=--no-locale --inputdir=test --outputdir=test/output_iso --temp-instance=./test/tmp_check_iso
 
+# A generated sql/X.sql is upstream's X_prod.sql, then the fork's X_dtonic.sql
+# where there is one, then X_dev.sql under IS_DEV.  The parts are the
+# prerequisites, so a change to any of them regenerates the file.
+.SECONDEXPANSION:
 ifdef IS_DEV
 override PG_CPPFLAGS += -DIS_DEV
 
-sql/%.sql:
-	@cat sql/$*_prod.sql sql/$*_dev.sql > $@
+sql/%.sql: sql/%_prod.sql $$(wildcard sql/$$*_dtonic.sql) sql/%_dev.sql
+	@cat $^ > $@
 else
-sql/%.sql:
-	@cat sql/$*_prod.sql > $@
+sql/%.sql: sql/%_prod.sql $$(wildcard sql/$$*_dtonic.sql)
+	@cat $^ > $@
 endif
 
 ifdef USE_PGXS
