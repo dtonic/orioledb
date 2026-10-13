@@ -51,7 +51,9 @@ extern void s3_header_open_part(S3HeaderTag tag, int index, int stream,
 								bool localOnly);
 extern bool s3_header_seal_part(S3HeaderTag tag, int index, int stream);
 extern uint64 s3_headers_unsealed_parts(void);
+extern S3PartStatus s3_header_part_status(S3HeaderTag tag, int index);
 extern S3PartStatus s3_header_mark_part_loading(S3HeaderTag tag, int index);
+extern void s3_header_release_part_load(S3HeaderTag tag, int index);
 extern void s3_header_mark_part_loaded(S3HeaderTag tag, int index);
 extern void s3_header_unlock_part(S3HeaderTag tag, int index, bool setDirty,
 								  int stream);
@@ -62,5 +64,8 @@ extern void s3_header_mark_part_not_written(S3HeaderTag tag, int index);
 extern void s3_headers_sync(void);
 extern void s3_headers_error_cleanup(void);
 extern void s3_headers_try_eviction_cycle(void);
+extern void s3_headers_scan_read(bool on);
+extern void s3_headers_range_step(bool on);
+extern bool s3_headers_in_range_step(void);
 
 #endif							/* __S3_HEADERS_H__ */

@@ -51,7 +51,7 @@
 
 
 static S3TaskLocation s3_schedule_file_part_read(uint32 chkpNum, OIndexKey key,
-												 int64 partNum);
+												 int64 partNum, bool claim);
 
 #define WORKERS_FILE_CHECKSUMS_MAX_LEN 100
 
@@ -71,6 +71,10 @@ static S3WorkerCtl *workers_ctl = NULL;
 static S3ChecksumState *checksum_state = NULL;
 
 static int	worker_num;
+
+/* this process is an S3 worker; the task it runs is one it replays */
+bool		s3_worker_process = false;
+static bool s3_worker_replaying = false;
 
 Size
 s3_workers_shmem_needs(void)
@@ -411,15 +415,44 @@ s3process_task(uint64 taskLocation)
 		int32		segNum = partNum / S3_PARTS_PER_SEGMENT,
 					index = partNum % S3_PARTS_PER_SEGMENT;
 
+		tag.key = task->typeSpecific.filePart.key;
+		tag.segNum = segNum;
+
+		/*
+		 * A hint read ahead: claim the part now, and leave it if it is here
+		 * or somebody is downloading it (the process that needs it does that
+		 * itself).  A replayed hint the dead attempt had claimed is still
+		 * Loading: it is this task's to finish.
+		 */
+		if (!task->typeSpecific.filePart.claimed)
+		{
+			S3PartStatus status = s3_header_mark_part_loading(tag, index);
+
+			if (status == S3PartStatusLoaded ||
+				(status == S3PartStatusLoading && !s3_worker_replaying))
+				goto part_done;
+		}
+
 		filename = btree_filename(task->typeSpecific.filePart.key, segNum, 0);
 		objectname = s3_part_object_name(task->typeSpecific.filePart.key, partNum);
 
 		elog(DEBUG1, "S3 part get %s %s", objectname, filename);
 
-		s3_get_file_part(objectname, filename, index);
-
-		tag.key = task->typeSpecific.filePart.key;
-		tag.segNum = segNum;
+		if (task->typeSpecific.filePart.claimed)
+			s3_get_file_part(objectname, filename, index);
+		else if (!s3_try_get_file_part(objectname, filename, index))
+		{
+			/*
+			 * A hint for a part the store does not have (a read ahead past
+			 * the tree's last part): give it back rather than end the worker.
+			 * A part a query needs is downloaded by the process that needs
+			 * it, which reports a part that is missing.
+			 */
+			s3_header_release_part_load(tag, index);
+			pfree(filename);
+			pfree(objectname);
+			goto part_done;
+		}
 
 		/*
 		 * A worker that errors out is restarted with bgw_restart_time 0 and
@@ -441,6 +474,8 @@ s3process_task(uint64 taskLocation)
 
 		pfree(filename);
 		pfree(objectname);
+part_done:
+		;
 	}
 	else if (task->type == S3TaskTypeWriteFilePart &&
 			 task->typeSpecific.filePart.partNum >= 0)
@@ -868,7 +903,8 @@ s3_schedule_dead_file_write(uint32 chkpNum, OIndexKey key)
  * chkpNum when partNum < 0.
  */
 static S3TaskLocation
-s3_schedule_file_part_read(uint32 chkpNum, OIndexKey key, int64 partNum)
+s3_schedule_file_part_read(uint32 chkpNum, OIndexKey key, int64 partNum,
+						   bool claim)
 {
 	S3Task	   *task;
 	S3TaskLocation location;
@@ -881,7 +917,16 @@ s3_schedule_file_part_read(uint32 chkpNum, OIndexKey key, int64 partNum)
 	o_verify_dir_exists_or_create(db_prefix, NULL, NULL);
 	pfree(db_prefix);
 
-	if (partNum >= 0)
+	if (partNum >= 0 && !claim)
+	{
+		S3HeaderTag tag = {.key = key,.segNum = partNum / S3_PARTS_PER_SEGMENT};
+
+		/* a hint: the worker claims the part when it gets to the task */
+		if (s3_header_part_status(tag, partNum % S3_PARTS_PER_SEGMENT) !=
+			S3PartStatusNotLoaded)
+			return 0;
+	}
+	else if (partNum >= 0)
 	{
 		S3PartStatus status;
 		S3HeaderTag tag = {.key = key,.segNum = partNum / S3_PARTS_PER_SEGMENT};
@@ -918,6 +963,7 @@ s3_schedule_file_part_read(uint32 chkpNum, OIndexKey key, int64 partNum)
 	task->typeSpecific.filePart.chkpNum = chkpNum;
 	task->typeSpecific.filePart.key = key;
 	task->typeSpecific.filePart.partNum = partNum;
+	task->typeSpecific.filePart.claimed = claim;
 
 	location = s3_queue_put_task((Pointer) task, sizeof(S3Task));
 
@@ -962,20 +1008,19 @@ s3_schedule_wal_file_write(char *filename, bool archived)
  * shipper hands it over rather than waiting on the deletes itself, as every
  * commit waits on the shipper.
  */
-S3TaskLocation
+void
 s3_schedule_wal_chunks_delete(uint32 timeline, uint64 fromSeq, uint64 toSeq)
 {
 	S3Task	   *task;
-	S3TaskLocation location;
 
 	task = (S3Task *) palloc0(sizeof(S3Task));
 	task->type = S3TaskTypeDeleteWalChunks;
 	task->typeSpecific.deleteWalChunks.timeline = timeline;
 	task->typeSpecific.deleteWalChunks.fromSeq = fromSeq;
 	task->typeSpecific.deleteWalChunks.toSeq = toSeq;
-	location = s3_queue_put_task((Pointer) task, sizeof(S3Task));
+	/* in the background lane: a start's backlog held every worker */
+	s3_queue_put_background_task((Pointer) task, sizeof(S3Task));
 	pfree(task);
-	return location;
 }
 
 /*
@@ -1010,6 +1055,23 @@ s3_schedule_undo_file_write(UndoLogType undoType, uint64 fileNum,
 
 
 /*
+ * The number of the part the page of the given downlink starts in.
+ */
+int64
+s3_downlink_part(BTreeDescr *desc, uint64 downlink)
+{
+	uint64		offset = DOWNLINK_GET_DISK_OFF(downlink);
+	off_t		byte_offset;
+
+	if (!OCompressIsValid(desc->compress))
+		byte_offset = (off_t) offset * (off_t) ORIOLEDB_BLCKSZ;
+	else
+		byte_offset = (off_t) offset * (off_t) ORIOLEDB_COMP_BLCKSZ;
+
+	return byte_offset / ORIOLEDB_S3_PART_SIZE;
+}
+
+/*
  * Schedule the load of given downlink from S3 to local storage.
  */
 S3TaskLocation
@@ -1037,7 +1099,9 @@ s3_schedule_downlink_load(BTreeDescr *desc, uint64 downlink)
 		OIndexKey	key = {.oids = desc->oids};
 		S3TaskLocation location;
 
-		location = s3_schedule_file_part_read(0, key, byte_offset / ORIOLEDB_S3_PART_SIZE);
+		location = s3_schedule_file_part_read(0, key,
+											  byte_offset / ORIOLEDB_S3_PART_SIZE,
+											  false);
 		result = Max(result, location);
 		if (byte_offset % ORIOLEDB_S3_PART_SIZE + read_size > ORIOLEDB_S3_PART_SIZE)
 		{
@@ -1115,16 +1179,46 @@ s3_schedule_pg_file_write(uint32 chkpNum, char *filename)
 	return location;
 }
 
+/*
+ * Schedule the load of a part and return: the caller, s3_header_lock_part(),
+ * finds the part Loading and waits for its status.  Waiting for the task's
+ * queue location instead waited for every task queued before it too (the
+ * queue is erased in order), a checkpoint's uploads included.
+ */
 void
 s3_load_file_part(OIndexKey key, int32 segNum, int32 partNum)
 {
-	S3TaskLocation location;
+	(void) s3_schedule_file_part_read(0, key,
+									  (int64) segNum * S3_PARTS_PER_SEGMENT + partNum,
+									  true);
+}
 
-	location = s3_schedule_file_part_read(0, key,
-										  (int64) segNum * S3_PARTS_PER_SEGMENT + partNum);
+/*
+ * Hint the S3 workers to download a part, if it is not here: a read ahead.
+ */
+void
+s3_schedule_part_read_ahead(OIndexKey key, int64 partNum)
+{
+	(void) s3_schedule_file_part_read(0, key, partNum, false);
+}
 
-	if (location > 0)
-		s3_queue_wait_for_location(location);
+/*
+ * Download a part the caller marked loading, in the calling process: false
+ * when the store did not give it (the caller then leaves it to the workers).
+ */
+bool
+s3_load_file_part_here(OIndexKey key, int32 segNum, int32 partNum)
+{
+	int64		part = (int64) segNum * S3_PARTS_PER_SEGMENT + partNum;
+	char	   *filename = btree_filename(key, segNum, 0);
+	char	   *objectname = s3_part_object_name(key, part);
+	bool		loaded;
+
+	elog(DEBUG1, "S3 part get here %s %s", objectname, filename);
+	loaded = s3_try_get_file_part(objectname, filename, partNum);
+	pfree(objectname);
+	pfree(filename);
+	return loaded;
 }
 
 void
@@ -1132,7 +1226,7 @@ s3_load_map_file(uint32 chkpNum, OIndexKey key)
 {
 	S3TaskLocation location;
 
-	location = s3_schedule_file_part_read(chkpNum, key, -1);
+	location = s3_schedule_file_part_read(chkpNum, key, -1, true);
 
 	if (location > 0)
 		s3_queue_wait_for_location(location);
@@ -1141,10 +1235,8 @@ s3_load_map_file(uint32 chkpNum, OIndexKey key)
 void
 s3worker_main(Datum main_arg)
 {
-	int			rc,
-				wake_events = WL_LATCH_SET | WL_POSTMASTER_DEATH | WL_TIMEOUT;
-
 	worker_num = Int32GetDatum(main_arg);
+	s3_worker_process = true;
 
 	/* enable timeout for relation lock */
 	RegisterTimeout(DEADLOCK_TIMEOUT, CheckDeadLockAlert);
@@ -1200,7 +1292,9 @@ s3worker_main(Datum main_arg)
 				ResetLatch(MyLatch);
 				CHECK_FOR_INTERRUPTS();
 			}
+			s3_worker_replaying = true;
 			s3process_task(workers_locations[worker_num]);
+			s3_worker_replaying = false;
 			workers_locations[worker_num] = InvalidS3TaskLocation;
 		}
 
@@ -1213,14 +1307,11 @@ s3worker_main(Datum main_arg)
 			s3_take_config_reload();
 
 			/*
-			 * Sleep until we are signaled or it's time to check the queue.
+			 * Sleep until a task is put, or bgwriter_delay passes for the
+			 * checksum flush below and the shutdown and reload flags.  The
+			 * sleep exits the process if the postmaster dies.
 			 */
-			rc = WaitLatch(MyLatch, wake_events,
-						   BgWriterDelay,
-						   WAIT_EVENT_BGWRITER_MAIN);
-
-			if (rc & WL_POSTMASTER_DEATH)
-				ShutdownRequestPending = true;
+			s3_queue_wait_for_task(BgWriterDelay, WAIT_EVENT_BGWRITER_MAIN);
 
 			CHECK_FOR_INTERRUPTS();
 

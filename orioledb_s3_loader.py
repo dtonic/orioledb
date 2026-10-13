@@ -13,6 +13,12 @@ from botocore.config import Config
 from botocore.exceptions import ClientError, ParamValidationError
 from concurrent.futures import ThreadPoolExecutor
 from boto3.s3.transfer import TransferConfig
+
+# The most requests the loader runs at once (its download pools).  The
+# client's connection pool is sized to match: at botocore's default of 10, the
+# rest of the pool's threads opened and dropped a connection per request
+# ("Connection pool is full, discarding connection").
+MAX_CONCURRENCY = max(16, os.cpu_count() or 1)
 from email.utils import parsedate_to_datetime
 from threading import Event, Thread
 from urllib.parse import urlparse
@@ -154,7 +160,8 @@ class OrioledbS3ObjectLoader:
 			    "s3",
 			    endpoint_url=args.resolved_endpoint,
 			    verify=verify,
-			    config=Config(s3={'addressing_style': args.resolved_style}))
+			    config=Config(s3={'addressing_style': args.resolved_style},
+			                  max_pool_connections=MAX_CONCURRENCY))
 			self.finish_args(args, s3_client, args.resolved_bucket,
 			                 args.resolved_prefix)
 			return
@@ -171,7 +178,8 @@ class OrioledbS3ObjectLoader:
 		bucket_in_endpoint = True
 		bucket_in_prefix = False
 		try:
-			config = Config(s3={'addressing_style': 'virtual'})
+			config = Config(s3={'addressing_style': 'virtual'},
+			                max_pool_connections=MAX_CONCURRENCY)
 			s3_client = boto3.client("s3",
 			                         endpoint_url=raw_endpoint,
 			                         verify=verify,
@@ -188,7 +196,8 @@ class OrioledbS3ObjectLoader:
 			s3_client = boto3.client(
 			    "s3",
 			    endpoint_url=f"{parsed_url.scheme}://{parsed_url.netloc}",
-			    verify=verify)
+			    verify=verify,
+			    config=Config(max_pool_connections=MAX_CONCURRENCY))
 			try:
 				s3_client.head_bucket(Bucket=bucket)
 			except ParamValidationError:
@@ -451,7 +460,7 @@ class OrioledbS3ObjectLoader:
 			jobs.append((f"trees/{datoid}/{relnode}/maps/{token}-{k}",
 			             os.path.join(self.data_dir, "orioledb_data",
 			                          str(datoid), f"{relnode}-{k}.map")))
-		with ThreadPoolExecutor(os.cpu_count()) as executor:
+		with ThreadPoolExecutor(MAX_CONCURRENCY) as executor:
 			futures = [
 			    executor.submit(self.download_file, self.bucket_name,
 			                    os.path.join(self.prefix, key), path)
@@ -930,7 +939,7 @@ class OrioledbS3ObjectLoader:
 				f.write(body)
 			os.replace(tmp, path)
 
-		with ThreadPoolExecutor(16) as executor:
+		with ThreadPoolExecutor(MAX_CONCURRENCY) as executor:
 			list(executor.map(fetch, seqs))
 		if seqs:
 			tmp = f"{marker}.tmp{os.getpid()}"
@@ -969,11 +978,26 @@ class OrioledbS3ObjectLoader:
 		"""
 		# a chunk listed and gone before it was read was removed once its
 		# segment was archived: ask for the segment again
+		relists = 0
 		for _ in range(10):
 			try:
 				seg = self.assemble_segment(tli, segno)
 			except ChunkGone:
 				continue
+			except ChunkGap:
+				# a store whose listing lags its writes (RustFS) can list a
+				# chunk and not the one put just before it, for a second or
+				# two.  The cache took that listing as complete and never
+				# listed the gap again, so a reader stopped there for good:
+				# list again, a little later each time
+				if relists < 3:
+					relists += 1
+					self.forget_listing(tli)
+					time.sleep(0.5 * relists)
+					continue
+				seg = self.archived_since(tli, segno)
+				if seg is None:
+					raise
 			except RestoreRefused:
 				seg = self.archived_since(tli, segno)
 				if seg is None:
@@ -985,6 +1009,13 @@ class OrioledbS3ObjectLoader:
 			return seg
 		raise RestoreRefused(f"the WAL chunks of segment "
 		                     f"{self.segment_name(tli, segno)} keep going")
+
+	def forget_listing(self, tli):
+		"""The next chunks_of() lists the timeline's chunks again."""
+		try:
+			os.unlink(os.path.join(self.chunk_cache(tli), 'listed'))
+		except FileNotFoundError:
+			pass
 
 	def archived_since(self, tli, segno):
 		"""The segment archived after assemble_segment looked for it: the
@@ -1045,7 +1076,7 @@ class OrioledbS3ObjectLoader:
 				# a chunk missing between two that are there: the WAL
 				# after it was acknowledged and is not here; ending the
 				# segment at the gap would end recovery before it
-				raise RestoreRefused(
+				raise ChunkGap(
 				    f"WAL chunks of timeline {tli} miss {pos:X} to {start:X} "
 				    f"(before chunk {seq})")
 			body = self.chunk_body(tli, seq)
@@ -1195,6 +1226,10 @@ class ChunkGone(Exception):
 
 class RestoreRefused(Exception):
 	"""The bucket's WAL cannot be put together without leaving some out."""
+
+
+class ChunkGap(RestoreRefused):
+	"""A chunk missing between two the listing had."""
 
 
 PIN_TTL = 600
@@ -1369,7 +1404,11 @@ def end_after_record(seg, pos, block_size):
 
 def server_s3_settings(data_dir):
 	"""orioledb.s3_accesskey/secretkey/region as AWS_* variables, from the
-	server's configuration files and the options it was started with."""
+	server's configuration files and the options it was started with.  The
+	files' include, include_if_exists and include_dir directives are
+	followed, in order, as the server reads them: the keys are best kept in
+	an included file outside the data directory, since the checkpoints put
+	postgresql.conf and postgresql.auto.conf into the bucket."""
 	names = {
 	    'orioledb.s3_accesskey': 'AWS_ACCESS_KEY_ID',
 	    'orioledb.s3_secretkey': 'AWS_SECRET_ACCESS_KEY',
@@ -1379,19 +1418,50 @@ def server_s3_settings(data_dir):
 	# a setting starts its line (a commented one does not count); in
 	# postmaster.opts each is one quoted argument
 	in_conf = re.compile(r"^\s*(orioledb\.s3_(?:accesskey|secretkey|region))"
-	                     r"\s*=\s*'?([^'\s\"#]+)'?", re.MULTILINE)
+	                     r"\s*=\s*'?([^'\s\"#]+)'?")
+	include = re.compile(r"^\s*(include|include_if_exists|include_dir)"
+	                     r"\s*=?\s*'([^']+)'")
 	in_opts = re.compile(r'"(orioledb\.s3_(?:accesskey|secretkey|region))'
 	                     r'=([^"]+)"')
-	for name, pattern in (('postgresql.conf', in_conf),
-	                      ('postgresql.auto.conf', in_conf),
-	                      ('postmaster.opts', in_opts)):
+
+	def read_conf(path, depth):
+		if depth > 10:
+			return
 		try:
-			with open(os.path.join(data_dir, name)) as f:
-				text = f.read()
+			with open(path) as f:
+				lines = f.read().splitlines()
 		except OSError:
-			continue
-		for m in pattern.finditer(text):
+			return
+		here = os.path.dirname(path)
+		for line in lines:
+			m = in_conf.match(line)
+			if m:
+				found[names[m.group(1)]] = m.group(2)
+				continue
+			m = include.match(line)
+			if not m:
+				continue
+			target = os.path.join(here, m.group(2))
+			if m.group(1) == 'include_dir':
+				try:
+					entries = sorted(os.listdir(target))
+				except OSError:
+					continue
+				for entry in entries:
+					if entry.endswith('.conf') and not entry.startswith('.'):
+						read_conf(os.path.join(target, entry), depth + 1)
+			else:
+				read_conf(target, depth + 1)
+
+	read_conf(os.path.join(data_dir, 'postgresql.conf'), 0)
+	read_conf(os.path.join(data_dir, 'postgresql.auto.conf'), 0)
+	try:
+		with open(os.path.join(data_dir, 'postmaster.opts')) as f:
+			text = f.read()
+		for m in in_opts.finditer(text):
 			found[names[m.group(1)]] = m.group(2)
+	except OSError:
+		pass
 	return found
 
 

@@ -1462,13 +1462,14 @@ _PG_init(void)
 							   NULL,
 							   NULL);
 
+	/* shown to superusers only, as primary_conninfo is */
 	DefineCustomStringVariable("orioledb.s3_secretkey",
 							   "S3 secret key",
 							   NULL,
 							   &s3_secretkey,
 							   NULL,
 							   PGC_SIGHUP,
-							   0,
+							   GUC_SUPERUSER_ONLY,
 							   NULL,
 							   NULL,
 							   NULL);
@@ -1933,6 +1934,10 @@ orioledb_on_shmem_exit(int code, Datum arg)
 		 */
 		btree_unpin_meta_page();
 		btree_release_meta_page_claim();
+
+		/* a part this process was downloading itself (FATAL skips the hook) */
+		if (orioledb_s3_mode)
+			s3_headers_error_cleanup();
 	}
 
 	/* the postmaster at a clean stop; a crash restart passes code 1 */

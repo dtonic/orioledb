@@ -27,7 +27,8 @@ from .s3_base_test import S3BaseTest, s3_test_attrs, mock_put_object, \
  orig_put_object, \
  mock_put_object_conflict, mock_moto_unkown_error, FlakyPutObject, \
  RevokedKeyPut, AmbiguousPut, HoldChunksOf, HoldFirstGet, ConflictingPut, \
- FailingGet, RevokedKey, orig_get_object, orig_list_objects_v2, FailingDelete
+ FailingGet, RevokedKey, orig_get_object, orig_list_objects_v2, FailingDelete, \
+ orig_delete_object, TransientServerError
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
@@ -535,6 +536,548 @@ class S3Test(S3BaseTest):
 			time.sleep(1)
 		self.assertEqual(300000,
 		                 node.execute("SELECT COUNT(*) FROM o_test")[0][0])
+		node.stop()
+
+	def test_s3_part_read_does_not_wait_for_a_worker_poll(self):
+		"""
+		A backend that needed an evicted part queued its download and
+		waited.  No S3 worker was woken for it: the task waited for a
+		worker's next look at the queue, bgwriter_delay apart, so every part
+		a query reached cost up to that long.  With bgwriter_delay at 10 s
+		these lookups took minutes.
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('32MB')
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION IF NOT EXISTS orioledb;
+			CREATE TABLE o_test (
+				id int PRIMARY KEY,
+				value text NOT NULL
+			) USING orioledb;
+			INSERT INTO o_test SELECT id, repeat('x', 1000)
+				FROM generate_series(1, 300000) id;
+			CHECKPOINT;
+		""")
+		deadline = time.time() + 120
+		while self.get_data_size() > 64 * 1024 * 1024:
+			self.assertLess(time.time(), deadline, "the data was not evicted")
+			time.sleep(1)
+		node.safe_psql("ALTER SYSTEM SET bgwriter_delay = '10s'")
+		node.safe_psql("SELECT pg_reload_conf()")
+		time.sleep(1)
+		# 40 keys 7,500 rows (about 8 MB) apart: each in a part of its own
+		keys = [1 + i * 7500 for i in range(40)]
+		started = time.time()
+		with node.connect() as con:
+			con.execute("SET statement_timeout = '120s'")
+			for key in keys:
+				self.assertEqual(
+				    [(1000, )],
+				    con.execute(
+				        f"SELECT length(value) FROM o_test WHERE id = {key}"))
+		elapsed = time.time() - started
+		self.assertLess(elapsed, 30,
+		                f"40 lookups of evicted parts took {elapsed:.0f} s")
+		node.stop()
+
+	def test_s3_part_read_waits_for_its_part_only(self):
+		"""
+		A backend that queued the download of a part waited until every task
+		queued before it was done (the queue is erased in order), so one slow
+		download, or a checkpoint's uploads, held a read whose own part was
+		in long before.  It now waits for its part's status.
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('16MB')
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION IF NOT EXISTS orioledb;
+			CREATE TABLE o_test (
+				id int PRIMARY KEY,
+				value text NOT NULL
+			) USING orioledb;
+			INSERT INTO o_test SELECT id,
+				(SELECT string_agg(md5(id::text || g::text), '')
+				 FROM generate_series(1, 30) g)
+				FROM generate_series(1, 100000) id;
+			CHECKPOINT;
+		""")
+		deadline = time.time() + 120
+		while self.get_data_size() > 32 * 1024 * 1024:
+			self.assertLess(time.time(), deadline, "the data was not evicted")
+			time.sleep(0.5)
+
+		entered = threading.Event()
+		release = threading.Event()
+		armed = [True]
+
+		def hold_first_part_get(response):
+			if armed[0] and '/parts/' in response.parse_key_name():
+				armed[0] = False
+				entered.set()
+				release.wait(120)
+			return orig_get_object(response)
+
+		with patch('moto.s3.responses.S3Response.get_object',
+		           new=hold_first_part_get):
+			held = Thread(target=lambda: node.execute(
+			    "SELECT length(value) FROM o_test WHERE id = 1"))
+			held.start()
+			try:
+				self.assertTrue(entered.wait(60))
+				started = time.time()
+				with node.connect() as con:
+					con.execute("SET statement_timeout = '30s'")
+					self.assertEqual([(960, )],
+					                 con.execute(
+					                     "SELECT length(value) FROM o_test "
+					                     "WHERE id = 90000"))
+				elapsed = time.time() - started
+			finally:
+				release.set()
+				held.join()
+		self.assertLess(elapsed, 10,
+		                f"a read behind a held download took {elapsed:.0f} s")
+		node.stop()
+
+	def test_s3_part_read_does_not_wait_for_busy_workers(self):
+		"""
+		The S3 workers download what is queued in order, so a part a query
+		needed waited until one was free: after a start, a GC's deletes of
+		WAL chunks kept all of them busy, and the first query on a table
+		whose local data was evicted took 45 s.  The process that needs a
+		part downloads it itself; here every worker is held in a part upload
+		of a checkpoint.
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('16MB')
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION IF NOT EXISTS orioledb;
+			CREATE TABLE o_test (
+				id int PRIMARY KEY,
+				value text NOT NULL
+			) USING orioledb;
+			INSERT INTO o_test SELECT id,
+				(SELECT string_agg(md5(id::text || g::text), '')
+				 FROM generate_series(1, 30) g)
+				FROM generate_series(1, 100000) id;
+			CHECKPOINT;
+		""")
+		deadline = time.time() + 120
+		while self.get_data_size() > 32 * 1024 * 1024:
+			self.assertLess(time.time(), deadline, "the data was not evicted")
+			time.sleep(0.5)
+		# parts for a checkpoint to upload, more than there are workers
+		node.safe_psql("UPDATE o_test SET value = upper(value) "
+		               "WHERE id <= 10000")
+
+		held = threading.Semaphore(0)
+		release = threading.Event()
+
+		def slow_part_put(response):
+			if '/parts/' in response.parse_key_name():
+				held.release()
+				release.wait(120)
+			return orig_put_object(response)
+
+		with patch('moto.s3.responses.S3Response.put_object',
+		           new=slow_part_put):
+			checkpoint = Thread(target=lambda: node.safe_psql("CHECKPOINT"))
+			checkpoint.start()
+			try:
+				# the store takes one PUT at a time: the workers wait in the
+				# uploads behind the one held
+				self.assertTrue(held.acquire(timeout=60))
+				time.sleep(3)
+				started = time.time()
+				with node.connect() as con:
+					con.execute("SET statement_timeout = '60s'")
+					self.assertEqual([(960, )],
+					                 con.execute(
+					                     "SELECT length(value) FROM o_test "
+					                     "WHERE id = 90000"))
+				elapsed = time.time() - started
+			finally:
+				release.set()
+				checkpoint.join()
+		self.assertLess(
+		    elapsed, 10,
+		    f"a read while the workers were busy took {elapsed:.0f} s")
+		node.stop()
+
+	def s3_incompressible_table(self, node, name, rows):
+		node.safe_psql(f"""
+			CREATE TABLE {name} (
+				id int PRIMARY KEY,
+				value text NOT NULL
+			) USING orioledb;
+			INSERT INTO {name} SELECT id,
+				(SELECT string_agg(md5(id::text || g::text), '')
+				 FROM generate_series(1, 30) g)
+				FROM generate_series(1, {rows}) id;
+		""")
+
+	def wait_evicted(self, below_mb):
+		deadline = time.time() + 120
+		while self.get_data_size() > below_mb * 1024 * 1024:
+			self.assertLess(time.time(), deadline, "the data was not evicted")
+			time.sleep(0.5)
+
+	def test_s3_scan_does_not_evict_what_queries_use(self):
+		"""
+		A sequential scan of a table larger than orioledb.s3_desired_size
+		counted every page it read on the parts it passed, so its parts
+		looked as used as the ones queries kept reading, and the eviction
+		took those with them: after scans of a large table, lookups in a
+		small one went back to the store.  A scan's read does not count
+		now, and the eviction takes the parts nothing counted first.
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('96MB')
+		node.start()
+		node.safe_psql("CREATE EXTENSION IF NOT EXISTS orioledb")
+		self.s3_incompressible_table(node, 'hot', 40000)
+		self.s3_incompressible_table(node, 'big', 300000)
+		node.safe_psql("CHECKPOINT")
+		self.wait_evicted(104)
+		keys = [1 + i * 100 for i in range(400)]
+		lookups = "".join(f"SELECT length(value) FROM hot WHERE id = {k};"
+		                  for k in keys)
+		for _ in range(2):
+			node.safe_psql(lookups)
+		for _ in range(3):
+			self.assertEqual([(300000, )],
+			                 node.execute("SELECT count(*) FROM big"))
+		time.sleep(3)
+
+		gets = [0]
+
+		def counting_get(response):
+			if '/parts/' in response.parse_key_name():
+				gets[0] += 1
+			return orig_get_object(response)
+
+		with patch('moto.s3.responses.S3Response.get_object',
+		           new=counting_get):
+			node.safe_psql(lookups)
+		self.assertLessEqual(
+		    gets[0], 4, f"lookups in the small table read {gets[0]} "
+		    "parts back after the scans")
+		node.stop()
+
+	def test_s3_desired_size_counts_bytes(self):
+		"""
+		orioledb.s3_desired_size was held as a number of 1 MB parts, and
+		each file's last part counted whole however little it held: with a
+		few dozen files of system trees and indexes, the local data stayed
+		at about half of a 64 MB bound.  The bound is held in bytes on disk.
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('64MB')
+		node.start()
+		node.safe_psql("CREATE EXTENSION IF NOT EXISTS orioledb")
+		self.s3_incompressible_table(node, 'o_test', 300000)
+		node.safe_psql("CHECKPOINT")
+		self.assertEqual([(300000, )],
+		                 node.execute("SELECT count(*) FROM o_test"))
+		self.wait_evicted(72)
+		sizes = []
+		for _ in range(20):
+			sizes.append(self.get_data_size() >> 20)
+			time.sleep(0.5)
+		self.assertGreater(min(sizes), 48,
+		                   f"local data under a 64 MB bound: {sizes}")
+		self.assertLessEqual(max(sizes), 72)
+		node.stop()
+
+	def test_s3_range_scan_reads_ahead(self):
+		"""
+		A range scan over the primary key steps from leaf to leaf, and the
+		parts of its leaves were downloaded as it reached them: what read
+		ahead there was (an internal page loaded from the store schedules
+		its children) stopped at every internal page.  With every GET
+		taking 100 ms a range of 30 MB took 2.4 to 2.8 s.  A run of misses
+		on nearby parts now reads the following parts ahead, past the
+		internal pages; a hint past the tree's last part is dropped, not a
+		failure.
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('16MB')
+		node.append_conf("orioledb.s3_num_workers = 8")
+		node.start()
+		node.safe_psql("CREATE EXTENSION IF NOT EXISTS orioledb")
+		self.s3_incompressible_table(node, 'o_test', 100000)
+		node.safe_psql("CHECKPOINT")
+
+		def slow_get(response):
+			if '/parts/' in response.parse_key_name():
+				time.sleep(0.1)
+			return orig_get_object(response)
+
+		with node.connect() as con:
+			con.execute("SET enable_seqscan = off")
+			con.execute("SET enable_bitmapscan = off")
+			# the internal pages in memory: a range over the whole key
+			self.assertEqual([(100000, )],
+			                 con.execute("SELECT count(*) FROM o_test "
+			                             "WHERE id BETWEEN 1 AND 100000"))
+			self.wait_evicted(32)
+			time.sleep(2)
+			query = ("SELECT count(*) FROM o_test "
+			         "WHERE id BETWEEN 30001 AND 60000")
+			self.assertIn(
+			    "scan of: o_test_pkey",
+			    "\n".join(r[0] for r in con.execute("EXPLAIN " + query)))
+			with patch('moto.s3.responses.S3Response.get_object',
+			           new=slow_get):
+				started = time.time()
+				self.assertEqual([(30000, )], con.execute(query))
+				elapsed = time.time() - started
+		self.assertLess(elapsed, 2,
+		                f"a range scan of evicted parts took {elapsed:.1f} s")
+		with open(node.pg_log_file) as f:
+			self.assertNotIn("could not get object", f.read())
+		node.stop()
+
+	def test_s3_lookups_download_their_own_parts(self):
+		"""
+		A lookup descending through an internal page loaded from the store
+		downloaded all its children's parts, and lookups a few parts apart
+		in key order made a run the read ahead followed: after a restart, 20
+		lookups downloaded about 96 parts.  Children are warmed for a scan
+		only, and a run is misses at most two parts apart.
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('16MB')
+		node.start()
+		node.safe_psql("CREATE EXTENSION IF NOT EXISTS orioledb")
+		self.s3_incompressible_table(node, 'o_test', 100000)
+		node.safe_psql("CHECKPOINT")
+		self.wait_evicted(32)
+		time.sleep(2)
+		# nothing of the tree in memory
+		node.stop()
+		node.start()
+
+		gets = []
+
+		def counting_get(response):
+			key = response.parse_key_name()
+			if '/parts/' in key:
+				gets.append(key)
+			return orig_get_object(response)
+
+		keys = [1 + i * 5000 for i in range(20)]
+		with patch('moto.s3.responses.S3Response.get_object',
+		           new=counting_get):
+			node.safe_psql("".join(
+			    f"SELECT length(value) FROM o_test WHERE id = {k};"
+			    for k in keys))
+		self.assertLessEqual(len(gets), 45,
+		                     f"20 lookups downloaded {len(gets)} parts")
+		node.stop()
+
+	def test_s3_chunk_deletes_leave_a_worker(self):
+		"""
+		The deletes of WAL chunks an archived segment frees went to the S3
+		workers' queue with everything else: a backlog of them held every
+		worker, and a checkpoint waited for its uploads until the deletes
+		were done (after a start, a GC's backlog held the workers for a
+		minute).  They go to a background lane now, which all the workers
+		but one may run.
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('1GB')
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			archive_mode = on
+			archive_library = 'orioledb'
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION IF NOT EXISTS orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+		""")
+		# a chunk a commit: more than three delete tasks of 1000 chunks
+		with node.connect(autocommit=True) as con:
+			for i in range(1, 3501):
+				con.execute(f"INSERT INTO o_test VALUES ({i})")
+
+		held = threading.Semaphore(0)
+		release = threading.Event()
+
+		# a refused delete keeps its worker retrying (holding the request
+		# instead would hold the store's other writes)
+		def held_delete(response):
+			if '/chunks/' in response.parse_key_name() and \
+                not release.is_set():
+				held.release()
+				raise TransientServerError()
+			return orig_delete_object(response)
+
+		with patch('moto.s3.responses.S3Response.delete_object',
+		           new=held_delete):
+			try:
+				node.safe_psql("SELECT pg_switch_wal()")
+				node.safe_psql("INSERT INTO o_test VALUES (0)")
+				self.assertTrue(held.acquire(timeout=60))
+				time.sleep(3)
+				node.safe_psql("UPDATE o_test SET id = -id WHERE id <= 100")
+				checkpoint = Thread(
+				    target=lambda: node.safe_psql("CHECKPOINT"))
+				started = time.time()
+				checkpoint.start()
+				checkpoint.join(30)
+				self.assertFalse(checkpoint.is_alive(),
+				                 "a checkpoint waited behind chunk deletes")
+				self.assertLess(time.time() - started, 30)
+			finally:
+				release.set()
+		node.stop()
+
+	def test_s3_secret_key_is_shown_to_superusers_only(self):
+		"""orioledb.s3_secretkey was shown to every user (SHOW, pg_settings),
+		where PostgreSQL keeps its own credentials, such as
+		primary_conninfo, to superusers."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("CREATE ROLE plain LOGIN")
+		self.assertEqual([(self.secret_access_key, )],
+		                 node.execute("SHOW orioledb.s3_secretkey"))
+		with node.connect(username='plain') as con:
+			with self.assertRaisesRegex(Exception, 'pg_read_all_settings'):
+				con.execute("SHOW orioledb.s3_secretkey")
+		with node.connect(username='plain') as con:
+			self.assertEqual([],
+			                 con.execute(
+			                     "SELECT setting FROM pg_settings "
+			                     "WHERE name = 'orioledb.s3_secretkey'"))
+		node.stop()
+
+	def test_s3_loader_reads_keys_from_an_included_file(self):
+		"""restore_command takes the server's keys from its configuration
+		files, which a checkpoint puts into the bucket: the keys are best
+		kept in a file outside the data directory that postgresql.conf
+		includes, and the loader did not follow include directives."""
+		loader = runpy.run_path(os.path.join(
+		    os.path.dirname(os.path.realpath(__file__)),
+		    '../../orioledb_s3_loader.py'),
+		                        run_name='loader')
+		data = mkdtemp()
+		secrets = mkdtemp()
+		confd = os.path.join(data, 'conf.d')
+		os.mkdir(confd)
+		with open(os.path.join(secrets, 's3.conf'), 'w') as f:
+			f.write("orioledb.s3_accesskey = 'included-access'\n"
+			        "orioledb.s3_secretkey = 'included-secret'\n")
+		with open(os.path.join(confd, '10-region.conf'), 'w') as f:
+			f.write("orioledb.s3_region = 'eu-west-1'\n")
+		with open(os.path.join(data, 'postgresql.conf'), 'w') as f:
+			f.write("# orioledb.s3_secretkey = 'commented'\n"
+			        f"include_if_exists '{secrets}/s3.conf'\n"
+			        "include_if_exists 'missing.conf'\n"
+			        "include_dir 'conf.d'\n")
+		try:
+			self.assertEqual(
+			    {
+			        'AWS_ACCESS_KEY_ID': 'included-access',
+			        'AWS_SECRET_ACCESS_KEY': 'included-secret',
+			        'AWS_DEFAULT_REGION': 'eu-west-1'
+			    }, loader['server_s3_settings'](data))
+		finally:
+			shutil.rmtree(data)
+			shutil.rmtree(secrets)
+
+	def test_s3_scan_reads_ahead(self):
+		"""
+		A sequential scan reads the leaves it finds on disk in file order, but
+		it downloaded the part of each in turn and waited for it: with every
+		GET taking 100 ms, as against a remote store, a scan of 100 MB took
+		ten seconds whatever the number of S3 workers.  It now schedules the
+		parts ahead of the one it reads.
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('16MB')
+		node.append_conf("orioledb.s3_num_workers = 8")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION IF NOT EXISTS orioledb;
+			CREATE TABLE o_test (
+				id int PRIMARY KEY,
+				value text NOT NULL
+			) USING orioledb;
+			INSERT INTO o_test SELECT id,
+				(SELECT string_agg(md5(id::text || g::text), '')
+				 FROM generate_series(1, 30) g)
+				FROM generate_series(1, 100000) id;
+			CHECKPOINT;
+		""")
+		deadline = time.time() + 120
+		while self.get_data_size() > 32 * 1024 * 1024:
+			self.assertLess(time.time(), deadline, "the data was not evicted")
+			time.sleep(0.5)
+
+		def slow_get(response):
+			if '/parts/' in response.parse_key_name():
+				time.sleep(0.1)
+			return orig_get_object(response)
+
+		with patch('moto.s3.responses.S3Response.get_object', new=slow_get):
+			started = time.time()
+			self.assertEqual([(100000, 96000000)],
+			                 node.execute(
+			                     "SELECT COUNT(*), sum(length(value)) "
+			                     "FROM o_test"))
+			elapsed = time.time() - started
+		self.assertLess(elapsed, 5,
+		                f"a scan of evicted parts took {elapsed:.1f} s")
+		node.stop()
+
+	def test_s3_eviction_keeps_the_desired_size(self):
+		"""
+		Past orioledb.s3_desired_size, a pass evicted every part no query
+		had used since the last pass, not only enough to get under the
+		bound.  After a scan the parts' usage counts reach zero together, so
+		one pass took the local data far under the bound, and the scan's
+		parts came back and went again.  A pass now stops at nine tenths of
+		the bound.  (The bound counts parts: each file's last part counts
+		whole, so the bytes on disk stay a little below it.)
+		"""
+		node = self.node
+		self.s3_small_buffers_conf('200MB')
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION IF NOT EXISTS orioledb;
+			CREATE TABLE o_test (
+				id int PRIMARY KEY,
+				value text NOT NULL
+			) USING orioledb;
+			INSERT INTO o_test SELECT id,
+				(SELECT string_agg(md5(id::text || g::text), '')
+				 FROM generate_series(1, 30) g)
+				FROM generate_series(1, 300000) id;
+			CHECKPOINT;
+		""")
+		self.assertEqual([(300000, 288000000)],
+		                 node.execute("SELECT COUNT(*), sum(length(value)) "
+		                              "FROM o_test"))
+		# the scan's usage counts halve away, then a pass evicts
+		deadline = time.time() + 120
+		while self.get_data_size() > 216 * 1024 * 1024:
+			self.assertLess(time.time(), deadline, "the data was not evicted")
+			time.sleep(0.5)
+		sizes = []
+		for _ in range(40):
+			sizes.append(self.get_data_size() >> 20)
+			time.sleep(0.5)
+		self.assertGreater(
+		    min(sizes), 128,
+		    f"local data under a 200 MB bound went down to {min(sizes)} MB: "
+		    f"{sizes}")
+		self.assertLessEqual(max(sizes), 216)
 		node.stop()
 
 	def s3_small_buffers_conf(self, desired_size):
@@ -3310,6 +3853,88 @@ class S3Test(S3BaseTest):
 			with open(restored, 'rb') as f:
 				got = f.read()
 			upto = last[4] - segno * segment_size
+			self.assertEqual(original[:upto], got[:upto])
+			new_node.cleanup()
+
+	def test_s3_restore_lists_a_gap_again(self):
+		"""
+		A store whose listing lags its writes (RustFS) can list a chunk and
+		not the one put just before it.  The restore cache took that listing
+		as complete, so the chunk it missed was never listed again: the
+		segment was refused for good, and a reader stopped there.  A gap
+		between two chunks is listed again before it is refused.
+		"""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		for i in range(1, 21):
+			node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+		node.stop(['-m', 'immediate'])
+		keys = [k for k in self.chunk_keys() if k.startswith('wal/00000001/')]
+		ranges = [
+		    struct.unpack('<IIQQQ',
+		                  self.s3_object(k)[:32]) for k in keys
+		]
+		segment_size = 16 * 1024 * 1024
+		segno = ranges[-1][4] // segment_size
+		inside = [
+		    k for k, h in zip(keys, ranges) if h[3] // segment_size == segno
+		]
+		self.assertGreater(len(inside), 2)
+		hidden = inside[len(inside) // 2]
+		# whether each listing that had the chunk hid it
+		listings = []
+
+		def lagging_listing(response):
+			body = orig_list_objects_v2(response)
+			if f"<Key>{hidden}</Key>" not in body:
+				return body
+			listings.append(not listings)
+			if not listings[-1]:
+				return body
+			return re.sub(r"<Contents>(?:(?!</Contents>).)*<Key>" +
+			              re.escape(hidden) +
+			              r"</Key>(?:(?!</Contents>).)*</Contents>",
+			              "",
+			              body,
+			              flags=re.S)
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			# what --restore knows of the chunks is what it lists itself
+			shutil.rmtree(os.path.join(new_node.data_dir, 'pg_wal',
+			                           'orioledb_s3_chunks'),
+			              ignore_errors=True)
+			name = f"00000001{segno >> 8:08X}{segno & 0xFF:08X}"
+			restored = os.path.join(new_node.data_dir, 'restored-segment')
+			old_argv = sys.argv
+			sys.argv = [
+			    os.path.join(os.path.dirname(os.path.realpath(__file__)),
+			                 '../../orioledb_s3_loader.py'), '--endpoint',
+			    self.loader._endpoint_url, '--cert-file', self.s3_cainfo, '-d',
+			    new_node.data_dir, '--restore', name, restored
+			]
+			try:
+				with patch('moto.s3.responses.S3Response.list_objects_v2',
+				           new=lagging_listing):
+					runpy.run_path(sys.argv[0], None, "__main__")
+			except SystemExit as e:
+				self.assertEqual(e.code, 0)
+			finally:
+				sys.argv = old_argv
+			# the first listing missed the chunk, and a later one had it
+			self.assertEqual([True, False], listings[:2])
+			with open(os.path.join(node.data_dir, 'pg_wal', name), 'rb') as f:
+				original = f.read()
+			with open(restored, 'rb') as f:
+				got = f.read()
+			upto = ranges[-1][4] - segno * segment_size
 			self.assertEqual(original[:upto], got[:upto])
 			new_node.cleanup()
 

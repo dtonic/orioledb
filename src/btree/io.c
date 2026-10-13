@@ -1807,13 +1807,15 @@ load_page(OBTreeFindPageContext *context)
 	Assert(O_PAGE_IS(page, LEAF) ||
 		   (PAGE_GET_N_ONDISK(page) == BTREE_PAGE_ITEMS_COUNT(page)));
 
-	if (orioledb_s3_mode && !O_PAGE_IS(page, LEAF))
+	if (orioledb_s3_mode && !O_PAGE_IS(page, LEAF) && s3_headers_in_range_step())
 	{
 		BTreePageItemLocator loc;
 
 		/*
 		 * In S3 mode schedule load of all the page children for faster
-		 * warmup.
+		 * warmup, for a scan only: a lookup descending through an internal
+		 * page downloaded all its children's parts for the one leaf it read
+		 * (20 lookups after a restart downloaded 96 parts; 29 now).
 		 */
 		BTREE_PAGE_FOREACH_ITEMS(page, &loc)
 		{
