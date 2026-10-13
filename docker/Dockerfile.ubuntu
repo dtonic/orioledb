@@ -232,10 +232,12 @@ RUN set -eux; \
 	# install orioledb extension
 	cd /usr/src/postgresql/contrib/orioledb; \
 	# Remove any stale generated SQL files that may have leaked into the
-	# build context, so the Makefile regenerates them with IS_DEV=1.
+	# build context, so the Makefile regenerates them.  A release build:
+	# no IS_DEV, so none of the test-only SQL functions (sql/*_dev.sql)
+	# and debug GUCs are in the image; S3 mode does not need them.
 	make USE_PGXS=1 clean; \
-	make USE_PGXS=1 IS_DEV=1 -j "$(nproc)"; \
-	make USE_PGXS=1 IS_DEV=1 install; \
+	make USE_PGXS=1 -j "$(nproc)"; \
+	make USE_PGXS=1 install; \
 	\
 	# Clean up only if not in debug mode
 	if [ "$DEBUG_MODE" != "true" ]; then \
