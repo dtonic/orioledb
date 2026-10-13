@@ -144,11 +144,34 @@ shipper). 한 버킷에 writer 하나와 reader 여럿이 붙는다. writer 는 
   사용 횟수가 남은 파트는 반으로 줄여 남기고, 없는 파트를 내보내며, 멈춘 파일(손)에서 다음 바퀴를 시작한다. 스캔이 지나간
   파트까지 함께 세면, 큰 테이블을 훑은 뒤 질의가 쓰던 파트가 먼저 나갔다(작은 테이블의 조회가 파트 15개를 다시 받음).
   Guards: `test_s3_scan_does_not_evict_what_queries_use`, `test_s3_eviction_keeps_the_desired_size`.
+- 한 바퀴가 파일마다 헤더를 세 번 읽고(차가운 두 단계와 clock) 파일마다 `stat()` 했다: 작은 트리 수천 개에서 아무것도
+  못 내보내는 바퀴가 초마다 헤더 캐시를 세 번 다시 채웠다. 파일의 디스크 크기는 바퀴 사이에 기억하고 16바퀴마다(또는
+  항목이 없을 때) 다시 재며 내보낸 만큼은 바로 뺀다(`occupied_callback`). 첫 차가운 단계가 두 번째 단계에 볼 파일(사용
+  횟수 1 인 내보낼 수 있는 파트가 있는 파일)과 clock 에 남은 것이 있는지를 적어 두어, 뒤 단계는 그 파일만 읽고 남은 것이
+  없으면 clock 을 건너뛴다. 바퀴마다 DEBUG1 로 `S3 eviction cycle: N files measured, N header loads, N parts evicted`
+  를 남긴다. Guard: `test_s3_eviction_cycles_read_each_header_once`.
+- 파일의 마지막, 덜 찬 파트는 찬 비율의 확률로 내보낸다(빈 꼬리는 나중의 GET 값어치가 없다). 뽑기가 부호 있는 int32 를
+  unsigned 찬 바이트와 비교해 음수 뽑기(절반)가 늘 크게 읽혀, 찬 정도와 무관하게 절반이 건너뛰어졌다. 뽑기는 바퀴의 첫
+  단계에서 한 번이다(전에는 단계마다): 건너뛴 꼬리는 헤더를 읽지 않으므로 뒤 단계가 알 수 없고, 읽으면 뽑기가 아끼는 것을
+  도로 쓴다. 건너뛴 꼬리는 그 바퀴의 clock 이 사용 횟수를 반으로 줄이지도 않는다.
+  Guard: `test_s3_a_part_full_last_part_is_evicted_by_its_fill`.
+- 봉인된 파트에 쓰기는 모든 빌드에서 PANIC 이다(`s3_header_unlock_part`): 트리·파트·흐름·마지막 체크포인트를 적는다.
+  Assert 뿐이어서 릴리스 빌드는 버킷의 파트와 조용히 어긋났다.
 - 로컬에 없는 파트가 필요한 프로세스는 그 파트를 Loading 으로 표시하고 **직접 받는다**(`s3_header_load_part`). 큐에 넣으면
   앞에 들어온 작업(체크포인트 업로드, WAL 조각 GC 의 삭제)이 워커를 모두 쥔 동안 기다린다. 임계 구역 안, S3 워커, 저장소가
-  파트를 주지 않을 때(`s3_try_get_file_part` 가 false)는 예전처럼 표시한 채 큐에 넣고 워커가 받는다(워커는 실패하면 다시 뜨며
-  재시도한다). 직접 받다 ERROR·FATAL 로 끝나면 표시를 되돌린다(`s3_headers_error_cleanup`, `before_shmem_exit`).
+  파트를 주지 않을 때(`s3_try_get_file_part` 가 200 이 아닌 답)는 예전처럼 표시한 채 큐에 넣고 워커가 받는다. 직접 받다
+  ERROR·FATAL 로 끝나면 표시를 되돌린다(`s3_headers_error_cleanup`, `before_shmem_exit`). 표시는 claim 전에 적어 둔다:
+  claim 과 기록 사이에 죽으면 파트가 영원히 Loading 으로 남았다.
   Guard: `test_s3_part_read_does_not_wait_for_busy_workers`.
+- **버킷에 없는 파트(404)와 저장소가 끝내 거절한 파트(`s3_auth_retry_time` 뒤의 403)는 그 질의의 ERROR** 로, 객체 키를
+  이름한다. 워커에 넘기면 워커가 404 로 죽고 1초 뒤 다시 떠 같은 작업을 영원히 재생하는 동안 백엔드는 아무 메시지 없이
+  파트 상태를 기다렸다. 워커가 받는 claimed 파트(임계 구역, 그 밖의 4xx)를 저장소가 주지 않으면 워커는 파트를 Failed 로
+  표시하고(`s3_header_mark_part_failed`, WARNING) 다음 작업으로 간다; 기다리던 쪽은 Failed 를 보고 ERROR 를 내며 파트를
+  NotLoaded 로 되돌려 다음 읽기가 다시 시도한다. Failed 는 적재 수에서 NotLoaded 와 같다. 이 ERROR 는 `load_page` 가
+  부모의 downlink 를 "I/O 진행 중" 으로 바꾼 뒤의 읽기 안에서 나므로, `load_page` 는 읽기 안의 ERROR(취소된 대기도)에
+  downlink 를 되돌린다: 되돌리지 않으면 그 페이지의 모든 뒤 읽기가 아무도 하지 않는 I/O 를 영원히 기다렸다.
+  Guards: `test_s3_a_part_missing_from_the_bucket_is_an_error`, `test_s3_a_part_the_store_refuses_is_an_error`,
+  `test_s3_a_part_refused_past_the_retry_time_is_an_error`.
 - 다른 프로세스가 받는 중인 파트는 **그 파트의 상태**를 기다린다(`s3_header_wait_part_settled`, `partSettledCV`). 큐에
   작업을 넣으면 S3 워커 하나를 깨운다(`insertLocationCV`). 워커는 일이 없으면 `bgwriter_delay` 까지 잔다.
   Guards: `test_s3_part_read_does_not_wait_for_a_worker_poll`, `test_s3_part_read_waits_for_its_part_only`.
@@ -156,11 +179,19 @@ shipper). 한 버킷에 writer 하나와 reader 여럿이 붙는다. writer 는 
   비었을 때만 그것을 집으며, 동시에 워커 수 − 1 까지만 백그라운드 작업을 돈다. 한 큐였을 때는 시작 직후 이전 실행의 조각
   삭제가 워커를 모두 쥐어, 그 뒤의 업로드·map·힌트가 기다렸다. 백그라운드 작업의 위치는 아무도 기다리지 않는다.
   Guard: `test_s3_chunk_deletes_leave_a_worker`.
+- S3 워커의 큐는 고리 버퍼다. 지우는 쪽은 자리를 0 으로 만든 뒤 `erasedLocation` 을 그 너머로 올린다: 꽉 찬 고리에
+  막힌 생산자가 위치가 넘어가는 즉시 그 자리에 새 작업을 쓰므로, 뒤에 쓴 0 이 새 작업의 길이를 지워 길이 0 작업이 머리에
+  남아 갈래가 멈췄다. 표시된 길이 단어를 0 으로 바꾸는 CAS 가 claim 이기도 해, 머리에서 만난 두 지우는 쪽 가운데 하나만
+  위치를 올린다. 워커는 작업을 집기 전에 그 위치를 `workers_locations[]` 에 적고(집기에 실패하면 지움), 다시 뜬 워커는
+  적힌 위치가 아직 집혔고 지워지지 않은 작업일 때만 재생한다(`s3_queue_task_is_live`).
+  Guard(스트레스, 결정적 재현은 아님): `test_s3_queue_wraps_around_under_read_ahead`.
 - 한 트리의 가까운 파트(두 파트 안)를 연달아 놓치면 그 뒤 16개 파트를 힌트로 넣는다: 파일을 차례로 읽을 때 파일 시스템이
   미리 읽듯, 트리가 아니라 파트 번호로 따라간다(`s3_header_note_miss`). 세 번째 실패부터 시작하고, 반복자가 다음 leaf 로
   넘어가는 중(범위 스캔)이면 첫 실패부터 시작한다(`s3_headers_range_step`). 트리는 파트를 두 흐름(체크포인트 짝·홀)으로 써
   실패가 두 줄을 오가므로 두 줄을 따라간다. 힌트가 버킷에 없는 파트(트리 끝 너머)를 가리키면 워커는 돌려놓고 넘어간다
-  (`s3_try_get_file_part`).
+  (`s3_try_get_file_part`). 힌트는 최선 노력이라 403 재시도 창에 들어가지 않는다: 거절도 없는 파트로 읽고 돌려놓는다.
+  끝 너머 파트에 403 을 답하는 저장소에서 워커 셋이 모두 아무도 기다리지 않는 힌트로 `s3_auth_retry_time` 동안 묶여
+  체크포인트의 업로드가 그 뒤에서 기다렸다. Guard: `test_s3_hints_past_the_tree_do_not_wait_for_a_refused_key`.
 - 내부 페이지를 버킷에서 올릴 때 자식을 모두 힌트로 넣는 것(`load_page`)은 스캔 중(범위 스캔의 다음 leaf, 순차 스캔의 내부
   페이지)에만 한다. 조회 하나가 거쳐 가는 내부 페이지마다 자식 파트를 다 받아, 재시작 뒤 조회 20번이 파트 96개를 받았다.
   실패를 이을 거리도 처음엔 8 파트였는데, 키 순서로 몇 파트씩 떨어진 조회가 이어진 실패로 보여 조회마다 16개를 미리 받았다.
@@ -661,10 +692,12 @@ writer 를 바꾸는 길은 둘이다.
 
 | 상황 | 처리 |
 | --- | --- |
-| curl 오류, 5xx, 429 | 서버 프로세스는 끝없이 재시도: 100 ms 부터 두 배, 상한 60초, 503·429 는 1초부터. 10회마다 WARNING. 5초 조각으로 기다리며 인터럽트, 설정 다시 읽기, 대기 hook(shipper 의 keepalive)을 처리. postmaster 는 재시도하지 않는다(설정 오류일 수 있다) |
-| 403 | 첫 거절부터 `orioledb.s3_auth_retry_time`(기본 300초) 동안 재시도. 그 뒤(0 이면 바로) 거절이 답이다. 그 답으로 죽은 S3 워커는 곧 다시 떠 남은 작업을 이어 하는데, 그 전에 1초 쉰다: 계속 거절되는 키로 초당 수십 번 재시작하며 저장소를 두드리지 않는다. Guard: `test_s3_keys_rotate_on_a_reload`, `test_s3_a_refused_key_fails_with_no_retry_time` |
-| 400 `BadDigest`, `IncompleteBody` | 본문이 오는 길에 잘린 것: 다시 보낸다 |
+| curl 오류, 5xx, 429 | 서버 프로세스는 끝없이 재시도: 100 ms 부터 두 배, 상한 60초, 503·429 는 1초부터. 10회마다 WARNING. 5초 조각으로 기다리며 인터럽트, 설정 다시 읽기, 대기 hook(shipper 의 keepalive)을 처리. postmaster 는 재시도하지 않는다(설정 오류일 수 있다). 60초 동안 진행이 없는 전송은 포기하고(`CURLOPT_LOW_SPEED_TIME`, curl 오류 28) 같은 길로 재시도한다: 연결을 받고 답하지 않는 저장소가 요청을 영원히 쥐었다. TCP keepalive 를 켠다. Guard: `test_s3_a_stalled_get_is_given_up_and_retried` |
+| 403 | 첫 거절부터 `orioledb.s3_auth_retry_time`(기본 300초) 동안 재시도. 그 뒤(0 이면 바로) 거절이 답이다. 그 답으로 죽은 S3 워커는 곧 다시 떠 남은 작업을 이어 하는데, 그 전에 1초 쉰다: 계속 거절되는 키로 초당 수십 번 재시작하며 저장소를 두드리지 않는다. 미리 읽기 힌트는 재시도하지 않는다. Guard: `test_s3_keys_rotate_on_a_reload`, `test_s3_a_refused_key_fails_with_no_retry_time` |
+| 400 `BadDigest`, `IncompleteBody`, `RequestTimeout` | 본문이 오는 길에 잘리거나 때맞춰 닿지 않은 것: 다시 보낸다. Guard: `test_s3_a_request_timeout_is_retried` |
+| 파트의 404, 403(재시도 창 뒤) | 그 파트를 기다리는 질의의 ERROR(`part N of tree D/R is not in the S3 bucket`, 객체 키를 DETAIL 에). 워커가 받던 파트면 Failed 로 표시해 기다리는 쪽이 ERROR 를 낸다(*Address space and allocation*) |
 | 그 밖의 4xx, 필요한 객체의 404 | 부른 프로세스의 FATAL(`could not put object to S3`, `could not get object from S3`) |
+| 256 MB 넘는 GET 본문 | ERROR(`too large to read into memory`). 메모리에 받는 GET 의 상한이다(`S3_MAX_BUFFERED_GET`); 서버가 통째로 읽는 객체는 모두 그보다 훨씬 작다. 펜싱된 PUT 의 내용 비교(`s3_object_holds`, 세그먼트 1 GB 까지)는 받으면서 비교하고 본문을 쥐지 않는다. Guard: `test_s3_a_large_object_is_not_read_into_memory` |
 | `root`·`writer` 의 PUT, `gc`·`readers` 의 GET, `readers` 의 PUT | 재시도 없는 한 번짜리(`s3_request_once`, 10초 상한). 판정은 모호한 결과 규칙과 호출자 각자의 재시도가 한다 |
 | 펜싱된 PUT(파트, 세그먼트, history, 정지 때 WAL) | `If-None-Match` + 토큰 헤더. 412·409 면 HEAD 로 저자 토큰을 읽어: 더 크면 리스 상실, 같은 바이트면 끝, 더 작거나 같은 토큰의 다른 바이트면 HEAD 가 본 ETag 로 `If-Match` PUT(412·404 면 처음부터 다시: 그사이 더 큰 토큰이 쓴 것을 지우지 않고 다음 바퀴가 그 토큰을 보고 멈춘다. Guard: `test_s3_fenced_put_leaves_a_newer_writers_object`), 토큰 없는 다른 바이트면 FATAL. `s3_put_object_fenced_until` 은 `s3_lease_hold()` 의 기한까지만 보내고(요청 시간도 그 기한으로 자름) 넘으면 0 을 돌려주어 호출자가 리스를 갱신하고 다시 한다 |
 | 보통 PUT(map, 죽은 목록, 매니페스트, PG 파일, undo, 트리 상태, `roots/<T>-<K>`) | 키에 저자 토큰이나 체크포인트 번호가 들어가 다른 writer 와 겹치지 않는다. 같은 writer 가 다시 쓰는 일은 정당하다(재구축의 map 을 체크포인트가 다시 씀) |
@@ -728,8 +761,9 @@ Guard: `test_s3_terminator_goes_after_the_last_chunk_path_style`, `test_s3_http_
 
 `orioledb.s3_accesskey`·`orioledb.s3_secretkey` 는 `PGC_SIGHUP` 이다. 리스·GC·S3 워커와 shipper 는 루프를 돌 때마다,
 모든 서버 프로세스(체크포인터 포함)는 거절된 요청의 재시도를 기다리는 동안 설정을 다시 읽는다(`s3_take_config_reload`).
-클라이언트 백엔드는 명령 사이에 읽는다. reader 의 `restore_command`(loader `--restore`)는 세그먼트마다 설정 파일에서 키를
-읽는다. 절차는:
+클라이언트 백엔드도 그렇다: 명령 사이에만 읽을 때는 파트를 직접 받다 거절된 백엔드가 회수된 키로 재시도 창을 다 기다렸다
+(Guard: `test_s3_a_backend_takes_rotated_keys_while_it_is_refused`). reader 의 `restore_command`(loader `--restore`)는
+세그먼트마다 설정 파일에서 키를 읽는다. 절차는:
 
 1. IAM 에 새 키를 더한다.
 2. 두 GUC 를 바꾸고 `SELECT pg_reload_conf()`.
@@ -869,6 +903,10 @@ RustFS, 같은 Docker 호스트, 릴리스 빌드. 100만 행 표에 8연결 무
   답을 로컬 시계로 대신함(writer 는 FATAL), 무효화된 슬롯에서 shipper 가 1초마다 다시 뜨며 동기 커밋이 멈춤(인스턴스 정지),
   늦는 목록이 종결 객체를 빈틈에 두게 함(둔 뒤 다시 나열), 갱신과 커밋이 LWLock 을 쥔 채 저장소를 기다려
   `orioledb_s3_status()` 와 epoch 조회가 서던 것(`requestLock`).
+- 2026-10-13 데이터 경로 검토(요청 계층·헤더·큐·축출): 버킷에 없는 파트가 질의를 영원히 멈추던 것(워커가 404 로 죽고
+  재생), 진행 없는 전송의 시간 제한, `RequestTimeout` 재시도, 거절 대기 중 백엔드의 설정 다시 읽기, 고리 버퍼 지우기의
+  순서(claim 뒤 0 이 새 작업을 지움)와 집기·claim 전에 기록, 봉인된 파트 재기록을 PANIC 으로, 축출 바퀴의 헤더 세 번
+  읽기와 `stat()` 캐시, 마지막 파트 뽑기의 부호 결함, 1 GB GET 의 StringInfo, 죽은 `S3TaskTypeWriteRootFile`, 403 힌트.
 
 ## Not done and open questions
 

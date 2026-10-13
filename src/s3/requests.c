@@ -200,7 +200,58 @@ typedef struct
 	char	   *etag;
 	char	   *date;
 	char	   *metaToken;
+	long		status;			/* the last status line's code, 0 before it */
 } S3ResponseHeaders;
+
+/*
+ * A GET is read into memory up to this much.  What a server process reads
+ * whole (control, root, maps, manifests, lists, a part) is far smaller; a WAL
+ * segment, up to 1 GB, is compared with the local bytes as it arrives instead
+ * (s3_object_holds).  Past 1 GB the StringInfo failed inside the curl
+ * callback, where an ERROR cannot safely leave the transfer.
+ */
+#define S3_MAX_BUFFERED_GET	(UINT64CONST(256) * 1024 * 1024)
+
+/*
+ * What a request does with the response body: keeps it, up to the bound, or
+ * compares a 200's body with the bytes given.
+ */
+typedef struct
+{
+	StringInfo	body;
+	S3ResponseHeaders *headers;
+	bool		overflow;		/* the body passed S3_MAX_BUFFERED_GET */
+	Pointer		compareData;	/* when set: compare, do not keep */
+	uint64		compareSize;
+	uint64		received;
+	bool		mismatch;
+} S3ResponseBody;
+
+static size_t
+write_response_body(void *buffer, size_t size, size_t nmemb, void *userp)
+{
+	size_t		segsize = size * nmemb;
+	S3ResponseBody *resp = (S3ResponseBody *) userp;
+
+	if (resp->compareData && resp->headers->status == S3_RESPONSE_OK)
+	{
+		if (!resp->mismatch &&
+			(resp->received + segsize > resp->compareSize ||
+			 memcmp(buffer, resp->compareData + resp->received, segsize) != 0))
+			resp->mismatch = true;
+		resp->received += segsize;
+		return segsize;
+	}
+
+	if ((uint64) resp->body->len + segsize > S3_MAX_BUFFERED_GET)
+	{
+		/* stop the transfer; the caller reports it once curl is done */
+		resp->overflow = true;
+		return 0;
+	}
+	appendBinaryStringInfo(resp->body, (const char *) buffer, segsize);
+	return segsize;
+}
 
 static char *
 header_value(char *buffer, size_t len, size_t namelen)
@@ -221,7 +272,14 @@ read_response_headers(char *buffer, size_t size, size_t nitems, void *userp)
 	size_t		len = size * nitems;
 	S3ResponseHeaders *headers = (S3ResponseHeaders *) userp;
 
-	if (len > 5 && pg_strncasecmp(buffer, "etag:", 5) == 0)
+	if (len > 5 && pg_strncasecmp(buffer, "HTTP/", 5) == 0)
+	{
+		char	   *space = memchr(buffer, ' ', len);
+
+		if (space && space + 1 < buffer + len)
+			headers->status = strtol(space + 1, NULL, 10);
+	}
+	else if (len > 5 && pg_strncasecmp(buffer, "etag:", 5) == 0)
 	{
 		if (headers->etag)
 			pfree(headers->etag);
@@ -285,11 +343,15 @@ s3_take_config_reload(void)
 }
 
 /*
- * Any other server process waiting to retry (the checkpointer, the archiver)
- * reads the new configuration, so new credentials reach it, but leaves the
- * reload pending: its own loop then does what it does on a reload as well
- * (the checkpointer updates shared memory from it).  Read once per reload.
- * A client backend takes reloads between commands, as always.
+ * A client backend takes a pending reload here as the bgworkers do: new
+ * credentials are what a request refused as unauthorized waits for, and the
+ * backend read them only between commands, so it sat out the whole retry
+ * time with the revoked key (ProcessConfigFile is safe inside a command, as
+ * autovacuum's delay point shows).  Any other server process waiting to retry
+ * (the checkpointer, the archiver) reads the new configuration, so new
+ * credentials reach it, but leaves the reload pending: its own loop then
+ * does what it does on a reload as well (the checkpointer updates shared
+ * memory from it).  Read once per reload.
  */
 static void
 request_wait_reload(void)
@@ -301,7 +363,7 @@ request_wait_reload(void)
 		readPending = false;
 		return;
 	}
-	if (MyBackendType == B_BG_WORKER)
+	if (MyBackendType == B_BG_WORKER || MyBackendType == B_BACKEND)
 		s3_take_config_reload();
 	else if (MyBackendType != B_BACKEND && !readPending)
 	{
@@ -392,20 +454,52 @@ request_deadline_passed(void)
 	return requestDeadline != 0 && GetCurrentTimestamp() >= requestDeadline;
 }
 
-static long
-s3_request(const char *method, char *objectname,
-		   Pointer data, uint64 dataSize, char *dataChecksum,
-		   const char *ifMatch, bool ifNoneMatch, bool retry, long timeout,
-		   StringInfo body, char **etag, char **date, int *curlCode,
-		   const char *metaToken, char **respMetaToken)
+/*
+ * What a request does beyond s3_request()'s arguments.  authRetry: a 403 is
+ * retried for orioledb.s3_auth_retry_time (off for a request nobody waits
+ * for).  compareData: a 200's body is compared with these bytes as it arrives
+ * instead of being kept; same says whether it was them.
+ */
+typedef struct
 {
-	S3ResponseHeaders headers = {NULL, NULL, NULL};
+	bool		authRetry;
+	Pointer		compareData;
+	uint64		compareSize;
+	bool		same;
+} S3RequestOpts;
+
+/*
+ * A transfer that makes no progress for this long is given up
+ * (CURLE_OPERATION_TIMEDOUT) and retried as a transport failure: a store that
+ * accepts a request and never answers, or a connection that died without a
+ * reset, held the request for ever, as nothing bounded a request without a
+ * deadline.  Keepalives tell a dead peer apart sooner.
+ */
+#define S3_LOW_SPEED_TIME	60L
+
+static long
+s3_request_ext(const char *method, char *objectname,
+			   Pointer data, uint64 dataSize, char *dataChecksum,
+			   const char *ifMatch, bool ifNoneMatch, bool retry, long timeout,
+			   StringInfo body, char **etag, char **date, int *curlCode,
+			   const char *metaToken, char **respMetaToken,
+			   S3RequestOpts *opts)
+{
+	S3ResponseHeaders headers = {NULL, NULL, NULL, 0};
+	S3ResponseBody resp = {body, &headers, false, NULL, 0, 0, false};
 	char	   *objectpath = objectname;
 	char	   *checksumstringbuf;
 	long		http_code = 0;
 	int			sc = 0;
 	int			attempt;
 	TimestampTz authSince = 0;
+
+	if (opts)
+	{
+		resp.compareData = opts->compareData;
+		resp.compareSize = opts->compareSize;
+		opts->same = false;
+	}
 
 	if (dataChecksum == NULL)
 	{
@@ -498,6 +592,10 @@ s3_request(const char *method, char *objectname,
 		if (headers.metaToken)
 			pfree(headers.metaToken);
 		headers.etag = headers.date = headers.metaToken = NULL;
+		headers.status = 0;
+		resp.overflow = false;
+		resp.received = 0;
+		resp.mismatch = false;
 
 		curl = request_handle(&slist);
 		if (strcmp(method, "HEAD") == 0)
@@ -513,10 +611,13 @@ s3_request(const char *method, char *objectname,
 			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
 			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, dataSize);
 		}
-		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data_to_buf);
-		curl_easy_setopt(curl, CURLOPT_WRITEDATA, body);
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_response_body);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
 		curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, read_response_headers);
 		curl_easy_setopt(curl, CURLOPT_HEADERDATA, &headers);
+		curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+		curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, S3_LOW_SPEED_TIME);
+		curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
 		if (timeout > 0)
 			curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
 		if (requestDeadline != 0)
@@ -537,6 +638,14 @@ s3_request(const char *method, char *objectname,
 		pfree(datetimestring);
 		pfree(signature);
 
+		if (resp.overflow)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("S3 object \"%s\" is too large to read into memory",
+							objectname),
+					 errdetail("Its body passed %llu MB; a request reads at most that much.",
+							   (unsigned long long) (S3_MAX_BUFFERED_GET / (1024 * 1024)))));
+
 		/*
 		 * At startup (the postmaster) an unreachable store is reported at
 		 * once: it is as likely to be a wrong setting as an outage, and the
@@ -546,8 +655,9 @@ s3_request(const char *method, char *objectname,
 		 * about a minute rather than end the postmaster.
 		 */
 		/*
-		 * A body the store received cut short (BadDigest, IncompleteBody) was
-		 * damaged on the way and refused: send it again.
+		 * A body the store received cut short (BadDigest, IncompleteBody) or
+		 * not in time (RequestTimeout) was lost on the way and refused: send
+		 * it again.
 		 */
 		/*
 		 * Refused as unauthorized: the keys may be being rotated (the new
@@ -567,11 +677,13 @@ s3_request(const char *method, char *objectname,
 			request_deadline_passed() ||
 			!(s3_request_is_transient(sc, http_code) ||
 			  (authSince != 0 && s3_auth_retry_time > 0 &&
+			   (opts == NULL || opts->authRetry) &&
 			   !TimestampDifferenceExceeds(authSince, GetCurrentTimestamp(),
 										   s3_auth_retry_time * 1000)) ||
 			  (http_code == 400 && body->data &&
 			   (strstr(body->data, "<Code>BadDigest</Code>") != NULL ||
-				strstr(body->data, "<Code>IncompleteBody</Code>") != NULL))))
+				strstr(body->data, "<Code>IncompleteBody</Code>") != NULL ||
+				strstr(body->data, "<Code>RequestTimeout</Code>") != NULL))))
 			break;
 
 		if (attempt % 10 == 0)
@@ -600,8 +712,23 @@ s3_request(const char *method, char *objectname,
 		*respMetaToken = headers.metaToken;
 	else if (headers.metaToken)
 		pfree(headers.metaToken);
+	if (opts && opts->compareData)
+		opts->same = sc == 0 && http_code == S3_RESPONSE_OK &&
+			!resp.mismatch && resp.received == resp.compareSize;
 
 	return http_code;
+}
+
+static long
+s3_request(const char *method, char *objectname,
+		   Pointer data, uint64 dataSize, char *dataChecksum,
+		   const char *ifMatch, bool ifNoneMatch, bool retry, long timeout,
+		   StringInfo body, char **etag, char **date, int *curlCode,
+		   const char *metaToken, char **respMetaToken)
+{
+	return s3_request_ext(method, objectname, data, dataSize, dataChecksum,
+						  ifMatch, ifNoneMatch, retry, timeout, body, etag,
+						  date, curlCode, metaToken, respMetaToken, NULL);
 }
 
 /* URI-encode for a query string: everything but the unreserved characters */
@@ -1332,12 +1459,15 @@ s3_object_holds(char *objectname, Pointer data, uint64 dataSize)
 	bool		same;
 	long		code;
 	int			sc;
+	S3RequestOpts opts = {.authRetry = true,.compareData = data,
+	.compareSize = dataSize};
 
+	/* compared as it arrives: a WAL segment does not fit a StringInfo */
 	initStringInfo(&body);
-	code = s3_request("GET", objectname, NULL, 0, NULL, NULL, false, true, 0,
-					  &body, NULL, NULL, &sc, NULL, NULL);
+	code = s3_request_ext("GET", objectname, NULL, 0, NULL, NULL, false, true,
+						  0, &body, NULL, NULL, &sc, NULL, NULL, &opts);
 	if (sc == 0 && code == S3_RESPONSE_OK)
-		same = body.len == dataSize && memcmp(body.data, data, dataSize) == 0;
+		same = opts.same;
 	else if (code == S3_RESPONSE_NOT_FOUND || request_deadline_passed())
 		same = false;
 	else
@@ -1603,44 +1733,29 @@ s3_put_file_part(char *objectname, char *filename, int partnum)
 }
 
 /*
- * Get the file part from S3 object.
+ * Get the file part from S3 object, and answer the HTTP status (0 when no
+ * answer came) instead of ending the process where the store did not give
+ * it: the caller judges a part that is not there (404), one refused for good
+ * (403) and the rest.  Transient failures are retried as for any request.  A
+ * hint (a read ahead nobody waits for) is not retried while the store refuses
+ * the key, as a part a query waits for is.
  */
-void
-s3_get_file_part(char *objectname, char *filename, int partnum)
+long
+s3_try_get_file_part(char *objectname, char *filename, int partnum, bool hint)
 {
 	StringInfoData buf;
-
-	initStringInfo(&buf);
-	s3_get_object(objectname, &buf, false);
-
-	write_file_part(filename,
-					partnum * ORIOLEDB_S3_PART_SIZE + ORIOLEDB_BLCKSZ,
-					buf.data,
-					buf.len);
-
-	pfree(buf.data);
-}
-
-/*
- * Get the file part as s3_get_file_part() does, but answer false where the
- * store did not give it, instead of ending the process: a backend downloading
- * the part it needs leaves the part to the S3 workers then.  Transient
- * failures are retried as for any request.
- */
-bool
-s3_try_get_file_part(char *objectname, char *filename, int partnum)
-{
-	StringInfoData buf;
+	S3RequestOpts opts = {.authRetry = !hint};
 	long		http_code;
 	int			sc;
 
 	initStringInfo(&buf);
-	http_code = s3_request("GET", objectname, NULL, 0, NULL, NULL, false, true,
-						   0, &buf, NULL, NULL, &sc, NULL, NULL);
+	http_code = s3_request_ext("GET", objectname, NULL, 0, NULL, NULL, false,
+							   true, 0, &buf, NULL, NULL, &sc, NULL, NULL,
+							   &opts);
 	if (sc != 0 || http_code != S3_RESPONSE_OK)
 	{
 		pfree(buf.data);
-		return false;
+		return sc != 0 ? 0 : http_code;
 	}
 
 	write_file_part(filename,
@@ -1649,7 +1764,7 @@ s3_try_get_file_part(char *objectname, char *filename, int partnum)
 					buf.len);
 
 	pfree(buf.data);
-	return true;
+	return S3_RESPONSE_OK;
 }
 
 /*

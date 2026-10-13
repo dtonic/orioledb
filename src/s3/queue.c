@@ -72,6 +72,19 @@ static S3TaskQueueLane lanes[2];
 #define FOREGROUND_LANE	(&lanes[0])
 #define BACKGROUND_LANE	(&lanes[1])
 
+/*
+ * The length word of the task at a location.  Lengths are INTALIGN'd and the
+ * buffer's size is a multiple of 1 kB, so the word never straddles the end.
+ * It is read and written atomically: a producer publishes a task with it,
+ * and the eraser that advances the erased location past a task claims the
+ * task by zeroing it (s3_queue_erase_task).
+ */
+static inline pg_atomic_uint32 *
+lane_length_word(S3TaskQueueLane *lane, S3TaskLocation location)
+{
+	return (pg_atomic_uint32 *) (lane->buffer + location % lane->size);
+}
+
 static Size
 background_lane_size(void)
 {
@@ -163,7 +176,7 @@ lane_put_task(S3TaskQueueLane *lane, Pointer data, uint32 len)
 	Pointer		buffer = lane->buffer;
 	Size		size = lane->size;
 
-	Assert(totallen = INTALIGN(totallen));
+	Assert(totallen == INTALIGN(totallen));
 
 	/* Pick the insert location */
 	insertLocation = pg_atomic_fetch_add_u64(&meta->insertLocation, totallen);
@@ -212,7 +225,7 @@ lane_put_task(S3TaskQueueLane *lane, Pointer data, uint32 len)
 	 * presence as the sign that body is completely copied.
 	 */
 	pg_write_barrier();
-	*((uint32 *) (buffer + insertLocation % size)) = totallen;
+	pg_atomic_write_u32(lane_length_word(lane, insertLocation), totallen);
 
 	/*
 	 * Wake a worker sleeping in s3_queue_wait_for_task().  Without it the
@@ -264,7 +277,7 @@ lane_task_ready(S3TaskQueueLane *lane)
 		pickLocation + sizeof(uint32) >= erasedLocation + lane->size)
 		return false;
 
-	taskLen = *((uint32 *) (lane->buffer + pickLocation % lane->size));
+	taskLen = pg_atomic_read_u32(lane_length_word(lane, pickLocation));
 	return taskLen != 0 && !(taskLen & LENGTH_ERASED_FLAG);
 }
 
@@ -294,8 +307,16 @@ s3_queue_wait_for_task(long timeout, uint32 wait_event_info)
 	ConditionVariableCancelSleep();
 }
 
+/*
+ * Pick the lane's next task.  Its location, with laneBits, is written to
+ * *record before the pick takes it: a worker that dies right after the pick
+ * then replays the task (s3worker_main), rather than leaving it picked by
+ * nobody with the erased location stuck behind it.  A location recorded for
+ * a pick that did not take it is cleared again.
+ */
 static S3TaskLocation
-lane_try_pick_task(S3TaskQueueLane *lane)
+lane_try_pick_task(S3TaskQueueLane *lane, S3TaskLocation laneBits,
+				   volatile S3TaskLocation *record)
 {
 	while (true)
 	{
@@ -322,7 +343,7 @@ lane_try_pick_task(S3TaskQueueLane *lane)
 			return InvalidS3TaskLocation;
 		}
 
-		taskLen = *((uint32 *) (lane->buffer + pickLocation % lane->size));
+		taskLen = pg_atomic_read_u32(lane_length_word(lane, pickLocation));
 
 		/*
 		 * Another worker picked, did and erased the task since the pick
@@ -343,12 +364,16 @@ lane_try_pick_task(S3TaskQueueLane *lane)
 		 * Try to advance the pick location.  Whoever succeed on advancing the
 		 * pick location is assumed to successfully pick the task.
 		 */
+		if (record)
+			*record = pickLocation | laneBits;
 		if (pg_atomic_compare_exchange_u64(&lane->meta->pickLocation,
 										   &pickLocation,
 										   pickLocation + taskLen))
 		{
 			return pickLocation;
 		}
+		if (record)
+			*record = InvalidS3TaskLocation;
 	}
 }
 
@@ -358,13 +383,13 @@ lane_try_pick_task(S3TaskQueueLane *lane)
  * background task is taken in a free slot.
  */
 S3TaskLocation
-s3_queue_try_pick_task(void)
+s3_queue_try_pick_task(volatile S3TaskLocation *record)
 {
 	S3TaskLocation location;
 	pg_atomic_uint32 *running = &FOREGROUND_LANE->meta->backgroundRunning;
 	uint32		n;
 
-	location = lane_try_pick_task(FOREGROUND_LANE);
+	location = lane_try_pick_task(FOREGROUND_LANE, 0, record);
 	if (location != InvalidS3TaskLocation)
 		return location;
 
@@ -374,7 +399,8 @@ s3_queue_try_pick_task(void)
 	{
 		if (pg_atomic_compare_exchange_u32(running, &n, n + 1))
 		{
-			location = lane_try_pick_task(BACKGROUND_LANE);
+			location = lane_try_pick_task(BACKGROUND_LANE,
+										  BACKGROUND_LOCATION_BIT, record);
 			if (location != InvalidS3TaskLocation)
 				return location | BACKGROUND_LOCATION_BIT;
 			pg_atomic_fetch_sub_u32(running, 1);
@@ -382,6 +408,25 @@ s3_queue_try_pick_task(void)
 		}
 	}
 	return InvalidS3TaskLocation;
+}
+
+/*
+ * Whether the task at a location is picked and not yet erased: what a worker
+ * restarted on a recorded location replays.  A location the erased location
+ * has passed, or whose task is erased, is done (by this worker before it
+ * died, or by another).
+ */
+bool
+s3_queue_task_is_live(S3TaskLocation taskLocation)
+{
+	S3TaskQueueLane *lane = lane_of(&taskLocation);
+	uint32		taskLen;
+
+	if (taskLocation < pg_atomic_read_u64(&lane->meta->erasedLocation) ||
+		taskLocation >= pg_atomic_read_u64(&lane->meta->pickLocation))
+		return false;
+	taskLen = pg_atomic_read_u32(lane_length_word(lane, taskLocation));
+	return taskLen != 0 && !(taskLen & LENGTH_ERASED_FLAG);
 }
 
 /*
@@ -397,7 +442,7 @@ s3_queue_get_task(S3TaskLocation taskLocation)
 	Size		size = lane->size;
 
 	/* Get the task length */
-	taskLen = *((uint32 *) (buffer + taskLocation % size));
+	taskLen = pg_atomic_read_u32(lane_length_word(lane, taskLocation));
 
 	Assert(taskLen != 0);
 	Assert((taskLen & LENGTH_ERASED_FLAG) == 0);
@@ -446,7 +491,7 @@ s3_queue_erase_task(S3TaskLocation taskLocation)
 	Size		size = lane->size;
 	uint32		taskLen;
 
-	taskLen = *((uint32 *) (buffer + taskLocation % size));
+	taskLen = pg_atomic_read_u32(lane_length_word(lane, taskLocation));
 
 	Assert(taskLen != 0);
 	Assert((taskLen & LENGTH_ERASED_FLAG) == 0);
@@ -480,25 +525,39 @@ s3_queue_erase_task(S3TaskLocation taskLocation)
 	pg_write_barrier();
 
 	/* Put the LENGTH_ERASED_FLAG, which means we have erased the task body */
-	*((uint32 *) (buffer + taskLocation % size)) = taskLen | LENGTH_ERASED_FLAG;
+	pg_atomic_write_u32(lane_length_word(lane, taskLocation),
+						taskLen | LENGTH_ERASED_FLAG);
 
-	/* Try to advance the erased location */
-	while (pg_atomic_compare_exchange_u64(&meta->erasedLocation,
-										  &taskLocation,
-										  taskLocation + taskLen))
+	/*
+	 * Advance the erased location over this task, and over the erased tasks
+	 * after it whose erasers gave up on advancing it (they found it behind
+	 * their task; we take the lead), so somebody advances it past every
+	 * erased task.
+	 *
+	 * The slot is zeroed before the erased location is published past it,
+	 * never after: a producer blocked on the full ring writes its task into
+	 * the slot as soon as the location passes, and a zero written after that
+	 * wiped the new task's length (a length-0 task at the head stalled the
+	 * lane).  Zeroing the flagged length word is also the claim: of two
+	 * erasers at the head of the erased region, the one whose exchange
+	 * zeroes it advances the location; the other leaves it to them.
+	 */
+	while (pg_atomic_read_u64(&meta->erasedLocation) == taskLocation)
 	{
-		*((uint32 *) (buffer + taskLocation % size)) = 0;
+		uint32		flagged = taskLen | LENGTH_ERASED_FLAG;
+		S3TaskLocation erased = taskLocation;
+
+		if (!pg_atomic_compare_exchange_u32(lane_length_word(lane, taskLocation),
+											&flagged, 0))
+			break;				/* another eraser took this task */
+		pg_write_barrier();
+		if (!pg_atomic_compare_exchange_u64(&meta->erasedLocation, &erased,
+											taskLocation + taskLen))
+			elog(PANIC, "S3 task queue: erased location moved from " UINT64_FORMAT " while its task was claimed",
+				 (uint64) taskLocation);
 
 		taskLocation += taskLen;
-
-		/*
-		 * Try to also advance erased location for the next task if
-		 * appropriate.  It might happened that the next task is already
-		 * erased but its process gave up on advancing the erased location. In
-		 * this case we take a lead.  This algorithm guaranteed that somebody
-		 * will advance the erased location anyway.
-		 */
-		taskLen = *((uint32 *) (buffer + taskLocation % size));
+		taskLen = pg_atomic_read_u32(lane_length_word(lane, taskLocation));
 		if (!(taskLen & LENGTH_ERASED_FLAG))
 			break;
 		taskLen &= ~LENGTH_ERASED_FLAG;

@@ -22,6 +22,7 @@
 #include "btree/io.h"
 #include "checkpoint/checkpoint.h"
 #include "s3/headers.h"
+#include "s3/requests.h"
 #include "s3/worker.h"
 
 #include "catalog/pg_tablespace.h"
@@ -31,6 +32,8 @@
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
 #include "storage/condition_variable.h"
+#include "utils/hsearch.h"
+#include "utils/memutils.h"
 #include "utils/timestamp.h"
 
 #define S3_HEADER_BUFFERS_PER_GROUP 4
@@ -159,6 +162,9 @@ static bool rangeStep = false;
 
 static void initial_parts_conting(void);
 static void sync_buffer(S3HeaderBuffer *buffer);
+
+/* header buffers this process loaded from their files (change_buffer) */
+static uint64 headerLoads = 0;
 
 Size
 s3_headers_shmem_needs(void)
@@ -314,6 +320,7 @@ change_buffer(S3HeadersBuffersGroup *group, int index, S3HeaderTag tag)
 	int			i;
 
 	buffer = &group->buffers[index];
+	headerLoads++;
 
 	prevTag = buffer->tag;
 	prevChangeCount = buffer->changeCount;
@@ -653,26 +660,72 @@ s3_header_release_part_load(S3HeaderTag tag, int index)
  * after a start (SNB SF1, local data evicted).  Inside a critical section, in
  * an S3 worker, or when the store does not give the part, the S3 workers
  * download it, and the caller waits for its status.
+ *
+ * A part the bucket does not hold (404), or one the store refuses for good
+ * (403 past orioledb.s3_auth_retry_time), is the query's error, naming the
+ * object: handed to the workers, it was replayed for ever by a worker dying
+ * on it, a restart a second, while the query waited for the part's status
+ * with no message.
  */
 static void
 s3_header_load_part(S3HeaderTag tag, int index)
 {
-	if (CritSectionCount == 0 && !s3_worker_process &&
-		s3_header_mark_part_loading(tag, index) == S3PartStatusNotLoaded)
+	if (CritSectionCount == 0 && !s3_worker_process)
 	{
-		bool		loaded;
+		uint32		value = s3_header_read_value(tag, index);
 
+		if (S3_PART_GET_STATUS(value) == S3PartStatusEvicting)
+			value = s3_header_wait_part_settled(tag, index, true);
+
+		/*
+		 * The part is recorded as this process's download before it is
+		 * claimed, so a claim it does not live to see through is given back
+		 * (s3_headers_error_cleanup releases a recorded part that is
+		 * Loading); recorded after the claim, a death in between left the
+		 * part Loading for good.
+		 */
 		curLoadingTag = tag;
 		curLoadingIndex = index;
-		loaded = s3_load_file_part_here(tag.key, tag.segNum, index);
+		while (S3_PART_GET_STATUS(value) == S3PartStatusNotLoaded ||
+			   S3_PART_GET_STATUS(value) == S3PartStatusFailed)
+		{
+			uint32		newValue = S3_PART_SET_STATUS(value, S3PartStatusLoading);
+
+			if (s3_header_compare_and_swap(tag, index, &value, newValue))
+			{
+				int64		part = (int64) tag.segNum * S3_PARTS_PER_SEGMENT + index;
+				long		code;
+
+				pg_atomic_fetch_add_u64(&meta->numberOfLoadedParts, 1);
+				code = s3_load_file_part_here(tag.key, tag.segNum, index);
+				if (code == S3_RESPONSE_OK)
+					s3_header_mark_part_loaded(tag, index);
+				else
+					s3_header_release_part_load(tag, index);
+				curLoadingTag.key.oids.datoid = InvalidOid;
+				curLoadingTag.key.oids.relnode = InvalidOid;
+				if (code == S3_RESPONSE_OK)
+					return;
+				if (code == S3_RESPONSE_NOT_FOUND)
+					ereport(ERROR,
+							(errcode(ERRCODE_CONNECTION_EXCEPTION),
+							 errmsg("part " INT64_FORMAT " of tree %u/%u is not in the S3 bucket",
+									part, tag.key.oids.datoid, tag.key.oids.relnode),
+							 errdetail("Object \"%s\" does not exist.",
+									   s3_part_object_name(tag.key, part))));
+				if (code == 403)
+					ereport(ERROR,
+							(errcode(ERRCODE_CONNECTION_EXCEPTION),
+							 errmsg("the S3 store refused part " INT64_FORMAT " of tree %u/%u",
+									part, tag.key.oids.datoid, tag.key.oids.relnode),
+							 errdetail("Object \"%s\", http code 403, past orioledb.s3_auth_retry_time.",
+									   s3_part_object_name(tag.key, part))));
+				/* any other answer: the S3 workers' turn */
+				break;
+			}
+		}
 		curLoadingTag.key.oids.datoid = InvalidOid;
 		curLoadingTag.key.oids.relnode = InvalidOid;
-		if (loaded)
-		{
-			s3_header_mark_part_loaded(tag, index);
-			return;
-		}
-		s3_header_release_part_load(tag, index);
 	}
 	s3_load_file_part(tag.key, tag.segNum, index);
 }
@@ -794,6 +847,25 @@ s3_header_lock_part(S3HeaderTag tag, int index, uint32 *loadId)
 			value = s3_header_wait_part_settled(tag, index, true);
 			continue;
 		}
+		else if (status == S3PartStatusFailed)
+		{
+			int64		part = (int64) tag.segNum * S3_PARTS_PER_SEGMENT + index;
+
+			/*
+			 * An S3 worker could not download it (s3_header_mark_part_failed).
+			 * The part goes back to NotLoaded, for the next reader to try the
+			 * store again, and this one reports it.
+			 */
+			newValue = S3_PART_SET_STATUS(value, S3PartStatusNotLoaded);
+			if (s3_header_compare_and_swap(tag, index, &value, newValue))
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_EXCEPTION),
+						 errmsg("could not read part " INT64_FORMAT " of tree %u/%u from the S3 bucket",
+								part, tag.key.oids.datoid, tag.key.oids.relnode),
+						 errdetail("An S3 worker could not get object \"%s\"; its log says why.",
+								   s3_part_object_name(tag.key, part))));
+			continue;
+		}
 		else
 		{
 			Assert(status == S3PartStatusLoaded);
@@ -834,6 +906,9 @@ s3_header_mark_part_loading(S3HeaderTag tag, int index)
 		S3PartStatus status;
 
 		status = S3_PART_GET_STATUS(value);
+		/* nothing is here after a failed download, as for NotLoaded */
+		if (status == S3PartStatusFailed)
+			status = S3PartStatusNotLoaded;
 
 		if (status == S3PartStatusLoaded ||
 			status == S3PartStatusLoading)
@@ -915,6 +990,37 @@ s3_header_mark_part_loaded(S3HeaderTag tag, int index)
 }
 
 /*
+ * An S3 worker could not download a part it was to load: the bucket does not
+ * hold it, or the store refused it for good.  Marked failed, the part counts
+ * as not loaded, whoever waits for it reports it instead of waiting on
+ * (s3_header_lock_part), and the next reader tries the store again.  Only a
+ * part still Loading is marked: one a waiter already reported was given back.
+ */
+void
+s3_header_mark_part_failed(S3HeaderTag tag, int index)
+{
+	uint32		value;
+
+	value = s3_header_read_value(tag, index);
+
+	while (true)
+	{
+		uint32		newValue;
+
+		if (S3_PART_GET_STATUS(value) != S3PartStatusLoading)
+			return;
+		newValue = S3_PART_SET_STATUS(value, S3PartStatusFailed);
+
+		if (s3_header_compare_and_swap(tag, index, &value, newValue))
+		{
+			pg_atomic_fetch_sub_u64(&meta->numberOfLoadedParts, 1);
+			ConditionVariableBroadcast(&meta->partSettledCV);
+			return;
+		}
+	}
+}
+
+/*
  * Release the lock taken by s3_header_lock_part().  A write (setDirty) also
  * records the stream it belongs to: a part is written by one stream only,
  * and the mark is what a seal looks for, so writing it at every write keeps
@@ -933,7 +1039,17 @@ s3_header_unlock_part(S3HeaderTag tag, int index, bool setDirty, int stream)
 
 		Assert(S3_PART_GET_STATUS(value) == S3PartStatusLoaded);
 		Assert(S3_PART_GET_LOCKS_NUM(value) >= 0);
-		Assert(!setDirty || !(value & S3_PART_SEALED_FLAG));
+
+		/*
+		 * A sealed part is uploaded as it is and never changes: a write to
+		 * one would be lost to every load from the bucket, silently.  Stop
+		 * here, in every build.
+		 */
+		if (setDirty && (value & S3_PART_SEALED_FLAG))
+			elog(PANIC, "part " INT64_FORMAT " of tree %u/%u (segment %d, part %d) was written by stream %d after it was sealed, last checkpoint %u",
+				 (int64) tag.segNum * S3_PARTS_PER_SEGMENT + index,
+				 tag.key.oids.datoid, tag.key.oids.relnode, tag.segNum, index,
+				 stream, checkpoint_state->lastCheckpointNumber);
 
 		newValue -= S3_PART_LOCKS_ONE;
 		if (setDirty && !(value & S3_PART_LOCAL_FLAG))
@@ -995,7 +1111,7 @@ s3_header_open_part(S3HeaderTag tag, int index, int stream, bool localOnly)
 			bool		wasUnsealed = (value & S3_PART_DIRTY_FLAG) &&
 				!(value & (S3_PART_SEALED_FLAG | S3_PART_LOCAL_FLAG));
 
-			if (status == S3PartStatusNotLoaded)
+			if (status == S3PartStatusNotLoaded || status == S3PartStatusFailed)
 				pg_atomic_fetch_add_u64(&meta->numberOfLoadedParts, 1);
 			if (!localOnly && !wasUnsealed)
 				pg_atomic_fetch_add_u64(&meta->numberOfUnsealedParts, 1);
@@ -1412,6 +1528,7 @@ initial_parts_counting_callback(S3HeaderTag tag)
 		if (status == S3PartStatusNotLoaded ||
 			status == S3PartStatusLoading ||
 			status == S3PartStatusEvicting ||
+			status == S3PartStatusFailed ||
 			(values[i] & S3_PART_LOCAL_FLAG))
 		{
 
@@ -1548,15 +1665,114 @@ s3_headers_in_range_step(void)
 
 static uint64 occupiedBytes;
 
+/*
+ * Each file's size on disk, kept between cycles: a stat() of every file every
+ * cycle, with thousands of small trees, was most of a cycle that evicted
+ * nothing.  A file is measured again every S3_OCCUPIED_REFRESH_CYCLES cycles
+ * (downloads by other processes grow it meanwhile), and what a cycle evicts
+ * from a file comes off its entry at once.  Entries of files gone are dropped
+ * at the refresh.
+ */
+#define S3_OCCUPIED_REFRESH_CYCLES 16
+
+typedef struct
+{
+	Oid			datoid;
+	Oid			relnode;
+	Oid			spcoid;
+	int			segNum;
+} OccupiedKey;
+
+typedef struct
+{
+	OccupiedKey key;
+	uint64		blocks;			/* st_blocks */
+	uint64		measuredCycle;
+	uint64		seenCycle;
+} OccupiedEntry;
+
+static HTAB *occupiedSizes = NULL;
+static uint64 evictionCycle = 0;
+
+/* what one cycle did, for its DEBUG1 line */
+static uint32 filesMeasured;
+static uint32 partsEvicted;
+
+static OccupiedEntry *
+occupied_entry(S3HeaderTag tag, HASHACTION action, bool *found)
+{
+	OccupiedKey key;
+
+	if (occupiedSizes == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(OccupiedKey);
+		ctl.entrysize = sizeof(OccupiedEntry);
+		ctl.hcxt = TopMemoryContext;
+		occupiedSizes = hash_create("S3 file sizes", 1024, &ctl,
+									HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	memset(&key, 0, sizeof(key));
+	key.datoid = tag.key.oids.datoid;
+	key.relnode = tag.key.oids.relnode;
+	key.spcoid = tag.key.oids.spcoid;
+	key.segNum = tag.segNum;
+	return hash_search(occupiedSizes, &key, action, found);
+}
+
 static void
 occupied_callback(S3HeaderTag tag)
 {
-	char	   *filename = btree_filename(tag.key, tag.segNum, 0);
-	struct stat st;
+	bool		found;
+	OccupiedEntry *entry = occupied_entry(tag, HASH_ENTER, &found);
 
-	if (stat(filename, &st) == 0)
-		occupiedBytes += (uint64) st.st_blocks * 512;
-	pfree(filename);
+	if (!found ||
+		evictionCycle - entry->measuredCycle >= S3_OCCUPIED_REFRESH_CYCLES)
+	{
+		char	   *filename = btree_filename(tag.key, tag.segNum, 0);
+		struct stat st;
+
+		entry->blocks = stat(filename, &st) == 0 ? (uint64) st.st_blocks : 0;
+		entry->measuredCycle = evictionCycle;
+		filesMeasured++;
+		pfree(filename);
+	}
+	entry->seenCycle = evictionCycle;
+	occupiedBytes += entry->blocks * 512;
+}
+
+/* the bytes a cycle punched out of a file come off its entry */
+static void
+occupied_evicted(S3HeaderTag tag, uint64 bytes)
+{
+	bool		found;
+	OccupiedEntry *entry = occupied_entry(tag, HASH_FIND, &found);
+
+	if (found)
+		entry->blocks -= Min(entry->blocks, bytes / 512);
+}
+
+static void
+measure_occupied(void)
+{
+	occupiedBytes = 0;
+	filesMeasured = 0;
+	iterate_files(occupied_callback);
+
+	if (evictionCycle % S3_OCCUPIED_REFRESH_CYCLES == 0)
+	{
+		HASH_SEQ_STATUS seq;
+		OccupiedEntry *entry;
+
+		hash_seq_init(&seq, occupiedSizes);
+		while ((entry = hash_seq_search(&seq)) != NULL)
+		{
+			if (entry->seenCycle != evictionCycle)
+				(void) hash_search(occupiedSizes, &entry->key, HASH_REMOVE,
+								   NULL);
+		}
+	}
 }
 
 static void
@@ -1565,6 +1781,35 @@ eviction_done_at(S3HeaderTag tag)
 	evictionHand = tag;
 	evictionHandValid = true;
 	evictionPhase = EvictionDone;
+}
+
+/*
+ * What the first cold pass finds for the passes after it, so they read only
+ * the headers that hold something for them: the files with a part the next
+ * cold pass may evict, and whether any part is left for the clock sweep
+ * (one evictable but for its usage count).  Every pass over every file
+ * reloaded every header into the small header cache: three times a cycle,
+ * once a second, for a cycle that evicted nothing.
+ */
+static S3HeaderTag *coldNextFiles = NULL;
+static int	coldNextCount = 0;
+static int	coldNextCapacity = 0;
+static uint64 clockCandidates = 0;
+
+static void
+cold_next_file(S3HeaderTag tag)
+{
+	if (coldNextCount == coldNextCapacity)
+	{
+		coldNextCapacity = Max(coldNextCapacity * 2, 1024);
+		if (coldNextFiles == NULL)
+			coldNextFiles = MemoryContextAlloc(TopMemoryContext,
+											   sizeof(S3HeaderTag) * coldNextCapacity);
+		else
+			coldNextFiles = repalloc(coldNextFiles,
+									 sizeof(S3HeaderTag) * coldNextCapacity);
+	}
+	coldNextFiles[coldNextCount++] = tag;
 }
 
 static void
@@ -1576,6 +1821,7 @@ eviction_callback(S3HeaderTag tag)
 				dataSize;
 	int			i;
 	int			numParts;
+	bool		coldNext = false;
 
 	if (evictionPhase == EvictionSeekingHand)
 	{
@@ -1640,10 +1886,22 @@ eviction_callback(S3HeaderTag tag)
 			break;
 		}
 
+		/*
+		 * A file's last, part-full part is evicted with the probability of
+		 * its fill: an emptier one frees less for the GET it costs later.
+		 * The cycle's first pass draws for the cycle: a tail the draw passes
+		 * over is not read, so the later passes cannot know of it, and
+		 * reading it would cost what the draw saves (a tree of one small
+		 * part is one such file).  Every pass drew again before; the draw
+		 * was a signed int32 compared with the fill as unsigned, so a
+		 * negative draw, half of them, counted as above any fill and the
+		 * part was skipped whatever it held.
+		 */
 		if (i == numParts - 1 && dataSize < (uint64) numParts * (uint64) ORIOLEDB_S3_PART_SIZE)
 		{
 			static pg_prng_state random_state;
 			static bool seed_initialized = false;
+			uint64		filled = dataSize - (uint64) (numParts - 1) * (uint64) ORIOLEDB_S3_PART_SIZE;
 
 			if (!seed_initialized)
 			{
@@ -1651,11 +1909,9 @@ eviction_callback(S3HeaderTag tag)
 				seed_initialized = true;
 			}
 
-			if (pg_prng_int32(&random_state) % ORIOLEDB_S3_PART_SIZE >
-				dataSize - (uint64) (numParts - 1) * (uint64) ORIOLEDB_S3_PART_SIZE)
-			{
+			if (pg_prng_uint64_range(&random_state, 0,
+									 ORIOLEDB_S3_PART_SIZE - 1) > filled)
 				continue;
-			}
 		}
 
 		value = s3_header_read_value(tag, i);
@@ -1664,17 +1920,26 @@ eviction_callback(S3HeaderTag tag)
 		{
 			uint32		newValue = value,
 						usageCount = S3_PART_GET_USAGE_COUNT(value);
+			bool		evictable;
 
-			if (S3_PART_GET_STATUS(value) == S3PartStatusLoaded &&
+			evictable = S3_PART_GET_STATUS(value) == S3PartStatusLoaded &&
 				S3_PART_GET_LOCKS_NUM(value) == 0 &&
-				usageCount <= (uint32) Max(evictionColdLimit, 0) &&
-				(value & (S3_PART_DIRTY_FLAG | S3_PART_WRITING_FLAG | S3_PART_LOCAL_FLAG)) == 0)
+				(value & (S3_PART_DIRTY_FLAG | S3_PART_WRITING_FLAG | S3_PART_LOCAL_FLAG)) == 0;
+
+			if (evictable && usageCount <= (uint32) Max(evictionColdLimit, 0))
 			{
 				newValue = S3_PART_SET_STATUS(newValue, S3PartStatusEvicting);
 			}
 			else if (evictionColdLimit >= 0)
 			{
 				/* the cold pass leaves the others as they are */
+				if (evictable && evictionColdLimit == 0)
+				{
+					if (usageCount == 1)
+						coldNext = true;
+					else
+						clockCandidates++;
+				}
 				break;
 			}
 			else
@@ -1688,14 +1953,16 @@ eviction_callback(S3HeaderTag tag)
 					S3_PART_GET_STATUS(newValue) == S3PartStatusEvicting)
 				{
 					off_t		offset = (off_t) i * (off_t) ORIOLEDB_S3_PART_SIZE + (off_t) ORIOLEDB_BLCKSZ;
+					uint64		punched = Min(offset + ORIOLEDB_S3_PART_SIZE, fileSize) - offset;
 					uint64		result;
 
 					elog(DEBUG1, "S3 evict %u %u %d %d",
 						 tag.key.oids.datoid, tag.key.oids.relnode,
 						 tag.segNum, i);
-					punch_fd_hole(fd, offset, Min(offset + ORIOLEDB_S3_PART_SIZE, fileSize) - offset, filename);
-					evictionBytes -= Min(evictionBytes,
-										 (uint64) (Min(offset + ORIOLEDB_S3_PART_SIZE, fileSize) - offset));
+					punch_fd_hole(fd, offset, punched, filename);
+					evictionBytes -= Min(evictionBytes, punched);
+					occupied_evicted(tag, punched);
+					partsEvicted++;
 
 					result = pg_atomic_fetch_sub_u64(&meta->numberOfLoadedParts, 1);
 					elog(DEBUG1, "eviction_callback(%llu 1)",
@@ -1708,6 +1975,9 @@ eviction_callback(S3HeaderTag tag)
 		}
 	}
 
+	if (coldNext && evictionColdLimit == 0)
+		cold_next_file(tag);
+
 	close(fd);
 	pfree(filename);
 }
@@ -1718,6 +1988,7 @@ s3_headers_try_eviction_cycle(void)
 	uint64		desiredNumParts = (uint64) s3_desired_size * (uint64) (1024 * 1024) / (uint64) ORIOLEDB_S3_PART_SIZE;
 	uint64		maxUnsealedParts = (uint64) s3_max_unsealed_size * (uint64) (1024 * 1024) / (uint64) ORIOLEDB_S3_PART_SIZE;
 	static TimestampTz lastRequest = 0;
+	uint64		headerLoadsBefore;
 
 	Assert(orioledb_s3_mode);
 
@@ -1764,10 +2035,17 @@ s3_headers_try_eviction_cycle(void)
 		if (!TimestampDifferenceExceeds(lastMeasure, now, 1000))
 			return;
 		lastMeasure = now;
-		occupiedBytes = 0;
-		iterate_files(occupied_callback);
+		evictionCycle++;
+		headerLoadsBefore = headerLoads;
+		partsEvicted = 0;
+		measure_occupied();
 		if (occupiedBytes < desiredBytes)
+		{
+			elog(DEBUG1, "S3 eviction cycle: %u files measured, %llu header loads, %u parts evicted",
+				 filesMeasured, (unsigned long long) (headerLoads - headerLoadsBefore),
+				 partsEvicted);
 			return;
+		}
 		evictionBytes = occupiedBytes;
 		evictionTargetBytes = desiredBytes - desiredBytes / 10;
 	}
@@ -1777,38 +2055,40 @@ s3_headers_try_eviction_cycle(void)
 	 * those counted once (read ahead, or read once).  A part queries keep
 	 * using is swept only when they are not enough: on a slow machine a long
 	 * scan made many sweeps, each halving every count, and took the parts
-	 * queries used.
+	 * queries used.  The first pass notes what the later ones have to look
+	 * at; they skip the rest of the files.
 	 */
-	for (int limit = 0; limit <= 1; limit++)
+	coldNextCount = 0;
+	clockCandidates = 0;
+	evictionColdLimit = 0;
+	evictionPhase = EvictionSweeping;
+	iterate_files(eviction_callback);
+	if (evictionBytes > evictionTargetBytes && coldNextCount > 0)
 	{
-		evictionColdLimit = limit;
+		evictionColdLimit = 1;
 		evictionPhase = EvictionSweeping;
-		iterate_files(eviction_callback);
-		evictionColdLimit = -1;
-		if (evictionBytes <= evictionTargetBytes)
-			break;
+		for (int i = 0; i < coldNextCount && evictionPhase != EvictionDone; i++)
+			eviction_callback(coldNextFiles[i]);
 	}
-	if (evictionBytes <= evictionTargetBytes)
-	{
-		/* this cycle evicted: measure again at the next one */
-		lastMeasure = 0;
-		return;
-	}
+	evictionColdLimit = -1;
 
-	evictionPhase = EvictionSeekingHand;
-	if (evictionHandValid)
+	if (evictionBytes > evictionTargetBytes && clockCandidates > 0)
 	{
-		/* from the hand to the last file */
-		iterate_files(eviction_callback);
-	}
-	if (evictionPhase != EvictionDone)
-	{
-		/*
-		 * From the first file to the hand: the rest of the circle, or all of
-		 * it when the hand's file is gone or there is no hand yet.
-		 */
-		evictionPhase = EvictionWrapped;
-		iterate_files(eviction_callback);
+		evictionPhase = EvictionSeekingHand;
+		if (evictionHandValid)
+		{
+			/* from the hand to the last file */
+			iterate_files(eviction_callback);
+		}
+		if (evictionPhase != EvictionDone)
+		{
+			/*
+			 * From the first file to the hand: the rest of the circle, or
+			 * all of it when the hand's file is gone or there is no hand yet.
+			 */
+			evictionPhase = EvictionWrapped;
+			iterate_files(eviction_callback);
+		}
 	}
 
 	/*
@@ -1818,4 +2098,8 @@ s3_headers_try_eviction_cycle(void)
 	 */
 	if (evictionBytes < occupiedBytes)
 		lastMeasure = 0;
+
+	elog(DEBUG1, "S3 eviction cycle: %u files measured, %llu header loads, %u parts evicted",
+		 filesMeasured, (unsigned long long) (headerLoads - headerLoadsBefore),
+		 partsEvicted);
 }

@@ -1942,9 +1942,28 @@ load_page(OBTreeFindPageContext *context)
 
 	page_desc->flags = 0;
 
-	/* Read page data and put it to the page */
-	read_result = read_page_from_disk(desc, buf, downlink,
-									  &page_desc->fileExtent);
+	/*
+	 * Read page data and put it to the page.  An error raised inside the
+	 * read (in S3 mode a part the bucket does not hold, or a cancelled wait
+	 * for one another process downloads) puts the downlink back as a failed
+	 * read does below: left as an I/O in progress that nobody runs, every
+	 * later reader of the page waited on it for ever.
+	 */
+	PG_TRY();
+	{
+		read_result = read_page_from_disk(desc, buf, downlink,
+										  &page_desc->fileExtent);
+	}
+	PG_CATCH();
+	{
+		/* errfinish zeroed the holdoff count the held lock stands for */
+		HOLD_INTERRUPTS();
+		int_hdr->downlink = downlink;
+		PAGE_INC_N_ONDISK(parent_page);
+		unlock_io(ionum);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	if (read_result != OReadPageResultOk)
 	{
 		int_hdr->downlink = downlink;
