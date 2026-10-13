@@ -299,6 +299,8 @@ class OrioledbS3ObjectLoader:
 		`collected` that the manifest of `collected` does not refer to is
 		named by no retained manifest: it is garbage the GC could not see.
 		Parts are left alone: a writer puts over an uncommitted part number.
+		The dead lists of a tree the GC skipped (`skipped` lines of `gc`: its
+		state could not be read) are left for whoever repairs the state.
 		"""
 		root = self.read_root(self.bucket_name)
 		gc = self.read_object('gc')
@@ -306,8 +308,9 @@ class OrioledbS3ObjectLoader:
 			print("nothing to sweep: no root or no GC progress yet")
 			return
 		self.epochs = root['epochs']
-		fields = dict(
-		    line.split(' ', 1) for line in gc.decode().splitlines() if ' ' in line)
+		lines = [line.split(' ') for line in gc.decode().splitlines() if ' ' in line]
+		fields = dict((l[0], ' '.join(l[1:])) for l in lines)
+		skipped = {(int(l[1]), int(l[2])) for l in lines if l[0] == 'skipped' and len(l) == 3}
 		collected = int(fields.get('collected', 0))
 		folded = int(fields.get('folded', 0))
 		if collected == 0:
@@ -353,7 +356,8 @@ class OrioledbS3ObjectLoader:
 				    m['trees'].get((int(parts[1]), int(parts[2]))) != tc[1]
 			elif parts[0] == 'trees' and len(parts) == 5 and parts[3] == 'dead':
 				tc = tok_chk(parts[4])
-				garbage = tc is not None and tc[1] <= folded
+				garbage = tc is not None and tc[1] <= folded and \
+				    (int(parts[1]), int(parts[2])) not in skipped
 			if garbage:
 				if self.verbose:
 					print(f"sweep {key}", flush=True)
@@ -1281,7 +1285,7 @@ class ReaderPin:
 			kept = []
 			for other in body.splitlines():
 				fields = other.split()
-				if len(fields) == 3 and fields[0] != self.id and \
+				if len(fields) >= 3 and fields[0] != self.id and \
 				    int(fields[2]) >= now:
 					kept.append(other)
 			if line is not None:
@@ -1301,7 +1305,9 @@ class ReaderPin:
 		raise Exception("could not write the loader's pin to the S3 bucket")
 
 	def put(self, chkp):
-		self.edit(lambda now: f"{self.id} {chkp} {now + PIN_TTL}")
+		# the TTL too: the GC passes a pin below its floor only once a
+		# renewal interval (a third of it) has gone by
+		self.edit(lambda now: f"{self.id} {chkp} {now + PIN_TTL} {PIN_TTL}")
 
 	def remove(self):
 		self.edit(None)

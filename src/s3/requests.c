@@ -884,15 +884,43 @@ delete_slot_start(CURLM *multi, DeleteSlot *slot, char *objectname,
 }
 
 /*
- * Delete many objects, DELETE_CONCURRENCY requests at a time.  A request that
- * fails is done again on its own with s3_delete_object(), which retries; an
- * object already gone counts as deleted.  An interrupt stops starting new
- * requests and is served once those in flight are done; when serving it does
- * not end the call, the rest are deleted.
+ * One delete with the usual retries, nothing raised: false when the store's
+ * answer is a refusal (an object already gone counts as deleted).
  */
-void
-s3_delete_objects(char **objectnames, int count)
+static bool
+delete_object_try(char *objectname)
 {
+	StringInfoData buf;
+	long		http_code;
+	int			sc;
+	bool		ok;
+
+	initStringInfo(&buf);
+	http_code = s3_request("DELETE", objectname, NULL, 0, NULL, NULL, false, true, 0,
+						   &buf, NULL, NULL, &sc, NULL, NULL);
+	ok = sc == 0 &&
+		(http_code == 204 || http_code == 200 || http_code == S3_RESPONSE_NOT_FOUND);
+	if (!ok)
+		ereport(LOG,
+				(errmsg("S3 DELETE of \"%s\" refused", objectname),
+				 errdetail("return code = %d, http code = %ld, response = %s",
+						   sc, http_code, buf.data)));
+	pfree(buf.data);
+	return ok;
+}
+
+/*
+ * Delete many objects, DELETE_CONCURRENCY requests at a time.  A request that
+ * fails is done again on its own with the usual retries; an object already
+ * gone counts as deleted.  An interrupt stops starting new requests and is
+ * served once those in flight are done; when serving it does not end the
+ * call, the rest are deleted.  Returns the indexes of the objects the store
+ * refused for good (NIL: every one is gone), for the caller to judge.
+ */
+List *
+s3_delete_objects_try(char **objectnames, int count)
+{
+	List	   *refused = NIL;
 	CURLM	   *multi;
 	DeleteSlot	slots[DELETE_CONCURRENCY];
 	bool		busy[DELETE_CONCURRENCY] = {0};
@@ -905,7 +933,7 @@ s3_delete_objects(char **objectnames, int count)
 	char	   *emptyChecksum;
 
 	if (count == 0)
-		return;
+		return NIL;
 	(void) SHA256((unsigned char *) "", 0, checksumbuf);
 	emptyChecksum = hex_string((Pointer) checksumbuf, sizeof(checksumbuf));
 	multi = curl_multi_init();
@@ -962,15 +990,37 @@ s3_delete_objects(char **objectnames, int count)
 	pfree(emptyChecksum);
 
 	foreach(lc, failed)
-		s3_delete_object(objectnames[lfirst_int(lc)]);
+		if (!delete_object_try(objectnames[lfirst_int(lc)]))
+			refused = lappend_int(refused, lfirst_int(lc));
 	list_free(failed);
 
 	if (stoppedAt >= 0)
 	{
+		List	   *rest;
+
 		CHECK_FOR_INTERRUPTS();
 		/* the interrupt did not end this process: go on */
-		s3_delete_objects(objectnames + stoppedAt, count - stoppedAt);
+		rest = s3_delete_objects_try(objectnames + stoppedAt, count - stoppedAt);
+		foreach(lc, rest)
+			refused = lappend_int(refused, lfirst_int(lc) + stoppedAt);
+		list_free(rest);
 	}
+	return refused;
+}
+
+/*
+ * The same, where a refusal is fatal.
+ */
+void
+s3_delete_objects(char **objectnames, int count)
+{
+	List	   *refused = s3_delete_objects_try(objectnames, count);
+
+	if (refused != NIL)
+		ereport(FATAL, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+						errmsg("could not delete object from S3"),
+						errdetail("object \"%s\"",
+								  objectnames[linitial_int(refused)])));
 }
 
 /*

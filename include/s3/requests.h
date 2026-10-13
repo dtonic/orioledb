@@ -55,6 +55,7 @@ extern bool s3_postmaster_retries;
 extern void s3_take_config_reload(void);
 extern void s3_check_bucket_versioning(void);
 extern void s3_delete_objects(char **objectnames, int count);
+extern List *s3_delete_objects_try(char **objectnames, int count);
 extern List *s3_list_objects(const char *prefix, const char *startAfter);
 
 extern Pointer read_file(const char *filename, uint64 *size);

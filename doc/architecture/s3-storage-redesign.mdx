@@ -64,8 +64,13 @@ shipper). 한 버킷에 writer 하나와 reader 여럿이 붙는다. writer 는 
 - `full_page_writes = on`. 조각과 세그먼트로 복원한 페이지가 찢기지 않는 근거다.
 - 토큰 하나에 writer 프로세스 트리 하나. 같은 데이터 디렉터리의 사본이 같은 토큰으로 함께 돌면 버킷이 두 역사를 갖는데,
   시작 때 리스 대기, 시작마다 두는 종결 객체, 조각마다 하는 리스 확인, 사본 분기 검사가 그 창을 막는다.
-- relnode 는 지워진 트리의 객체가 버킷에 남아 있는 동안 다시 쓰이지 않는다(OID 가 한 바퀴 돌아야 다시 쓰인다). GC 는
-  체크포인트가 그 relnode 를 다시 이름하면 지우지 않지만, 새 트리가 첫 체크포인트 전에 올린 파트는 지킬 수 없다.
+- relnode 는 지워진 트리의 객체가 버킷에 남아 있는 동안 다시 쓰이지 않는다(OID 가 한 바퀴 돌아야 다시 쓰인다). 그래도
+  R 이 지운 트리의 relnode 를 R 뒤의 매니페스트가 다시 이름하면 GC 는 그것을 옛 키 아래의 새 트리로 본다: 지워진 트리의
+  객체는 지우지 않고(LOG "a tree has its relnode again"), 그 트리의 GC 상태(`<rel>.gcstate`, `trees/<db>/<rel>/gc`)는
+  처음부터 다시 시작한다. 옛 트리의 죽은 비트가 새 트리의 파트에 OR 되어 살아 있는 파트를 지우게 하지 않기 위해서다. 새
+  트리가 첫 체크포인트 전에 올린 파트는 여전히 지킬 수 없고, 옛 트리가 남긴 파트·map 은 누수로 남는다. 지워진 트리의 로컬
+  `.dead` 목록도 트리와 함께 지운다: 남겨 두면 relnode 를 다시 가진 트리가 그것을 자기 목록으로 접는다. Guard:
+  `test_s3_gc_resets_the_state_of_a_relnode_named_again`, `test_s3_gc_removes_the_local_lists_of_a_dropped_tree`.
 
 ## Object layout
 
@@ -80,7 +85,7 @@ shipper). 한 버킷에 writer 하나와 reader 여럿이 붙는다. writer 는 
 | `roots/<K>` | K 를 커밋한 `root` 본문 사본 | 체크포인터, `root` CAS 직후. postmaster, 시작의 `root` CAS 직후(새 토큰과 epoch, 같은 K). 보통 PUT | GC, 매니페스트 K 와 함께 |
 | `writer` | 리스: `bucket`, `token`, `attempt`, `owner`, `expires_at`(저장소 시계로 환산한 클라이언트의 추정) | postmaster 가 얻고, 리스 워커가 갱신(체크포인터, S3 워커, shipper 도 남은 시간이 짧으면 갱신), 정상 종료 때 `expires_at 0`. `If-Match`/`If-None-Match` | 없음 |
 | `gc` | `retain`, `folded`, `collected`, `pin_floor`, `pin_warn`, `token` | GC, 한 바퀴에 최대 세 번. 읽은 ETag 로 `If-Match` | 없음 |
-| `readers` | 핀 줄 `<id> <K> <expires_at>` | reader(첫 핀은 postmaster, 갱신은 리스 워커), loader(`loader-<hex>`). 읽은 ETag 로 조건부 교체, 만료된 줄은 그때 버림 | 없음 |
+| `readers` | 핀 줄 `<id> <K> <expires_at> [<ttl>]` | reader(첫 핀은 postmaster, 갱신은 리스 워커), loader(`loader-<hex>`). 읽은 ETag 로 조건부 교체, 만료된 줄은 그때 버림 | 없음 |
 | `manifests/<T>-<K>` | 체크포인트 K 의 매니페스트 | 체크포인터: PG 파일 백업 끝(`s3_manifest_prepare`), 커밋 직전 WAL 위치를 더해 다시(`s3_manifest_publish`). 보통 PUT | GC |
 | `data/<T>-<K>/<path>` | K 에서 바뀐 PG 파일, 작은 파일 묶음 `orioledb_data/small_files_<n>`, `file_checksums`, `small_file_checksums`, `orioledb_data/<K>.xid`, `orioledb_data/<K>.xidrange`, `global/pg_control`, `orioledb_data/control`, 빈 디렉터리(`…/`) | S3 워커. 보통 PUT | GC(R 이 참조하지 않으면) |
 | `orioledb_undo/<file>/<T>-<K>` | K 가 보존하는 undo 파일(`<file>` = `%02X%08X` + `row`/`page`/`system`) | S3 워커, K 의 트리 걷기 뒤. 보통 PUT | GC |
@@ -418,6 +423,11 @@ TRUNCATE 표지는 바로 `.bend` 에 가지 않고, 다음 체크포인트 번�
 죽은 목록을 기록하는 것은 writer 의 영구·unlogged 트리뿐이다. 재구축은 비공개 메타 페이지로 쓰므로 파트 끝을
 `<rel>.bend` 에 모았다가 그 트리를 카탈로그에서 처음 보는 체크포인트가 `.build` 목록으로 올린다. Guard:
 `test_s3_dead_extents_are_recorded`.
+seq buf 파일은 `O_TRUNC` 없이 열고 자르지 않으므로, 크래시한 실행이 같은 번호의 체크포인트에 적은 `.dead` 가 남아 있으면
+다시 하는 실행의 끝 뒤에 그 항목이 남아 파일 전체가 올라갈(`s3_put_file`) 것이다. 그것을 막는 것은 복구 시작의
+`recovery_cleanup_old_files`(`cleanup_tablespace_old_files`): control 의 체크포인트 번호보다 큰 `.tmp`·`.dead` 를 복구 전에
+지운다. 그래서 다시 하는 체크포인트의 목록은 빈 파일에서 시작한다(측정: 크래시 뒤 B 의 `<rel>-<K>.dead` 는 복구가 다시
+옮긴 페이지의 항목만 들었다).
 
 ### Retention
 
@@ -429,10 +439,13 @@ R(보존하는 가장 오래된 체크포인트)은 한 곳(`s3_gc_cycle`)에서
    둘 중 더 많이 남기는 쪽이다. Guard: `test_s3_gc_keeps_checkpoints_by_time`.
 3. `pin_floor = committed − orioledb.s3_gc_max_pin_lag`(기본 1000), `pin_warn = pin_floor + max(1, lag/4)`.
 4. `retain`·`pin_floor`·`pin_warn` 을 `gc` 에 **발표한 뒤** 핀을 읽는다.
-5. `r = min(retain, max(pin_floor, folded, collected) 이상인 만료 안 된 핀의 최솟값, 로컬 순차 스캔이 읽는 map 의
-   체크포인트)`. `folded`·`collected` 아래의 핀은 이미 거둔 것을 가리키므로 아무것도 붙잡지 않는다(그런 핀의 reader 는
-   스스로 멈춘다). `readers` 를 읽지
-   못하면 r = 0 이고 이번 바퀴는 아무것도 하지 않는다.
+5. `r = min(retain, max(folded, collected) 이상인 만료 안 된 핀의 최솟값, 로컬 순차 스캔이 읽는 map 의 체크포인트)`.
+   `folded`·`collected` 아래의 핀은 이미 거둔 것을 가리키므로 아무것도 붙잡지 않는다(그런 핀의 reader 는 스스로 멈춘다).
+   `pin_floor` 아래의 핀은 그 reader 가 `pin_warn` 을 볼 갱신을 한 번 거친 뒤에만 지나간다: 핀의 나이(핀 줄의 TTL − 남은
+   시간; TTL 이 없는 옛 줄은 writer 의 `s3_reader_pin_ttl` 로 본다)가 갱신 간격(TTL 의 3분의 1) 이상일 때다. 그보다 새
+   핀은 floor 가 지나기 전에 갱신한 것이라 reader 가 아직 모르고 그 아래를 읽고 있을 수 있다. Guard:
+   `test_s3_gc_waits_for_a_pins_renewal_before_passing_it`. `readers` 를 읽지 못하면 r = 0 이고 이번 바퀴는 아무것도
+   하지 않는다.
 
 핀을 쓴 쪽은 쓴 뒤에 `gc` 를 읽어 자기 체크포인트가 `retain`·`folded`·`collected` 가운데 어느 것 아래면 시작하지 않는다.
 그래서 어느 쪽이 먼저든 핀의 체크포인트는 지워지지 않는다. GC 는 `retain` 을 이미 접고 거둔 곳(`folded`, `collected`)
@@ -444,24 +457,39 @@ R(보존하는 가장 오래된 체크포인트)은 한 곳(`s3_gc_cycle`)에서
 GC 는 writer 의 bgworker(`orioledb s3 gc`)로 `orioledb.s3_gc_interval`(기본 60초, 0 은 끔)마다 한 바퀴 돈다. 진행은
 `gc` 의 `folded`(죽은 목록을 상태에 접은 체크포인트)와 `collected`(매니페스트와 그것만 가리키던 객체를 지운 체크포인트)다.
 모든 단계는 다시 해도 같고, 진행은 그 단계가 끝난 뒤에만 발표하므로 종료 요청이 오면 그 자리에서 멈춘다. 삭제는 1000개씩
-모았다가 16개 동시 DELETE 로 보내고(`s3_delete_objects`), 지운 것을 기록하기 전(상태 저장, 진행 발표, 매니페스트 삭제)에
-반드시 비운다.
+모았다가 16개 동시 DELETE 로 보내고(`s3_delete_objects_try`), 지운 것을 기록하기 전(상태 저장, 진행 발표, 매니페스트 삭제)에
+반드시 비운다. 비우기 전과 상태를 저장하기 전에 리스가 한동안 더 자기 것인지 확인한다(`s3_lease_hold`, 아니면 인스턴스가
+멈춘다): 핀을 읽은 뒤 얼어 있다가 리스가 넘어간 뒤 깨어난 바퀴가 새 writer 의 reader 가 핀한 파트를 지우지 않기 위해서다.
+Guard: `test_s3_gc_frozen_through_a_takeover_deletes_nothing`. 스토어가 끝내 거절한 DELETE(일시 오류가 아닌 답)는 LOG
+("S3 GC could not delete")로 남기고 그 바퀴에서는 건너뛴다: 파트는 상태에 남아 그 트리를 다음에 접는 바퀴가 다시 지우고,
+나머지는 `--sweep` 의 몫이다. 한 키의 거절이 GC 전체를 멈추지 않는다. Guard:
+`test_s3_gc_goes_on_past_a_delete_the_store_refuses`.
 
 1. **접기**: `folded + 1 … r` 의 매니페스트가 이름한 `dead`·`bdead` 목록을 트리 상태에 접는다(로컬 사본, 없으면 버킷).
    트리 상태는 로컬 `<rel>.gcstate` 와 버킷 `trees/<db>/<rel>/gc` 의 합이다. 같은 extent 가 두 번 적혀도 비트맵이라 한 번이고,
    끝은 `Max` 로 접는다. 매니페스트가 없는 체크포인트(로컬에서 끝났으나 매니페스트를 올리기 전에 멈췄거나 shipper 가 보증하지
    못한 것)는 다음 매니페스트가 아는 트리마다 그 번호의 목록을 찾아 접는다(`fold_unpublished`). Guard:
    `test_s3_gc_folds_the_lists_of_a_checkpoint_with_no_manifest`. 상태나 목록이 읽히지 않거나 파트당 블록 수를 말하지 않는
-   트리는 건너뛰고(LOG "S3 GC skips tree") 그 목록을 남긴다.
+   트리는 건너뛰고(LOG "S3 GC skips tree") 그 목록을 남기며, `gc` 에 `skipped <db> <rel>` 줄로 적는다(한 번 건너뛴 트리는
+   계속 적힌다: 접지 않은 목록을 뒤의 바퀴가 다시 접지 않으므로). 파싱되지 않거나 다른 체크포인트의 것인 매니페스트는 쓰인
+   적 없는 것처럼 지나간다(LOG "S3 GC skips the manifest of checkpoint"): 목록은 `fold_unpublished` 로 접고, 그것만
+   가리키던 객체는 `--sweep` 의 몫이며, 매니페스트 자체는 R 아래의 다른 것들과 함께 간다. ERROR 로 두면 워커가 죽고 다시
+   떠서 같은 객체를 만나 어떤 바퀴도 끝나지 않는다. Guard: `test_s3_gc_goes_on_past_a_damaged_manifest`.
+   트리 상태의 꼴은 magic `SGC4`, 쓴 writer 의 토큰, 파트당 블록 수, 파트 수, 파트마다 번호·끝·`(블록 수 + 7) / 8` 바이트의
+   비트맵이다(8 KiB 블록이면 파트마다 16 바이트). 버킷의 상태는 읽은 ETag 로 조건부 PUT 하고, 더 큰 토큰이 쓴 것이면
+   인스턴스가 멈춘다(`s3_gc_publish` 와 같은 울타리). Guard: `test_s3_gc_state_is_sized_by_the_trees_blocks_per_part`.
 2. **파트**: 끝이 알려졌고 끝 아래 블록이 모두 죽었거나 `PART_GONE` 인 파트를 지운다. 이어서 상태를 저장하고, 접은 목록을
    지우고, `folded = r` 을 발표한다. Guard: `test_s3_gc_removes_dead_parts`.
 3. **나머지**: `R'` 은 r 이하에서 `complete` 인 가장 새 매니페스트다(참조는 앞으로만 움직이므로 더 이른 것도 맞다).
    `collected … R'−1` 의 매니페스트마다 R' 가 참조하지 않는 업로드와 참조(PG 파일, 묶음, undo, map)를 지우고, R' 에 없는
    트리는 지워진 트리로 적는다. 지워진 트리는 `trees/<db>/<rel>/` 를 목록으로 찾아 통째로 지운다: 마지막 map 을 읽지 못해도,
    어느 매니페스트도 이름하지 않는 map·파트(체크포인트 전에 죽은 실행이 올린 것)도 함께 간다. R' 다음부터 커밋된
-   체크포인트까지 어느 매니페스트가 그 relnode 를 다시 이름하면 지우지 않는다(LOG "a tree has its relnode again"). WAL 은
-   R' 의 REDO 세그먼트 앞의 세그먼트와 `.partial`(모든 timeline), 조각(위)을 지운다. 그 뒤 매니페스트와 `roots/<k>` 를
-   지우고, epoch 를 줄이고, `collected = R'` 를 발표한다. Guard: `test_s3_gc_removes_old_checkpoints`,
+   체크포인트까지 어느 매니페스트가 그 relnode 를 다시 이름하면 지우지 않고 그 GC 상태를 처음으로 되돌린다(LOG "a tree has
+   its relnode again", *Facts the design rests on*). 매니페스트가 이름하는 트리 집합은 바퀴를 넘어 캐시한다(매니페스트는
+   바뀌지 않는다; `collected` 아래는 비운다). WAL 은 R' 의 REDO 세그먼트 앞의 세그먼트와 `.partial`(모든 timeline),
+   조각(위)을 지운다. 조각 목록은 timeline 마다 마지막으로 지운 조각 뒤에서(`start-after`) 시작하고, 남긴 첫 조각의 끝이
+   아직 R' 의 REDO 세그먼트 뒤면 목록을 요청하지 않는다(Guard: `test_s3_gc_lists_chunks_from_where_it_stopped`). 그 뒤
+   매니페스트와 `roots/<k>` 를 지우고, epoch 를 줄이고, `collected = R'` 를 발표한다. Guard: `test_s3_gc_removes_old_checkpoints`,
    `test_s3_gc_removes_a_dropped_tree`, `test_s3_gc_removes_every_object_of_a_dropped_tree`.
 4. **버려진 트리**: 두 매니페스트 사이에서 만들고 지운 트리, 롤백된 재구축은 어느 매니페스트에도 없다. 트리를 지우는
    쪽(`btree_relnode_undo_callback`, 보류된 truncate)이 `s3_note_dropped_tree` 로 로컬 `s3_dropped_trees` 에 적는다. 기록마다
@@ -471,9 +499,10 @@ GC 는 writer 의 bgworker(`orioledb s3 gc`)로 `orioledb.s3_gc_interval`(기본
 
 GC 가 지우지 않는 것: `root`, `writer`, `gc`, `readers`, history, 종결 객체와 그 표지. 매니페스트를 쓰기 전에 죽은
 체크포인트의 업로드나 옛 토큰의 map 처럼 어느 매니페스트도 이름하지 않는 것은 `--sweep` 이 지운다: `collected` 아래
-체크포인트의 매니페스트, `collected` 의 매니페스트가 참조하지 않는 `data/`·undo·map, `folded` 이하의 죽은 목록. 파트는
-건드리지 않는다(새 writer 가 커밋되지 않은 파트 번호 위에 펜싱된 PUT 으로 쓴다). `--sweep` 은 수동이다. Guard:
-`test_s3_sweep_removes_what_the_gc_could_not_see`.
+체크포인트의 매니페스트, `collected` 의 매니페스트가 참조하지 않는 `data/`·undo·map, `folded` 이하의 죽은 목록(`gc` 가
+`skipped` 로 적은 트리의 것은 빼고: 상태를 고친 뒤 다시 접을 것이다). 파트는 건드리지 않는다(새 writer 가 커밋되지 않은
+파트 번호 위에 펜싱된 PUT 으로 쓴다). `--sweep` 은 수동이다. Guard: `test_s3_sweep_removes_what_the_gc_could_not_see`,
+`test_s3_sweep_keeps_the_lists_of_a_skipped_tree`.
 
 이어받은 writer 의 GC 는 `gc` 와 버킷의 트리 상태에서 이어 간다(`test_s3_gc_goes_on_after_a_takeover`). 단
 `s3_dropped_trees` 는 데이터 디렉터리에만 있다.
@@ -563,6 +592,7 @@ Guard: `test_s3_terminator_goes_after_the_last_chunk_path_style`, `test_s3_http_
 | 체크포인트 K 의 트리 걷기 중(control 은 K−1) | 새 토큰, epoch 가 K 부터. K 를 새 키로 다시 함. map 에서 올린 트리는 두 흐름 모두 새 파트에서 시작 | 다음 흐름이 쓴 블록의 파트는 봉인되지 않음. 올라간 옛 파트 번호는 새 실행이 펜싱된 PUT 으로 덮음. 옛 토큰의 `maps/`·`dead/` 는 `--sweep`. Guard: `test_s3_gc_removes_parts_written_before_a_crash` |
 | control 은 K, PG 파일 백업 끝 전 | 복구 끝 hook 은 K 의 pending 매니페스트가 없어 커밋하지 않음. 다음 체크포인트가 커밋 | K 의 죽은 목록은 `fold_unpublished` 가 접음. `data/<T>-<K>/` 는 `--sweep`. Guard: `test_s3_crash_while_pg_files_upload` |
 | 작은 파일 체크섬을 바꾼 뒤, 매니페스트 전 | 같음. 다음 매니페스트는 K 의 묶음 수를 `s3_bundles` 쪽지에서, 없으면 버킷의 묶음을 세어 안다 | 매니페스트는 `complete 1`. Guard: `test_s3_bundle_count_survives_a_crash_before_the_manifest` |
+| 체크포인트 K 도중(K 의 죽은 목록을 디스크에 쓴 뒤) | K 를 다시 함. 복구 시작의 `recovery_cleanup_old_files` 가 `<rel>-<K>.dead` 를 지워 처음부터 쓴다 | 크래시한 실행의 항목이 올라가지 않음 |
 | 매니페스트는 올라갔고 `root` 교체 전 | 다음 체크포인트가 커밋 | K 의 매니페스트는 커밋되지 않았어도 R 아래로 가면 GC 가 접고 거둠 |
 | `root` 교체의 답을 잃음 | `root` 를 읽어 토큰·owner·attempt 로 판정 | 없음 |
 | `root` 교체 뒤 `roots/<K>` 전 | 없음 | `--repair-root` 는 그 앞 사본을 쓴다 |
@@ -577,6 +607,7 @@ Guard: `test_s3_terminator_goes_after_the_last_chunk_path_style`, `test_s3_http_
 | unlogged 트리가 있는 상태에서 크래시, 또는 그런 버킷에서 받기 | 복구 뒤 unlogged 트리를 제자리에서 비우고, 빈 map 을 두 번 쓴다: 마지막 체크포인트 번호로 로컬에(이 실행이 그 번호로 트리를 연다), 다음 번호로 올리고 기다린다(커밋된 map 은 그대로 두고, 트리를 바꾸지 않은 다음 체크포인트의 매니페스트가 이것을 이름한다) | 버킷의 map 에서 옛 내용이 되살아나지 않음(로컬 모드와 같이 비어 있음). 옛 파트는 `PART_GONE` 으로 GC. Guard: `s3_unlogged_test` |
 | 제자리 TRUNCATE 뒤 | `s3floor_<rel>` 에서 이어 셈 | 아래 파트는 `PART_GONE` 표지로 GC. Guard: `test_s3_gc_removes_parts_a_truncate_in_place_left` |
 | GC 한 바퀴 도중 | 발표된 진행에서 다시 | 모든 단계가 멱등. 이어받은 writer 도 같음 |
+| GC 한 바퀴 도중 얼었다가 리스가 넘어간 뒤 깨어남 | 삭제와 상태 저장 전의 `s3_lease_hold` 에서 멈춤 | 아무것도 지우지 않음. Guard: `test_s3_gc_frozen_through_a_takeover_deletes_nothing` |
 | 옛 writer 가 리스 만료 뒤 깨어남 | 갱신·CAS·펜싱된 PUT·조각 가운데 먼저 닿는 것에서 멈춤 | 없음 |
 | 이어받는 둘이 동시에 시작 | 리스·`root` CAS 에서 하나만 이김 | Guard: `test_s3_two_takeovers_one_writer` |
 
@@ -750,9 +781,13 @@ RustFS, 같은 Docker 호스트, 릴리스 빌드. 100만 행 표에 8연결 무
 - 두 체크포인트 사이에서 만들고 지운 트리는 다음 매니페스트의 `dropped` 줄로 이어받은 writer 에게 넘어간다(loader 가 새
   디렉터리의 `s3_dropped_trees` 에 적는다). 그 매니페스트를 쓰기 전에 writer 가 멈추면 그 기록은 남지 않는다.
   Guard: `test_s3_gc_after_a_takeover_removes_an_aborted_build`.
-- relnode 재사용: GC 는 체크포인트가 다시 이름한 relnode 의 지워진 트리를 남기지만, 새 트리가 첫 체크포인트 전에 올린 파트는
-  지킬 수 없다(*Facts the design rests on*). 로컬 파일로는 가리지 못한다: 롤백된 재구축의 데이터 파일이 체크포인트 뒤에도
-  남는다.
+- relnode 재사용: GC 는 체크포인트가 다시 이름한 relnode 의 지워진 트리를 남기고 그 GC 상태만 되돌리지만, 새 트리가 첫
+  체크포인트 전에 올린 파트는 지킬 수 없다(*Facts the design rests on*). 되돌리는 바퀴가 그 전에 새 트리의 목록을 접었으면
+  (r 이 R' 보다 뒤일 때, 즉 r 의 매니페스트가 `complete` 가 아닐 때) 그 목록은 상태와 함께 사라진다: 누수일 뿐이다. 로컬
+  파일로는 가리지 못한다: 롤백된 재구축의 데이터 파일이 체크포인트 뒤에도 남는다.
+- `pin_floor` 아래의 핀을 지나는 판정은 핀 줄의 TTL 로 나이를 센다. TTL 필드가 없는 줄(이 필드 전의 reader 나 loader 가 쓴
+  것)은 writer 의 `s3_reader_pin_ttl` 로 본다.
+- `gc` 의 `skipped` 줄은 늘어날 뿐 줄지 않는다. 상태를 고친 뒤 남은 목록을 다시 접는 길은 수동이다.
 - 시험의 moto 는 요청을 동시에 처리하되 PUT 은 하나씩 처리한다(조건부 PUT 의 원자성을 지키려고). 그래서 조건부 PUT 의
   동시 경쟁과 DELETE 장애, 서명 검증은 시험하지 않는다. GET·LIST 장애와 한 요청만 붙잡기는 시험한다.
 - 종결 객체와 그 표지, history 는 지우지 않는다(작다).

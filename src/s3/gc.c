@@ -31,7 +31,17 @@
  *
  * Progress is published in `gc` (folded, collected), so a writer that takes
  * the bucket over goes on where the last one stopped; a tree's state is the
- * union of this data directory's copy and the bucket's.
+ * union of this data directory's copy and the bucket's.  A relnode a
+ * manifest names again after R dropped its tree is a new tree under the old
+ * keys: its state starts over, so the dropped tree's dead bits do not mark
+ * the new tree's parts dead.
+ *
+ * Every delete, and every write of a tree's state, is fenced: the lease is
+ * ours for a while yet (s3_lease_hold()), and a state is put over the one in
+ * the bucket only while that one is ours or an earlier writer's.  A pass
+ * frozen past its lease would otherwise delete what the writer that took
+ * over has its readers pinned on.  A delete the store refuses for good is
+ * logged and left for a later pass; the part stays in the tree's state.
  *
  * Copyright (c) 2025-2026, Oriole DB Inc.
  *
@@ -72,8 +82,7 @@
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 
-#define GC_STATE_MAGIC		0x33434753	/* "SGC3" */
-#define MAX_PART_BLOCKS		2048
+#define GC_STATE_MAGIC		0x34434753	/* "SGC4" */
 
 int			s3_gc_interval = 60;
 int			s3_gc_keep_checkpoints = 2;
@@ -87,7 +96,8 @@ typedef struct
 	uint64		part;
 	uint64		end;			/* 0: the part is not complete yet;
 								 * PART_GONE: every block of it is dead */
-	uint8		dead[MAX_PART_BLOCKS / 8];
+	uint8	   *dead;			/* one bit per block of the part, sized by the
+								 * tree's blocks per part; NULL: none dead */
 } GcPart;
 
 typedef struct
@@ -98,7 +108,14 @@ typedef struct
 	bool		skip;			/* a list could not be read: collect nothing */
 	bool		changed;
 	HTAB	   *parts;
+	MemoryContext cxt;			/* the parts and their bitmaps */
 } GcTree;
+
+static inline Size
+bitmap_bytes(GcTree *tree)
+{
+	return (tree->blocksPerPart + 7) / 8;
+}
 
 static int
 pg_cmp_u64_wrapper(const void *a, const void *b)
@@ -110,13 +127,52 @@ pg_cmp_u64_wrapper(const void *a, const void *b)
 }
 
 /*
- * Deletions are queued and sent many at a time (s3_delete_objects()).  A
+ * Deletions are queued and sent many at a time (s3_delete_objects_try()).  A
  * caller flushes before it records that what it deleted is gone: a tree's
- * state without its parts, a published progress, a manifest.
+ * state without its parts, a published progress, a manifest.  The keys the
+ * store refused are kept for the pass (gc_failed()): what they name is left
+ * for a later pass, and nothing records it as gone.
  */
 #define GC_DELETE_BATCH		1000
 
+typedef struct
+{
+	char		key[MAXPGPATH + 64];
+} DeletedKey;
+
 static List *gc_pending = NIL;
+static HTAB *gcFailed = NULL;
+
+static void
+gc_note_failed(const char *key)
+{
+	DeletedKey	k = {{0}};
+
+	if (gcFailed == NULL)
+	{
+		HASHCTL		ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(DeletedKey);
+		ctl.entrysize = sizeof(DeletedKey);
+		ctl.hcxt = CurrentMemoryContext;
+		gcFailed = hash_create("orioledb s3 gc failed deletes", 16, &ctl,
+							   HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	}
+	strlcpy(k.key, key, sizeof(k.key));
+	(void) hash_search(gcFailed, &k, HASH_ENTER, NULL);
+}
+
+static bool
+gc_failed(const char *key)
+{
+	DeletedKey	k = {{0}};
+
+	if (gcFailed == NULL)
+		return false;
+	strlcpy(k.key, key, sizeof(k.key));
+	return hash_search(gcFailed, &k, HASH_FIND, NULL) != NULL;
+}
 
 static void
 gc_flush(void)
@@ -124,14 +180,32 @@ gc_flush(void)
 	int			n = list_length(gc_pending);
 	char	  **keys;
 	ListCell   *lc;
+	List	   *failed;
 	int			i = 0;
 
 	if (n == 0)
 		return;
+
+	/*
+	 * The lease is ours for a while yet, or the instance stops here: a pass
+	 * frozen past its lease and thawed would delete what the writer that
+	 * took over keeps for its readers.
+	 */
+	(void) s3_lease_hold();
 	keys = palloc(sizeof(char *) * n);
 	foreach(lc, gc_pending)
 		keys[i++] = lfirst(lc);
-	s3_delete_objects(keys, n);
+	failed = s3_delete_objects_try(keys, n);
+	foreach(lc, failed)
+	{
+		const char *key = keys[lfirst_int(lc)];
+
+		ereport(LOG,
+				(errmsg("S3 GC could not delete \"%s\", the store refused; left for a later pass",
+						key)));
+		gc_note_failed(key);
+	}
+	list_free(failed);
 	pfree(keys);
 	list_free_deep(gc_pending);
 	gc_pending = NIL;
@@ -251,34 +325,68 @@ tree_part(GcTree *tree, uint64 part)
 	if (!found)
 	{
 		entry->end = 0;
-		memset(entry->dead, 0, sizeof(entry->dead));
+		entry->dead = NULL;
 	}
 	return entry;
 }
 
+/* the part's bitmap, made once the blocks per part are known */
+static uint8 *
+part_bitmap(GcTree *tree, GcPart *p)
+{
+	Assert(tree->blocksPerPart != 0);
+	if (p->dead == NULL)
+		p->dead = MemoryContextAllocZero(tree->cxt, bitmap_bytes(tree));
+	return p->dead;
+}
+
+static bool
+block_dead(GcPart *p, uint64 i)
+{
+	return p->dead != NULL && (p->dead[i / 8] & (1 << (i % 8))) != 0;
+}
+
 /*
- * A state's serialized form: magic, blocks per part, count, the parts.  It is
- * merged into what the tree has.
+ * A state's serialized form: magic, the token of the writer that wrote it,
+ * blocks per part, count, then per part its number, end and bitmap of
+ * (blocks per part + 7) / 8 bytes.  It is merged into what the tree has.
  */
+#define STATE_HEADER_SIZE	(sizeof(uint32) + 3 * sizeof(uint64))
+
+static bool
+state_token(const char *data, uint64 size, uint64 *token)
+{
+	uint32		magic;
+
+	if (size < STATE_HEADER_SIZE)
+		return false;
+	memcpy(&magic, data, sizeof(magic));
+	if (magic != GC_STATE_MAGIC)
+		return false;
+	memcpy(token, data + sizeof(magic), sizeof(uint64));
+	return true;
+}
+
 static bool
 state_decode(GcTree *tree, const char *data, uint64 size)
 {
-	uint32		magic;
-	uint64		count,
-				bpp;
+	uint64		token,
+				count,
+				bpp,
+				bytes;
 	const char *p = data;
 
-	if (size < sizeof(uint32) + 2 * sizeof(uint64))
+	if (!state_token(data, size, &token))
 		return false;
-	memcpy(&magic, p, sizeof(magic));
-	p += sizeof(magic);
-	if (magic != GC_STATE_MAGIC)
-		return false;
+	p += sizeof(uint32) + sizeof(uint64);
 	memcpy(&bpp, p, sizeof(uint64));
 	p += sizeof(uint64);
 	memcpy(&count, p, sizeof(count));
 	p += sizeof(count);
-	if (size != sizeof(uint32) + 2 * sizeof(uint64) + count * sizeof(GcPart))
+	if (bpp > ORIOLEDB_S3_PART_SIZE)
+		return false;
+	bytes = (bpp + 7) / 8;
+	if (size != STATE_HEADER_SIZE + count * (2 * sizeof(uint64) + bytes))
 		return false;
 	if (bpp != 0)
 	{
@@ -288,33 +396,52 @@ state_decode(GcTree *tree, const char *data, uint64 size)
 	}
 	for (uint64 i = 0; i < count; i++)
 	{
-		GcPart		rec;
+		uint64		part,
+					end;
 		GcPart	   *entry;
 
-		memcpy(&rec, p, sizeof(rec));
-		p += sizeof(rec);
-		entry = tree_part(tree, rec.part);
-		entry->end = Max(entry->end, rec.end);
-		for (int b = 0; b < MAX_PART_BLOCKS / 8; b++)
-			entry->dead[b] |= rec.dead[b];
+		memcpy(&part, p, sizeof(part));
+		p += sizeof(part);
+		memcpy(&end, p, sizeof(end));
+		p += sizeof(end);
+		entry = tree_part(tree, part);
+		entry->end = Max(entry->end, end);
+		if (bytes > 0)
+		{
+			uint8	   *dead = part_bitmap(tree, entry);
+
+			for (uint64 b = 0; b < bytes; b++)
+				dead[b] |= (uint8) p[b];
+		}
+		p += bytes;
 	}
 	return true;
 }
 
 static void
-state_encode(GcTree *tree, StringInfo out)
+state_encode(GcTree *tree, StringInfo out, uint64 token)
 {
 	uint32		magic = GC_STATE_MAGIC;
 	uint64		count = hash_get_num_entries(tree->parts);
+	Size		bytes = bitmap_bytes(tree);
 	HASH_SEQ_STATUS seq;
 	GcPart	   *entry;
 
 	appendBinaryStringInfo(out, (char *) &magic, sizeof(magic));
+	appendBinaryStringInfo(out, (char *) &token, sizeof(token));
 	appendBinaryStringInfo(out, (char *) &tree->blocksPerPart, sizeof(uint64));
 	appendBinaryStringInfo(out, (char *) &count, sizeof(count));
 	hash_seq_init(&seq, tree->parts);
 	while ((entry = hash_seq_search(&seq)) != NULL)
-		appendBinaryStringInfo(out, (char *) entry, sizeof(GcPart));
+	{
+		appendBinaryStringInfo(out, (char *) &entry->part, sizeof(uint64));
+		appendBinaryStringInfo(out, (char *) &entry->end, sizeof(uint64));
+		if (entry->dead != NULL)
+			appendBinaryStringInfo(out, (char *) entry->dead, bytes);
+		else
+			for (Size b = 0; b < bytes; b++)
+				appendStringInfoChar(out, 0);
+	}
 }
 
 /*
@@ -354,6 +481,12 @@ state_load(GcTree *tree)
 	pfree(key);
 }
 
+/*
+ * Save the tree's state locally and in the bucket.  The bucket's copy is put
+ * over what is there only while that is ours or an earlier writer's, and only
+ * if it is still what was read (the same fence as s3_gc_publish()): a state
+ * a later writer wrote is theirs, and this instance stops.
+ */
 static void
 state_save(GcTree *tree)
 {
@@ -361,11 +494,13 @@ state_save(GcTree *tree)
 	char	   *tmp = psprintf("%s.tmp", filename);
 	char	   *dir = psprintf(ORIOLEDB_DATA_DIR "/%u", tree->key.datoid);
 	char	   *key = state_key(tree->key.datoid, tree->key.relnode);
+	uint64		mine = s3_lease_token();
 	StringInfoData body;
 	int			fd;
 
+	(void) s3_lease_hold();
 	initStringInfo(&body);
-	state_encode(tree, &body);
+	state_encode(tree, &body, mine);
 	(void) MakePGDirectory(dir);
 	fd = BasicOpenFile(tmp, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY);
 	if (fd < 0 || write(fd, body.data, body.len) != body.len ||
@@ -375,7 +510,31 @@ state_save(GcTree *tree)
 				 errmsg("could not write file \"%s\": %m", tmp)));
 	close(fd);
 	durable_rename(tmp, filename, ERROR);
-	(void) s3_put_object_with_contents(key, body.data, body.len, NULL, false);
+
+	for (int attempt = 0;; attempt++)
+	{
+		StringInfoData current;
+		char	   *etag = NULL;
+		uint64		theirs;
+		long		code;
+
+		initStringInfo(&current);
+		code = s3_get_object_etag(key, &current, true, &etag);
+		if (code == S3_RESPONSE_OK &&
+			state_token(current.data, current.len, &theirs) && theirs > mine)
+			s3_lease_lost(psprintf("The \"%s\" object was written by writer token " UINT64_FORMAT,
+								   key, theirs));
+		code = s3_put_object_conditional(key, body.data, body.len,
+										 code == S3_RESPONSE_OK ? etag : NULL,
+										 code != S3_RESPONSE_OK, NULL);
+		pfree(current.data);
+		if (etag)
+			pfree(etag);
+		if (code == S3_RESPONSE_OK)
+			break;
+		/* the condition failed: another writer of the key, read it again */
+		pg_usleep(Min(1000000L, 10000L << Min(attempt, 7)));
+	}
 	pfree(body.data);
 	pfree(filename);
 	pfree(tmp);
@@ -410,7 +569,7 @@ fold_list(GcTree *tree, const char *data, uint64 size, const char *name)
 		memcpy(&extent, data + pos, sizeof(extent));
 		if (extent.len == S3_DEAD_UNIT_LEN)
 		{
-			if (extent.off == 0 || extent.off > MAX_PART_BLOCKS ||
+			if (extent.off == 0 || extent.off > ORIOLEDB_S3_PART_SIZE ||
 				(tree->blocksPerPart != 0 && tree->blocksPerPart != extent.off))
 			{
 				ereport(LOG,
@@ -462,7 +621,7 @@ fold_list(GcTree *tree, const char *data, uint64 size, const char *name)
 			GcPart	   *p = tree_part(tree, b / bpp);
 			uint64		i = b % bpp;
 
-			p->dead[i / 8] |= (uint8) (1 << (i % 8));
+			part_bitmap(tree, p)[i / 8] |= (uint8) (1 << (i % 8));
 		}
 	}
 }
@@ -477,43 +636,71 @@ part_all_dead(GcTree *tree, GcPart *p)
 	if (p->end == 0 || p->end <= start)
 		return false;
 	for (uint64 i = 0; i < p->end - start; i++)
-		if (!(p->dead[i / 8] & (1 << (i % 8))))
+		if (!block_dead(p, i))
 			return false;
 	return true;
 }
 
-static int
+/*
+ * The parts queued for deletion this pass.  A part leaves its tree's state
+ * only once the flush shows its delete went through (forget_removed_parts()):
+ * one the store refused is tried again by the pass that next folds the tree.
+ */
+typedef struct
+{
+	GcTree	   *tree;
+	uint64		part;
+	char	   *key;
+} PendingPart;
+
+static List *gc_parts = NIL;
+
+static void
 collect_tree(GcTree *tree)
 {
 	HASH_SEQ_STATUS seq;
 	GcPart	   *entry;
-	List	   *done = NIL;
+
+	if (tree->skip)
+		return;
+	hash_seq_init(&seq, tree->parts);
+	while ((entry = hash_seq_search(&seq)) != NULL)
+	{
+		if (part_all_dead(tree, entry))
+		{
+			PendingPart *pending = palloc(sizeof(PendingPart));
+
+			gc_check_stop();
+			pending->tree = tree;
+			pending->part = entry->part;
+			pending->key = part_key(tree->key.datoid, tree->key.relnode,
+									entry->part);
+			gc_parts = lappend(gc_parts, pending);
+			gc_delete(pending->key);
+		}
+	}
+}
+
+/* after the flush: the parts whose delete went through are gone */
+static int
+forget_removed_parts(void)
+{
 	ListCell   *lc;
 	int			removed = 0;
 
-	if (tree->skip)
-		return 0;
-	hash_seq_init(&seq, tree->parts);
-	while ((entry = hash_seq_search(&seq)) != NULL)
-		if (part_all_dead(tree, entry))
-			done = lappend(done, entry);
-
-	foreach(lc, done)
+	foreach(lc, gc_parts)
 	{
-		GcPart	   *p = (GcPart *) lfirst(lc);
-		char	   *key = part_key(tree->key.datoid, tree->key.relnode, p->part);
-		uint64		part = p->part;
+		PendingPart *pending = lfirst(lc);
 
-		gc_check_stop();
-
-		gc_delete(key);
-		pfree(key);
-		(void) hash_search(tree->parts, &part, HASH_REMOVE, NULL);
+		if (gc_failed(pending->key))
+			continue;
+		(void) hash_search(pending->tree->parts, &pending->part, HASH_REMOVE,
+						   NULL);
+		pending->tree->changed = true;
 		removed++;
 	}
-	list_free(done);
-	if (removed > 0)
-		tree->changed = true;
+	list_free_deep(gc_parts);
+	gc_parts = NIL;
 	return removed;
 }
 
@@ -523,6 +710,41 @@ typedef struct
 	char	   *local;			/* its local copy, or NULL */
 	GcTree	   *tree;
 } FoldedList;
+
+/*
+ * A checkpoint's manifest, or NULL when the bucket has none.  One that does
+ * not parse, or is not its checkpoint's, is passed over like one never
+ * written, with a LOG: its lists are folded as an unpublished checkpoint's
+ * (fold_unpublished()), what only it referred to is for --sweep, and it goes
+ * with the manifests below R.  An ERROR here would end the worker, which
+ * would start again and meet the same object: no pass would ever finish.
+ */
+static S3Manifest *
+gc_manifest_fetch(uint32 chkpNum)
+{
+	S3Manifest *volatile m = NULL;
+	MemoryContext cxt = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		m = s3_manifest_fetch(chkpNum);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *e;
+
+		MemoryContextSwitchTo(cxt);
+		e = CopyErrorData();
+		FlushErrorState();
+		ereport(LOG,
+				(errmsg("S3 GC skips the manifest of checkpoint %u: %s",
+						chkpNum, e->message)));
+		FreeErrorData(e);
+		m = NULL;
+	}
+	PG_END_TRY();
+	return m;
+}
 
 static GcTree *
 get_tree(HTAB *trees, S3ManifestTree *t)
@@ -542,6 +764,7 @@ get_tree(HTAB *trees, S3ManifestTree *t)
 		tree->blocksPerPart = 0;
 		tree->skip = false;
 		tree->changed = false;
+		tree->cxt = CurrentMemoryContext;
 		tree->parts = hash_create("orioledb s3 gc parts", 64, &ctl,
 								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 		state_load(tree);
@@ -632,7 +855,7 @@ fold_unpublished(HTAB *trees, uint32 k, uint32 committed, List *folded)
 	if (!s3_checkpoint_token_known(k, &token))
 		return folded;
 	for (uint32 n = k + 1; n <= committed && later == NULL; n++)
-		later = s3_manifest_fetch(n);
+		later = gc_manifest_fetch(n);
 	if (later == NULL)
 		return folded;
 
@@ -685,11 +908,6 @@ typedef struct
 {
 	S3ManifestTreeKey key;
 } DroppedTree;
-
-typedef struct
-{
-	char		key[MAXPGPATH + 64];
-} DeletedKey;
 
 static void
 delete_once(HTAB *deleted, const char *key)
@@ -944,14 +1162,30 @@ delete_wal(S3Manifest *from, S3Manifest *to)
  * segments never are (archiving off, or another archive_library).  Chunks go
  * in their order, up to the first that cannot go; a terminator stays, or its
  * key would be free for the writer it fenced.  Chunks do not change, so the
- * ends read are kept for the next passes.
+ * ends read are kept for the next passes, and so is where a pass stopped: the
+ * next lists from the last chunk removed, and not at all while the first
+ * chunk kept still ends past `below`.
  */
+typedef struct
+{
+	uint64		tli;
+	uint64		lastRemoved;	/* 0: none yet */
+	XLogRecPtr	keptEnd;		/* the first chunk kept ends here; 0: not
+								 * known */
+} ChunkCursor;
+
 static void
 delete_chunks_below(TimeLineID tli, XLogRecPtr below)
 {
 	static HTAB *ends = NULL;
+	static HTAB *cursors = NULL;
 	char	   *prefix = psprintf("wal/%08X/chunks/", tli);
+	char	   *after = NULL;
+	uint64		tliKey = tli;
+	ChunkCursor *cursor;
+	bool		known;
 	List	   *keys;
+	List	   *removed = NIL;
 	ListCell   *lc;
 
 	if (ends == NULL)
@@ -964,8 +1198,31 @@ delete_chunks_below(TimeLineID tli, XLogRecPtr below)
 		ctl.hcxt = TopMemoryContext;
 		ends = hash_create("orioledb s3 gc chunk ends", 256, &ctl,
 						   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(uint64);
+		ctl.entrysize = sizeof(ChunkCursor);
+		ctl.hcxt = TopMemoryContext;
+		cursors = hash_create("orioledb s3 gc chunk cursors", 16, &ctl,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
-	keys = s3_list_objects(prefix, NULL);
+	cursor = hash_search(cursors, &tliKey, HASH_ENTER, &known);
+	if (!known)
+	{
+		cursor->lastRemoved = 0;
+		cursor->keptEnd = InvalidXLogRecPtr;
+	}
+	if (cursor->keptEnd != InvalidXLogRecPtr && cursor->keptEnd > below)
+	{
+		pfree(prefix);
+		return;
+	}
+	if (cursor->lastRemoved != 0)
+		after = psprintf("%s%020llu", prefix,
+						 (unsigned long long) cursor->lastRemoved);
+	keys = s3_list_objects(prefix, after);
+	if (after)
+		pfree(after);
+	cursor->keptEnd = InvalidXLogRecPtr;
 
 	/*
 	 * The chunks before the first one listed are gone (the shipper removes
@@ -1008,12 +1265,104 @@ delete_chunks_below(TimeLineID tli, XLogRecPtr below)
 		if (cached[2] == InvalidXLogRecPtr)
 			continue;
 		if (cached[2] > below)
+		{
+			cursor->keptEnd = cached[2];
 			break;
+		}
 		gc_delete(key);
+		removed = lappend(removed, key);
+	}
+
+	/*
+	 * The cursor moves past the chunks that went; one the store refused is
+	 * listed again next pass, and so is everything after it.
+	 */
+	gc_flush();
+	foreach(lc, removed)
+	{
+		char	   *key = lfirst(lc);
+		uint64		entry[3] = {tli, strtou64(key + strlen(prefix), NULL, 10), 0};
+
+		if (gc_failed(key))
+		{
+			cursor->keptEnd = InvalidXLogRecPtr;
+			break;
+		}
+		cursor->lastRemoved = entry[1];
 		(void) hash_search(ends, entry, HASH_REMOVE, NULL);
 	}
+	list_free(removed);
 	list_free_deep(keys);
 	pfree(prefix);
+}
+
+/*
+ * The trees a checkpoint's manifest names, kept across passes: a manifest
+ * does not change.  One the bucket does not have is asked for again.
+ */
+typedef struct
+{
+	uint32		chkp;
+	int			count;
+	S3ManifestTreeKey *keys;	/* in TopMemoryContext */
+} ManifestTrees;
+
+static HTAB *manifestTrees = NULL;
+
+static ManifestTrees *
+manifest_trees(uint32 chkp)
+{
+	ManifestTrees *entry;
+	bool		found;
+	S3Manifest *m;
+	HASH_SEQ_STATUS seq;
+	S3ManifestTree *t;
+	int			n = 0;
+
+	if (manifestTrees == NULL)
+	{
+		HASHCTL		ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(uint32);
+		ctl.entrysize = sizeof(ManifestTrees);
+		ctl.hcxt = TopMemoryContext;
+		manifestTrees = hash_create("orioledb s3 gc manifest trees", 64, &ctl,
+									HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	entry = hash_search(manifestTrees, &chkp, HASH_FIND, NULL);
+	if (entry != NULL)
+		return entry;
+	m = gc_manifest_fetch(chkp);
+	if (m == NULL)
+		return NULL;
+	entry = hash_search(manifestTrees, &chkp, HASH_ENTER, &found);
+	entry->count = hash_get_num_entries(m->trees);
+	entry->keys = MemoryContextAlloc(TopMemoryContext,
+									 sizeof(S3ManifestTreeKey) * Max(1, entry->count));
+	hash_seq_init(&seq, m->trees);
+	while ((t = hash_seq_search(&seq)) != NULL)
+		entry->keys[n++] = t->key;
+	s3_manifest_free(m);
+	return entry;
+}
+
+/* the manifests below `collected` are gone: so are their entries */
+static void
+forget_manifest_trees_below(uint32 collected)
+{
+	HASH_SEQ_STATUS seq;
+	ManifestTrees *entry;
+
+	if (manifestTrees == NULL)
+		return;
+	hash_seq_init(&seq, manifestTrees);
+	while ((entry = hash_seq_search(&seq)) != NULL)
+		if (entry->chkp < collected)
+		{
+			pfree(entry->keys);
+			(void) hash_search(manifestTrees, &entry->chkp, HASH_REMOVE, NULL);
+		}
 }
 
 /*
@@ -1022,39 +1371,60 @@ delete_chunks_below(TimeLineID tli, XLogRecPtr below)
  * keys, and is left, with whatever the dropped one left under them.
  */
 static bool
-tree_named(S3ManifestTreeKey *key, uint32 from, uint32 committed, HTAB **named)
+tree_named(S3ManifestTreeKey *key, uint32 from, uint32 committed)
 {
-	if (*named == NULL)
+	for (uint32 k = Max(from, 1); k <= committed; k++)
 	{
-		HASHCTL		ctl;
+		ManifestTrees *mt = manifest_trees(k);
 
-		memset(&ctl, 0, sizeof(ctl));
-		ctl.keysize = sizeof(S3ManifestTreeKey);
-		ctl.entrysize = sizeof(S3ManifestTreeKey);
-		ctl.hcxt = CurrentMemoryContext;
-		*named = hash_create("orioledb s3 gc named trees", 64, &ctl,
-							 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-		for (uint32 k = Max(from, 1); k <= committed; k++)
+		if (mt == NULL)
+			continue;
+		for (int i = 0; i < mt->count; i++)
+			if (mt->keys[i].datoid == key->datoid &&
+				mt->keys[i].relnode == key->relnode)
+				return true;
+	}
+	return false;
+}
+
+/*
+ * The local lists of dead extents of a tree that is gone: those of the
+ * checkpoints after the drop were never named by a manifest and never
+ * folded.  Left, a tree that has the relnode again would fold them as its
+ * own, marking its blocks dead.  Under the default tablespace, as the GC
+ * state file is.
+ */
+static void
+unlink_local_dead_lists(Oid datoid, Oid relnode)
+{
+	char	   *dir = psprintf(ORIOLEDB_DATA_DIR "/%u", datoid);
+	char		prefix[32];
+	size_t		plen = snprintf(prefix, sizeof(prefix), "%u-", relnode);
+	DIR		   *d = AllocateDir(dir);
+	struct dirent *de;
+
+	while (d != NULL && (de = ReadDirExtended(d, dir, LOG)) != NULL)
+	{
+		size_t		len = strlen(de->d_name);
+
+		if (len > plen + 5 && strncmp(de->d_name, prefix, plen) == 0 &&
+			strcmp(de->d_name + len - 5, ".dead") == 0)
 		{
-			S3Manifest *m = s3_manifest_fetch(k);
-			HASH_SEQ_STATUS seq;
-			S3ManifestTree *t;
+			char	   *path = psprintf("%s/%s", dir, de->d_name);
 
-			if (m == NULL)
-				continue;
-			hash_seq_init(&seq, m->trees);
-			while ((t = hash_seq_search(&seq)) != NULL)
-				(void) hash_search(*named, &t->key, HASH_ENTER, NULL);
-			s3_manifest_free(m);
+			(void) unlink(path);
+			pfree(path);
 		}
 	}
-	return hash_search(*named, key, HASH_FIND, NULL) != NULL;
+	if (d != NULL)
+		FreeDir(d);
+	pfree(dir);
 }
 
 /*
  * Remove a dropped tree: every object under its prefix (its parts, maps and
  * GC state, those of a run that crashed before naming them too), and its
- * local GC files.
+ * local GC files and dead lists.
  */
 static int
 collect_dropped_tree(S3ManifestTreeKey *key)
@@ -1075,6 +1445,7 @@ collect_dropped_tree(S3ManifestTreeKey *key)
 	pfree(prefix);
 	state_drop(key->datoid, key->relnode);
 	s3_tree_lists_unlink(key->datoid, key->relnode);
+	unlink_local_dead_lists(key->datoid, key->relnode);
 	return removed;
 }
 
@@ -1093,7 +1464,6 @@ collect_abandoned_trees(uint32 r, uint32 committed)
 	int			fd;
 	struct stat st;
 	char	   *data;
-	HTAB	   *named = NULL;
 	int			removed = 0;
 
 	if (stat(taken, &st) != 0)
@@ -1154,14 +1524,12 @@ collect_abandoned_trees(uint32 r, uint32 committed)
 		memset(&key, 0, sizeof(key));
 		key.datoid = rec.datoid;
 		key.relnode = rec.relnode;
-		if (tree_named(&key, r, committed, &named))
+		if (tree_named(&key, r, committed))
 			continue;
 		removed += collect_dropped_tree(&key);
 	}
 	gc_flush();
 	(void) unlink(taken);
-	if (named)
-		hash_destroy(named);
 	pfree(data);
 	pfree(taken);
 	return removed;
@@ -1190,6 +1558,17 @@ retain_by_time(uint32 retain, uint32 collected)
 		times = hash_create("orioledb s3 gc manifest times", 64, &ctl,
 							HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
+	else
+	{
+		/* the manifests below collected are gone: so are their times */
+		HASH_SEQ_STATUS seq;
+		uint32	   *k;
+
+		hash_seq_init(&seq, times);
+		while ((k = hash_seq_search(&seq)) != NULL)
+			if (*k < collected)
+				(void) hash_search(times, k, HASH_REMOVE, NULL);
+	}
 	/* the checkpoints before collected are gone already */
 	while (retain > Max(collected, 1))
 	{
@@ -1200,7 +1579,7 @@ retain_by_time(uint32 retain, uint32 collected)
 
 		if (!found)
 		{
-			S3Manifest *m = s3_manifest_fetch(k);
+			S3Manifest *m = gc_manifest_fetch(k);
 
 			t = m != NULL ? m->time : -1;
 			if (m != NULL)
@@ -1219,6 +1598,69 @@ retain_by_time(uint32 retain, uint32 collected)
 		retain = k;
 	}
 	return retain;
+}
+
+/*
+ * The trees the GC skips (their state or a list could not be read): their
+ * lists stay in the bucket for whoever repairs the state, and the `gc`
+ * object names them, so --sweep leaves those lists too.  The set is the
+ * union of what the object named and what this pass skipped: a tree skipped
+ * once keeps lists no later pass folds again.
+ */
+static HTAB *skippedTrees = NULL;
+
+static void
+note_skipped(Oid datoid, Oid relnode)
+{
+	S3ManifestTreeKey key = {datoid, relnode};
+
+	if (skippedTrees == NULL)
+	{
+		HASHCTL		ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(S3ManifestTreeKey);
+		ctl.entrysize = sizeof(S3ManifestTreeKey);
+		ctl.hcxt = TopMemoryContext;
+		skippedTrees = hash_create("orioledb s3 gc skipped trees", 16, &ctl,
+								   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	(void) hash_search(skippedTrees, &key, HASH_ENTER, NULL);
+}
+
+static void
+note_skipped_lines(const char *lines)
+{
+	const char *line = lines;
+
+	while (line && *line)
+	{
+		unsigned int a,
+					b;
+
+		if (sscanf(line, "skipped %u %u", &a, &b) == 2)
+			note_skipped(a, b);
+		line = strchr(line, '\n');
+		if (line)
+			line++;
+	}
+}
+
+static char *
+skipped_lines(void)
+{
+	StringInfoData out;
+	HASH_SEQ_STATUS seq;
+	S3ManifestTreeKey *key;
+
+	initStringInfo(&out);
+	if (skippedTrees != NULL)
+	{
+		hash_seq_init(&seq, skippedTrees);
+		while ((key = hash_seq_search(&seq)) != NULL)
+			appendStringInfo(&out, "skipped %u %u\n", key->datoid, key->relnode);
+	}
+	return out.data;
 }
 
 /*
@@ -1241,11 +1683,19 @@ s3_gc_cycle(void)
 	ListCell   *lc;
 	HASH_SEQ_STATUS seq;
 	GcTree	   *tree;
+	StringInfoData skippedBefore;
 	int			removed = 0;
 
+	/* what a pass left is in the pass's context, reset with it */
+	gcFailed = NULL;
+	gc_parts = NIL;
+	gc_pending = NIL;
+	initStringInfo(&skippedBefore);
 	if (committed < (uint32) s3_gc_keep_checkpoints ||
-		!s3_gc_progress(&published, &folded, &collected))
+		!s3_gc_progress(&published, &folded, &collected, &skippedBefore))
 		return 0;
+	note_skipped_lines(skippedBefore.data);
+	pfree(skippedBefore.data);
 
 	/*
 	 * The retention point: the committed checkpoint minus what is kept,
@@ -1261,14 +1711,15 @@ s3_gc_cycle(void)
 		pinFloor = committed - s3_gc_max_pin_lag;
 		pinWarn = pinFloor + Max(1, s3_gc_max_pin_lag / 4);
 	}
-	s3_gc_publish(retain, folded, collected, pinFloor, pinWarn);
+	s3_gc_publish(retain, folded, collected, pinFloor, pinWarn, skipped_lines());
 	/*
 	 * A pin below what is folded or collected already holds nothing: its
 	 * reader stops at its next renewal.  Counted, a stopped reader's pin
-	 * would hold the GC for the pin's lifetime.
+	 * would hold the GC for the pin's lifetime.  One below the pin floor is
+	 * passed over only once its reader has had a renewal in which to see
+	 * pin_warn (s3_reader_pins_min()).
 	 */
-	r = Min(retain, s3_reader_pins_min(retain,
-									   Max(pinFloor, Max(folded, collected))));
+	r = Min(retain, s3_reader_pins_min(retain, Max(folded, collected), pinFloor));
 	{
 		uint32		scans = oldest_scan_checkpoint();
 
@@ -1290,7 +1741,7 @@ s3_gc_cycle(void)
 		S3Manifest *m;
 
 		gc_check_stop();
-		m = s3_manifest_fetch(k);
+		m = gc_manifest_fetch(k);
 
 		if (m == NULL)
 		{
@@ -1302,8 +1753,13 @@ s3_gc_cycle(void)
 	}
 	hash_seq_init(&seq, trees);
 	while ((tree = hash_seq_search(&seq)) != NULL)
-		removed += collect_tree(tree);
+	{
+		if (tree->skip)
+			note_skipped(tree->key.datoid, tree->key.relnode);
+		collect_tree(tree);
+	}
 	gc_flush();
+	removed += forget_removed_parts();
 	hash_seq_init(&seq, trees);
 	while ((tree = hash_seq_search(&seq)) != NULL)
 		if (tree->changed)
@@ -1326,7 +1782,8 @@ s3_gc_cycle(void)
 	if (r > folded)
 	{
 		folded = r;
-		s3_gc_publish(retain, folded, collected, pinFloor, pinWarn);
+		s3_gc_publish(retain, folded, collected, pinFloor, pinWarn,
+					  skipped_lines());
 	}
 
 	/* remove what only the checkpoints before R referred to */
@@ -1342,7 +1799,7 @@ s3_gc_cycle(void)
 		 */
 		for (rk = r; rk > collected && rm == NULL; rk--)
 		{
-			rm = s3_manifest_fetch(rk);
+			rm = gc_manifest_fetch(rk);
 			if (rm != NULL && !rm->complete)
 			{
 				s3_manifest_free(rm);
@@ -1352,8 +1809,7 @@ s3_gc_cycle(void)
 		if (rm != NULL && rm->checkpoint > Max(collected, 1))
 		{
 			HTAB	   *dropped,
-					   *deleted,
-					   *named = NULL;
+					   *deleted;
 			S3Manifest *first = NULL;
 			DroppedTree *d;
 
@@ -1376,7 +1832,7 @@ s3_gc_cycle(void)
 				S3Manifest *m;
 
 				gc_check_stop();
-				m = s3_manifest_fetch(k);
+				m = gc_manifest_fetch(k);
 				if (m == NULL)
 					continue;
 				collect_checkpoint(m, rm, dropped, deleted);
@@ -1389,17 +1845,24 @@ s3_gc_cycle(void)
 			hash_seq_init(&seq, dropped);
 			while ((d = hash_seq_search(&seq)) != NULL)
 			{
-				if (tree_named(&d->key, rk + 1, committed, &named))
+				if (tree_named(&d->key, rk + 1, committed))
 				{
+					/*
+					 * A new tree under the dropped one's keys.  The dropped
+					 * tree's dead bits would OR into the new tree's parts,
+					 * and a live part would go: the state starts over.  Its
+					 * lists up to r are folded already, so nothing of the
+					 * dropped tree comes back; a list of the new tree folded
+					 * this pass (r past R') is lost with it, a leak only.
+					 */
 					ereport(LOG,
-							(errmsg("S3 GC leaves dropped tree %u/%u: a tree has its relnode again",
+							(errmsg("S3 GC leaves dropped tree %u/%u: a tree has its relnode again, its GC state starts over",
 									d->key.datoid, d->key.relnode)));
+					state_drop(d->key.datoid, d->key.relnode);
 					continue;
 				}
 				removed += collect_dropped_tree(&d->key);
 			}
-			if (named)
-				hash_destroy(named);
 
 			if (first != NULL)
 			{
@@ -1430,7 +1893,9 @@ s3_gc_cycle(void)
 			gc_flush();
 			collected = rk;
 			prune_epochs_for(rm);
-			s3_gc_publish(retain, folded, collected, pinFloor, pinWarn);
+			s3_gc_publish(retain, folded, collected, pinFloor, pinWarn,
+						  skipped_lines());
+			forget_manifest_trees_below(collected);
 			hash_destroy(dropped);
 			hash_destroy(deleted);
 		}
@@ -1483,7 +1948,7 @@ s3_gc_sparse_parts(Oid datoid, Oid relnode, double threshold, int *count)
 			if (p->end == 0 || p->end <= start || p->end == PART_GONE)
 				continue;
 			for (uint64 i = 0; i < p->end - start; i++)
-				if (!(p->dead[i / 8] & (1 << (i % 8))))
+				if (!block_dead(p, i))
 					live++;
 			if (live > 0 && live < threshold * tree.blocksPerPart)
 				result[n++] = p->part;
