@@ -1412,6 +1412,8 @@ s3_gc_cycle(void)
 			for (uint32 k = Max(collected, 1); k < rk; k++)
 			{
 				uint64		token;
+				uint64	   *tokens;
+				int			ntokens;
 
 				if (s3_checkpoint_token_known(k, &token))
 				{
@@ -1420,8 +1422,25 @@ s3_gc_cycle(void)
 					gc_delete(key);
 					pfree(key);
 				}
+
+				/*
+				 * The copies of root under k: its commit's, under the token
+				 * of k, and a start's at the same number, under the token of
+				 * a run that started at k -- the tokens a map of k may be
+				 * under.  A copy from before the token was in the key goes
+				 * too.
+				 */
+				ntokens = s3_map_tokens(k, &tokens);
+				for (int i = 0; i < ntokens; i++)
 				{
-					char	   *key = psprintf(ROOT_COPY_FORMAT, k);
+					char	   *key = psprintf(ROOT_COPY_FORMAT, tokens[i], k);
+
+					gc_delete(key);
+					pfree(key);
+				}
+				pfree(tokens);
+				{
+					char	   *key = psprintf("roots/%u", k);
 
 					gc_delete(key);
 					pfree(key);

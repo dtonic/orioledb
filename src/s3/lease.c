@@ -121,7 +121,8 @@ typedef struct
 
 typedef struct
 {
-	LWLock		lock;
+	LWLock		lock;			/* the state below */
+	LWLock		requestLock;	/* the one renewer or committer at a time */
 	int			trancheId;
 	uint64		token;
 	uint64		bucket;
@@ -333,6 +334,48 @@ static bool
 is_transient(long code)
 {
 	return code == 0 || code == 429 || code >= 500;
+}
+
+/*
+ * The lease is judged on the store's clock, read from the Date header of its
+ * answers.  An answer without one that reads leaves nothing to judge the
+ * lease by: a writer refuses to take or wait for a lease then, rather than
+ * judge it on its own clock, which another instance does not share.
+ */
+static void
+require_store_clock(int64 storageNow, const char *key)
+{
+	if (storageNow >= 0)
+		return;
+	ereport(FATAL,
+			(errcode(ERRCODE_CONNECTION_EXCEPTION),
+			 errmsg("the S3 store sent no usable Date header"),
+			 errdetail("The answer to GET \"%s\" carries no Date header that "
+					   "reads as an HTTP date; the writer lease is judged on "
+					   "the store's clock.", key)));
+}
+
+/*
+ * The same clock where only a reader pin is at stake: the local clock stands
+ * in, said once.  A pin judged a little off stays a pin.
+ */
+static int64
+store_clock_or_local(int64 storageNow, const char *key)
+{
+	static bool warned = false;
+
+	if (storageNow >= 0)
+		return storageNow;
+	if (!warned)
+	{
+		warned = true;
+		ereport(WARNING,
+				(errmsg("the S3 store sent no usable Date header, judging the "
+						"reader pins on the local clock"),
+				 errdetail("The answer to GET \"%s\" carries no Date header that "
+						   "reads as an HTTP date.", key)));
+	}
+	return (int64) time(NULL);
 }
 
 /*
@@ -867,8 +910,7 @@ wait_for_own_lease(WriterBody *writer, char *writerEtag, int64 storageNow)
 			ereport(FATAL,
 					(errmsg("the \"%s\" object of the S3 bucket changed while "
 							"waiting for it", WRITER_KEY)));
-		if (storageNow < 0)
-			storageNow = (int64) time(NULL);
+		require_store_clock(storageNow, WRITER_KEY);
 		if (strcmp(etag, writerEtag) != 0)
 			ereport(FATAL,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -887,16 +929,18 @@ wait_for_own_lease(WriterBody *writer, char *writerEtag, int64 storageNow)
  * lease, or has written root since this data directory last did.
  */
 /*
- * A copy of root under its checkpoint's number: root is a single object, and
- * a root lost or damaged is put back from the last copy whose manifest is
- * there (orioledb_s3_loader.py --repair-root).  Each commit leaves one, and so
- * does a start, whose root carries the new token and epoch under the same
- * checkpoint.  The GC removes the copies with the manifests.
+ * A copy of root under its writer's token and its checkpoint's number: root is
+ * a single object, and a root lost or damaged is put back from the copy of the
+ * largest token whose manifest is there (orioledb_s3_loader.py --repair-root).
+ * Each commit leaves one, and so does a start, whose root carries the new
+ * token and epoch under the same checkpoint: with the token in the key the
+ * two do not share one, and a copy a fenced writer puts late never replaces
+ * the new writer's.  The GC removes the copies with the manifests.
  */
 static void
-put_root_copy(uint32 checkpointNum, StringInfo body)
+put_root_copy(uint64 token, uint32 checkpointNum, StringInfo body)
 {
-	char	   *key = psprintf(ROOT_COPY_FORMAT, checkpointNum);
+	char	   *key = psprintf(ROOT_COPY_FORMAT, token, checkpointNum);
 
 	if (s3_put_object_conditional(key, body->data, body->len, NULL, false,
 								  NULL) != S3_RESPONSE_OK)
@@ -979,8 +1023,7 @@ s3_lease_acquire(void)
 	if (writerExists && !parse_writer(body.data, &writer))
 		ereport(FATAL,
 				(errmsg("invalid \"%s\" object in the S3 bucket", WRITER_KEY)));
-	if (storageNow < 0)
-		storageNow = (int64) time(NULL);
+	require_store_clock(storageNow, WRITER_KEY);
 
 	if (rootExists)
 		bucket = root.bucket;
@@ -1138,7 +1181,7 @@ s3_lease_acquire(void)
 	strlcpy(pm_lease.rootEtag, rootEtag, S3_ETAG_LEN);
 	/* a takeover's root, with its token and epoch, is the one to put back */
 	if (newRoot.checkpoint > 0)
-		put_root_copy(newRoot.checkpoint, &body);
+		put_root_copy(pm_lease.token, newRoot.checkpoint, &body);
 
 	/*
 	 * No chunk of an earlier writer after this: of the one this load takes
@@ -1256,6 +1299,7 @@ s3_lease_shmem_init(Pointer ptr, bool found)
 		memcpy(lease, &pm_lease, sizeof(S3LeaseState));
 		lease->trancheId = trancheId;
 		LWLockInitialize(&lease->lock, trancheId);
+		LWLockInitialize(&lease->requestLock, trancheId);
 	}
 	LWLockRegisterTranche(lease->trancheId, "S3LeaseTranche");
 }
@@ -1320,7 +1364,25 @@ s3_lease_lost(const char *detail)
 }
 
 /*
- * One renewal; the lease lock is held.  Returns false when the store gave no
+ * The requests to the store (a renewal, a root commit) run under requestLock
+ * alone, so there is one renewer at a time; lease->lock guards the state and
+ * is held for a copy in or out, never across a request.  A status read or an
+ * epoch lookup (every S3 worker's key) then never waits on a store that does
+ * not answer.
+ */
+static TimestampTz
+lease_deadline(void)
+{
+	TimestampTz deadline;
+
+	LWLockAcquire(&lease->lock, LW_SHARED);
+	deadline = lease->deadline;
+	LWLockRelease(&lease->lock);
+	return deadline;
+}
+
+/*
+ * One renewal; requestLock is held.  Returns false when the store gave no
  * answer to judge by.
  */
 static bool
@@ -1330,33 +1392,46 @@ lease_renew(void)
 				current;
 	WriterBody	w;
 	CasResult	res;
-	int64		storageNow;
+	int64		storageNow,
+				clockOffset;
 	TimestampTz sentAt;
+	uint32		attempt;
+	char		etag[S3_ETAG_LEN];
 	bool		done = false;
 
 	initStringInfo(&body);
 	initStringInfo(&current);
 	memset(&w, 0, sizeof(w));
+
+	LWLockAcquire(&lease->lock, LW_SHARED);
 	w.token = lease->token;
 	w.bucket = lease->bucket;
 	strlcpy(w.owner, lease->owner, OWNER_LEN);
+	attempt = lease->writerAttempt;
+	strlcpy(etag, lease->writerEtag, S3_ETAG_LEN);
+	clockOffset = lease->clockOffset;
+	LWLockRelease(&lease->lock);
 
 	for (int i = 0; i < 3; i++)
 	{
-		w.attempt = ++lease->writerAttempt;
-		w.expiresAt = (int64) time(NULL) + lease->clockOffset + s3_lease_duration;
+		w.attempt = ++attempt;
+		w.expiresAt = (int64) time(NULL) + clockOffset + s3_lease_duration;
 		render_writer(&body, &w);
 		sentAt = GetCurrentTimestamp();
-		res = lease_cas(WRITER_KEY, &body, lease->writerEtag, lease->token,
-						lease->owner, w.attempt, false, lease->writerEtag,
-						&storageNow, &current);
+		res = lease_cas(WRITER_KEY, &body, etag, w.token, w.owner, w.attempt,
+						false, etag, &storageNow, &current);
 		if (res == CAS_DONE)
 		{
+			if (storageNow >= 0)
+				clockOffset = storageNow - (int64) time(NULL);
+			LWLockAcquire(&lease->lock, LW_EXCLUSIVE);
+			lease->writerAttempt = attempt;
+			strlcpy(lease->writerEtag, etag, S3_ETAG_LEN);
 			lease->renewedAt = sentAt;
 			lease->deadline = TimestampTzPlusSeconds(sentAt,
 													 s3_lease_duration - LEASE_MARGIN_SECS);
-			if (storageNow >= 0)
-				lease->clockOffset = storageNow - (int64) time(NULL);
+			lease->clockOffset = clockOffset;
+			LWLockRelease(&lease->lock);
 			done = true;
 			break;
 		}
@@ -1366,7 +1441,7 @@ lease_renew(void)
 
 			/* an earlier renewal of ours: it moved the ETag (a restart) */
 			if (parse_writer(current.data, &cur))
-				lease->writerAttempt = Max(lease->writerAttempt, cur.attempt);
+				attempt = Max(attempt, cur.attempt);
 			continue;
 		}
 		if (res == CAS_LOST)
@@ -1374,14 +1449,20 @@ lease_renew(void)
 								   WRITER_KEY, current.data));
 		break;
 	}
+	if (!done)
+	{
+		/* the attempts spent are not sent again */
+		LWLockAcquire(&lease->lock, LW_EXCLUSIVE);
+		lease->writerAttempt = Max(lease->writerAttempt, attempt);
+		LWLockRelease(&lease->lock);
+	}
 	pfree(body.data);
 	pfree(current.data);
 	return done;
 }
 
 /*
- * Make sure the lease is ours for at least minSecs more; the lease lock is
- * held.
+ * Make sure the lease is ours for at least minSecs more; requestLock is held.
  */
 static void
 lease_ensure(int minSecs)
@@ -1390,11 +1471,11 @@ lease_ensure(int minSecs)
 	{
 		TimestampTz now = GetCurrentTimestamp();
 
-		if (now < TimestampTzPlusSeconds(lease->deadline, -minSecs))
+		if (now < TimestampTzPlusSeconds(lease_deadline(), -minSecs))
 			return;
 		if (lease_renew())
 			return;
-		if (GetCurrentTimestamp() >= lease->deadline)
+		if (GetCurrentTimestamp() >= lease_deadline())
 			s3_lease_lost("The store did not answer before the lease ran out.");
 		pg_usleep(1000000L);
 	}
@@ -1412,10 +1493,10 @@ s3_lease_hold(void)
 {
 	TimestampTz deadline;
 
-	LWLockAcquire(&lease->lock, LW_EXCLUSIVE);
+	LWLockAcquire(&lease->requestLock, LW_EXCLUSIVE);
 	lease_ensure(s3_lease_duration / 2);
-	deadline = lease->deadline;
-	LWLockRelease(&lease->lock);
+	deadline = lease_deadline();
+	LWLockRelease(&lease->requestLock);
 	return deadline;
 }
 
@@ -1429,15 +1510,21 @@ s3_root_commit(uint32 checkpointNum, XLogRecPtr redoLsn,
 	StringInfoData body,
 				current;
 	RootBody	r;
+	uint32		attempt;
+	char		etag[S3_ETAG_LEN];
 
 	initStringInfo(&body);
 	initStringInfo(&current);
 
-	LWLockAcquire(&lease->lock, LW_EXCLUSIVE);
+	LWLockAcquire(&lease->requestLock, LW_EXCLUSIVE);
+	LWLockAcquire(&lease->lock, LW_SHARED);
 	r = lease->root;
 	r.token = lease->token;
 	r.bucket = lease->bucket;
 	strlcpy(r.owner, lease->owner, OWNER_LEN);
+	attempt = lease->root.attempt;
+	strlcpy(etag, lease->rootEtag, S3_ETAG_LEN);
+	LWLockRelease(&lease->lock);
 	r.checkpoint = checkpointNum;
 	r.redoLsn = redoLsn;
 	r.checkpointLsn = checkpointLsn;
@@ -1453,11 +1540,13 @@ s3_root_commit(uint32 checkpointNum, XLogRecPtr redoLsn,
 		CasResult	res;
 
 		lease_ensure(s3_lease_duration / 2);
-		r.attempt = ++lease->root.attempt;
+		r.attempt = ++attempt;
+		/* the epoch table: the GC prunes it under the lock */
+		LWLockAcquire(&lease->lock, LW_SHARED);
 		render_root(&body, &r, lease);
-		res = lease_cas(ROOT_KEY, &body, lease->rootEtag, lease->token,
-						lease->owner, r.attempt, true, lease->rootEtag, NULL,
-						&current);
+		LWLockRelease(&lease->lock);
+		res = lease_cas(ROOT_KEY, &body, etag, r.token, r.owner, r.attempt,
+						true, etag, NULL, &current);
 		if (res == CAS_DONE)
 			break;
 		if (res == CAS_STALE)
@@ -1465,7 +1554,7 @@ s3_root_commit(uint32 checkpointNum, XLogRecPtr redoLsn,
 			RootBody	cur;
 
 			if (parse_root(current.data, &cur))
-				lease->root.attempt = Max(lease->root.attempt, cur.attempt);
+				attempt = Max(attempt, cur.attempt);
 			continue;
 		}
 		if (res == CAS_LOST)
@@ -1473,10 +1562,13 @@ s3_root_commit(uint32 checkpointNum, XLogRecPtr redoLsn,
 								   ROOT_KEY, current.data));
 		pg_usleep(1000000L);
 	}
+	LWLockAcquire(&lease->lock, LW_EXCLUSIVE);
 	lease->root = r;
+	strlcpy(lease->rootEtag, etag, S3_ETAG_LEN);
 	LWLockRelease(&lease->lock);
+	LWLockRelease(&lease->requestLock);
 
-	put_root_copy(checkpointNum, &body);
+	put_root_copy(r.token, checkpointNum, &body);
 
 	elog(DEBUG1, "S3 root now points at checkpoint %u", checkpointNum);
 	pfree(body.data);
@@ -1633,7 +1725,7 @@ s3_reader_pins_min(uint32 upper, uint32 floor)
 	else if (code != S3_RESPONSE_OK)
 		result = 0;				/* not known: collect nothing */
 	else
-		result = pins_min(body.data, storageNow >= 0 ? storageNow : (int64) time(NULL),
+		result = pins_min(body.data, store_clock_or_local(storageNow, READERS_KEY),
 						  upper, floor);
 	pfree(body.data);
 	return result;
@@ -1671,8 +1763,7 @@ reader_pin(const char *id, uint32 chkp)
 			continue;
 		}
 		exists = code == S3_RESPONSE_OK;
-		if (storageNow < 0)
-			storageNow = (int64) time(NULL);
+		storageNow = store_clock_or_local(storageNow, READERS_KEY);
 
 		for (line = exists ? body.data : ""; line && *line;)
 		{
@@ -1806,7 +1897,13 @@ register_s3_lease_worker(void)
 	BackgroundWorker worker;
 
 	memset(&worker, 0, sizeof(worker));
-	worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	/*
+	 * A system worker, as the S3 workers are: a regular one is stopped before
+	 * the shutdown checkpoint, which uploads and commits for as long as that
+	 * takes, and the lease ran out in it.  It gets its SIGTERM once the
+	 * checkpointer is gone, and the postmaster gives the lease back after it.
+	 */
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_CLASS_SYSTEM;
 	worker.bgw_start_time = BgWorkerStart_PostmasterStart;
 	worker.bgw_restart_time = 1;
 	strcpy(worker.bgw_library_name, "orioledb");
@@ -1848,21 +1945,25 @@ s3_lease_worker_main(Datum main_arg)
 
 	while (!ShutdownRequestPending)
 	{
-		TimestampTz now;
+		TimestampTz now,
+					renewedAt;
 
 		s3_take_config_reload();
 		now = GetCurrentTimestamp();
 
-		LWLockAcquire(&lease->lock, LW_EXCLUSIVE);
+		LWLockAcquire(&lease->requestLock, LW_EXCLUSIVE);
+		LWLockAcquire(&lease->lock, LW_SHARED);
+		renewedAt = lease->renewedAt;
+		LWLockRelease(&lease->lock);
 		if (!renewed ||
-			now >= TimestampTzPlusSeconds(lease->renewedAt, s3_lease_duration / 2))
+			now >= TimestampTzPlusSeconds(renewedAt, s3_lease_duration / 2))
 		{
 			if (lease_renew())
 				renewed = true;
-			else if (GetCurrentTimestamp() >= lease->deadline)
+			else if (GetCurrentTimestamp() >= lease_deadline())
 				s3_lease_lost("The store did not answer before the lease ran out.");
 		}
-		LWLockRelease(&lease->lock);
+		LWLockRelease(&lease->requestLock);
 		MemoryContextReset(cxt);
 
 		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,

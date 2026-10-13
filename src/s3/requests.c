@@ -1307,7 +1307,9 @@ s3_object_holds(char *objectname, Pointer data, uint64 dataSize)
  * content committed before.  A key holding other bytes is replaced only when
  * a writer we fenced off left it (a smaller token), or when it is our own
  * token's -- an attempt cut short before a crash restart, which keeps the
- * token.  An untagged object is not ours to remove.
+ * token -- and only under If-Match on the ETag the HEAD saw: a writer with a
+ * larger token may have written the key since, and its object is not ours to
+ * remove.  An untagged object is not ours to remove either.
  */
 long
 s3_put_object_fenced(char *objectname, Pointer data, uint64 dataSize,
@@ -1356,6 +1358,7 @@ fenced_put(char *objectname, Pointer data, uint64 dataSize,
 		long		http_code;
 		int			sc;
 		char	   *author = NULL;
+		char	   *etag = NULL;
 		uint64		authorToken = 0;
 
 		if (request_deadline_passed())
@@ -1380,10 +1383,16 @@ fenced_put(char *objectname, Pointer data, uint64 dataSize,
 									  sc, http_code, buf.data)));
 
 		http_code = s3_request("HEAD", objectname, NULL, 0, NULL, NULL, false,
-							   true, 0, &buf, NULL, NULL, &sc, NULL, &author);
+							   true, 0, &buf, &etag, NULL, &sc, NULL, &author);
 		if (http_code == S3_RESPONSE_NOT_FOUND ||
 			(sc != 0 && request_deadline_passed()))
+		{
+			if (etag)
+				pfree(etag);
+			if (author)
+				pfree(author);
 			continue;
+		}
 		if (sc != 0 || http_code != S3_RESPONSE_OK)
 			ereport(FATAL, (errcode(ERRCODE_CONNECTION_EXCEPTION),
 							errmsg("could not read object metadata from S3"),
@@ -1401,18 +1410,47 @@ fenced_put(char *objectname, Pointer data, uint64 dataSize,
 								   UINT64_FORMAT ".",
 								   objectname, authorToken, mine));
 		if (s3_object_holds(objectname, data, dataSize))
+		{
+			if (etag)
+				pfree(etag);
 			break;
+		}
 		if (authorToken == 0)
 			ereport(FATAL,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("S3 object \"%s\" holds other content and no writer token",
 							objectname),
 					 errdetail("An object no writer tagged is not replaced.")));
+		if (etag == NULL)
+			ereport(FATAL, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+							errmsg("could not read object metadata from S3"),
+							errdetail("The HEAD of object \"%s\" carries no ETag to "
+									  "replace it under.", objectname)));
 
+		/*
+		 * Replace it as the HEAD saw it.  A 412 (or a 404: it went meanwhile)
+		 * means the key changed under us -- a larger token's object, which
+		 * the next round reads and stops on, or the same writer's -- so it is
+		 * read again rather than put over.
+		 */
 		ereport(LOG,
 				(errmsg("replacing \"%s\" left by writer token " UINT64_FORMAT
 						" with other content", objectname, authorToken)));
-		s3_delete_object(objectname);
+		http_code = s3_request("PUT", objectname, data, dataSize, dataChecksum,
+							   etag, false, true, 0, &buf, NULL, NULL, &sc,
+							   token, NULL);
+		pfree(etag);
+		if (sc == 0 && http_code == S3_RESPONSE_OK)
+			break;
+		if (sc != 0 && request_deadline_passed())
+			continue;
+		if (sc != 0 || (http_code != S3_RESPONSE_CONDITION_FAILED &&
+						http_code != S3_RESPONSE_CONDITION_CONFLICT &&
+						http_code != S3_RESPONSE_NOT_FOUND))
+			ereport(FATAL, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+							errmsg("could not put object to S3"),
+							errdetail("return code = %d, http code = %ld, response = %s",
+									  sc, http_code, buf.data)));
 	}
 
 	pfree(buf.data);

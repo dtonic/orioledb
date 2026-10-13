@@ -89,6 +89,7 @@
 #define RESTORE_BUCKET_FILENAME	ORIOLEDB_DATA_DIR "/s3_restore_bucket"
 #define CHUNK_MAX_BYTES			(16 * 1024 * 1024)
 #define CHUNK_GC_INTERVAL_MS	10000
+#define TERMINATOR_ATTEMPTS		8
 
 bool		s3_wal_shipping = true;
 int			s3_wal_chunk_delay = 1;
@@ -700,6 +701,7 @@ s3_wal_place_terminator(uint64 token, bool loaded)
 	bool		crc_ok;
 	ControlFileData *cf;
 	StringInfoData retired;
+	uint64		misplaced = 0;	/* the previous attempt's terminator, see below */
 
 	cf = get_controlfile(DataDir, &crc_ok);
 	if (!crc_ok)
@@ -733,23 +735,88 @@ s3_wal_place_terminator(uint64 token, bool loaded)
 	header.magic = TERMINATOR_MAGIC;
 	header.timeline = tli;
 	header.token = token;
-	for (;; seq++)
+	for (int attempt = 0;; attempt++)
 	{
-		char	   *key = chunk_key(tli, seq);
-		long		code;
+		uint64		newest = 0;
+		bool		past = false;
+		char	   *prefix,
+				   *after;
+		List	   *keys;
+		ListCell   *lc;
 
-		/* taken: the fenced writer put one more meanwhile */
-		code = s3_put_object_conditional(key, (Pointer) &header, sizeof(header),
-										 NULL, true, NULL);
-		pfree(key);
-		if (code == S3_RESPONSE_OK)
+		for (;; seq++)
+		{
+			char	   *key = chunk_key(tli, seq);
+			long		code;
+
+			/* taken: the fenced writer put one more meanwhile */
+			code = s3_put_object_conditional(key, (Pointer) &header, sizeof(header),
+											 NULL, true, NULL);
+			pfree(key);
+			if (code == S3_RESPONSE_OK)
+				break;
+		}
+		{
+			char	   *mark = terminator_mark_key(tli, seq);
+
+			(void) s3_put_object_conditional(mark, "", 0, NULL, true, NULL);
+			pfree(mark);
+		}
+
+		/* the one the lagging listing had put short of the end (below) */
+		if (attempt > 0)
+		{
+			char	   *key = chunk_key(tli, misplaced);
+			char	   *mark = terminator_mark_key(tli, misplaced);
+
+			s3_delete_object(key);
+			s3_delete_object(mark);
+			pfree(key);
+			pfree(mark);
+		}
+
+		/*
+		 * The listing may lag the store's writes (RustFS): a chunk put before
+		 * it and not in it leaves the terminator short of the end, in a gap
+		 * the GC made, where it fences nothing and a restore takes it for the
+		 * end of the WAL.  List again from the terminator on: a chunk of a
+		 * smaller token past it says so.  The terminator goes again after the
+		 * newest, and the one in the gap is removed once the new one is up --
+		 * the fenced writer's shipper is past that key, which it never puts
+		 * again.  A listing that lags on and on is given up on.
+		 */
+		prefix = psprintf("wal/%08X/chunks/", tli);
+		after = chunk_key(tli, seq);
+		keys = s3_list_objects(prefix, after);
+		foreach(lc, keys)
+		{
+			uint64		listed = strtou64((char *) lfirst(lc) + strlen(prefix), NULL, 10);
+			ChunkHeader existing;
+
+			newest = Max(newest, listed);
+			if (!past && read_chunk_header(tli, listed, &existing) &&
+				existing.token < token)
+				past = true;
+		}
+		list_free_deep(keys);
+		pfree(prefix);
+		pfree(after);
+		if (!past)
 			break;
-	}
-	{
-		char	   *mark = terminator_mark_key(tli, seq);
-
-		(void) s3_put_object_conditional(mark, "", 0, NULL, true, NULL);
-		pfree(mark);
+		if (attempt >= TERMINATOR_ATTEMPTS)
+			ereport(FATAL,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("could not put a WAL terminator after the last chunk of timeline %u",
+							tli),
+					 errdetail("The bucket still lists a chunk of an earlier writer past "
+							   "the terminator at chunk %llu, after %d attempts.",
+							   (unsigned long long) seq, attempt + 1)));
+		ereport(LOG,
+				(errmsg("the listing lagged: put the WAL terminator again at chunk %llu "
+						"of timeline %u, past chunk %llu",
+						(unsigned long long) newest + 1, tli, (unsigned long long) seq)));
+		misplaced = seq;
+		seq = newest + 1;
 	}
 
 	/*
@@ -834,12 +901,56 @@ static void send_reply(WalReceiverConn *conn, XLogRecPtr flushed,
 
 static WalReceiverConn *replyConn = NULL;
 
-/* while a put waits to be retried: tell the walsender we are alive */
+/*
+ * Messages the walsender sent while a put was being retried, taken off the
+ * socket and kept for the loop in their order.  Left on the socket, they fill
+ * it, and a walsender told to die (a checkpoint invalidating its slot) hangs
+ * sending its last message, with the checkpointer waiting for it to release
+ * the slot and nothing reading.  Up to STASH_MAX_BYTES are kept; past that the
+ * socket holds the rest, as before (a store down for long under a load that
+ * does not wait for it).
+ */
+typedef struct
+{
+	int			len;
+	char	   *data;
+} StashedMessage;
+
+static List *stashed = NIL;
+static Size stashedBytes = 0;
+
+#define STASH_MAX_BYTES			(64 * 1024 * 1024)
+
+/*
+ * While a put waits to be retried: tell the walsender we are alive, and take
+ * what it sent.  A stream that ended ends the put too: the shipper starts
+ * again, judges its slot, and ships the chunk again from the hint.
+ */
 static void
 reply_while_waiting(void)
 {
-	if (replyConn)
-		send_reply(replyConn, pg_atomic_read_u64(&shipper->flushedLsn), false);
+	if (replyConn == NULL)
+		return;
+	send_reply(replyConn, pg_atomic_read_u64(&shipper->flushedLsn), false);
+	while (stashedBytes < STASH_MAX_BYTES)
+	{
+		char	   *buf;
+		pgsocket	fd;
+		int			len = walrcv_receive(replyConn, &buf, &fd);
+		StashedMessage *msg;
+
+		if (len == 0)
+			break;
+		if (len < 0)
+			ereport(ERROR,
+					(errmsg("WAL shipper stream ended while a put was retried")));
+		msg = palloc(sizeof(StashedMessage));
+		msg->len = len;
+		msg->data = palloc(len);
+		memcpy(msg->data, buf, len);
+		stashed = lappend(stashed, msg);
+		stashedBytes += len;
+	}
 }
 
 static void
@@ -896,10 +1007,11 @@ default_conninfo(void)
 
 /*
  * The physical slot that keeps the WAL the bucket does not have yet; created
- * on the first start.  Returns where it holds WAL from.
+ * on the first start.  Returns where it holds WAL from, and in *cause why it
+ * was invalidated (RS_INVAL_NONE: it was not).
  */
 static XLogRecPtr
-ensure_slot(void)
+ensure_slot(ReplicationSlotInvalidationCause *cause)
 {
 	ReplicationSlot *slot;
 	XLogRecPtr	restart;
@@ -927,6 +1039,7 @@ ensure_slot(void)
 
 	SpinLockAcquire(&slot->mutex);
 	restart = slot->data.restart_lsn;
+	*cause = slot->data.invalidated;
 	SpinLockRelease(&slot->mutex);
 	return restart;
 }
@@ -1233,6 +1346,7 @@ s3_wal_shipper_main(Datum main_arg)
 	TimestampTz lastReply = 0;
 	TimestampTz lastGc = 0;
 	bool		fenced = false;
+	ReplicationSlotInvalidationCause cause;
 
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
@@ -1248,7 +1362,21 @@ s3_wal_shipper_main(Datum main_arg)
 	if (WalReceiverFunctions == NULL)
 		elog(ERROR, "libpqwalreceiver didn't initialize correctly");
 
-	slotRestart = ensure_slot();
+	slotRestart = ensure_slot(&cause);
+
+	/*
+	 * The slot kept the WAL the bucket does not have yet.  Invalidated (a
+	 * checkpoint removed that WAL under max_slot_wal_keep_size), the stream
+	 * cannot start, and a shipper started again every second would only keep
+	 * the commits that wait for the bucket waiting: the instance stops, and
+	 * says why.
+	 */
+	if (cause != RS_INVAL_NONE)
+		s3_stop_instance("the WAL the S3 bucket needs is gone",
+						 psprintf("Replication slot \"%s\" was invalidated (%s): WAL "
+								  "the shipper had not put yet was removed.  Load the "
+								  "data directory from the bucket again.",
+								  SHIPPER_SLOT, GetSlotInvalidationCauseName(cause)));
 
 	conninfo = (s3_wal_conninfo && *s3_wal_conninfo) ?
 		s3_wal_conninfo : default_conninfo();
@@ -1428,11 +1556,11 @@ walk:
 			archived = s3_object_exists(key);
 			pfree(key);
 			if (!archived)
-				ereport(ERROR,
-						(errmsg("the WAL after %X/%08X that the bucket needs is gone",
-								LSN_FORMAT_ARGS(start)),
-						 errdetail("Segment %s is neither kept for the shipper nor archived.",
-								   name)));
+				s3_stop_instance("the WAL the S3 bucket needs is gone",
+								 psprintf("Segment %s, after %X/%08X, is neither kept for "
+										  "the shipper nor archived.  Load the data "
+										  "directory from the bucket again.",
+										  name, LSN_FORMAT_ARGS(start)));
 		}
 		ereport(LOG,
 				(errmsg("WAL of timeline %u from %X/%08X is archived, shipping from %X/%08X",
@@ -1482,11 +1610,22 @@ walk:
 		pgsocket	wait_fd = PGINVALID_SOCKET;
 		int			len;
 		bool		replyNow = false;
+		StashedMessage *taken = NULL;
 
 		CHECK_FOR_INTERRUPTS();
 		s3_take_config_reload();
 
-		len = walrcv_receive(conn, &buf, &wait_fd);
+		/* what came while a put was retried, before what comes now */
+		if (stashed != NIL)
+		{
+			taken = linitial(stashed);
+			stashed = list_delete_first(stashed);
+			stashedBytes -= taken->len;
+			buf = taken->data;
+			len = taken->len;
+		}
+		else
+			len = walrcv_receive(conn, &buf, &wait_fd);
 		if (len < 0)
 		{
 			ereport(LOG, (errmsg("WAL shipper stream ended")));
@@ -1529,6 +1668,11 @@ walk:
 				default:
 					ereport(ERROR,
 							(errmsg("WAL shipper received an unexpected message")));
+			}
+			if (taken)
+			{
+				pfree(taken->data);
+				pfree(taken);
 			}
 			/*
 			 * Take what else is ready into this chunk, but not for longer
@@ -1609,7 +1753,10 @@ walk:
  * with it, as the next chunks.  A partial segment is never put under the
  * archive's key: a restore takes an archived segment as complete, and would
  * read no chunk over it.  Returns false when the shipper never ran here, so
- * nothing says what the bucket has.
+ * nothing says what the bucket has.  Nothing here raises an ERROR: the
+ * checkpointer runs the shutdown checkpoint with ExitOnAnyError, so an ERROR
+ * was its exit(1), a crash to the postmaster, with no word of the cause.  What
+ * cannot be shipped stops the instance and says why.
  */
 bool
 s3_wal_ship_rest(TimeLineID tli)
@@ -1666,20 +1813,29 @@ s3_wal_ship_rest(TimeLineID tli)
 			n = Min(chunkEnd - pos, wal_segment_size - off);
 			fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
 			if (fd < 0)
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not open file \"%s\": %m", path)));
+				s3_stop_instance("could not ship the WAL a stop leaves to S3",
+								 psprintf("could not open file \"%s\": %m", path));
 			if (pg_pread(fd, buf + (pos - start), n, off) != (ssize_t) n)
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not read file \"%s\": %m", path)));
+				s3_stop_instance("could not ship the WAL a stop leaves to S3",
+								 psprintf("could not read file \"%s\": %m", path));
 			close(fd);
 			pos += n;
 		}
+
+		/*
+		 * The lease is still ours, as before every chunk the shipper puts: a
+		 * writer another took over from while it stopped (its lease worker
+		 * stuck, or the lease run out in a long checkpoint) stops here, with
+		 * the lease, rather than meet the new writer's terminator below.
+		 */
+		(void) s3_lease_hold();
 		if (!put_chunk(tli, nextSeq, start, chunkEnd, buf))
-			ereport(ERROR,
-					(errmsg("WAL chunk %llu of timeline %u belongs to another writer",
-							(unsigned long long) nextSeq, tli)));
+			s3_stop_instance("the S3 bucket has WAL past this data directory",
+							 psprintf("WAL chunk %llu of timeline %u belongs to another "
+									  "writer: the stop checkpoint cannot ship the WAL "
+									  "it leaves.  Load the data directory from the "
+									  "bucket again.",
+									  (unsigned long long) nextSeq, tli));
 		nextSeq++;
 		start = chunkEnd;
 		write_seq_file(tli, nextSeq, start, false);

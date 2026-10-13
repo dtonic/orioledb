@@ -13,8 +13,8 @@
 #ifndef __S3_LEASE_H__
 #define __S3_LEASE_H__
 
-/* the copy of root a checkpoint's commit leaves */
-#define ROOT_COPY_FORMAT	"roots/%u"
+/* the copy of root a checkpoint's commit leaves: its writer's token and K */
+#define ROOT_COPY_FORMAT	"roots/" UINT64_FORMAT "-%u"
 
 #include "access/xlogdefs.h"
 #include "datatype/timestamp.h"
