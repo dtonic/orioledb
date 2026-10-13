@@ -1033,7 +1033,17 @@ s3_header_unlock_part(S3HeaderTag tag, int index, bool setDirty, int stream)
 
 		Assert(S3_PART_GET_STATUS(value) == S3PartStatusLoaded);
 		Assert(S3_PART_GET_LOCKS_NUM(value) >= 0);
-		Assert(!setDirty || !(value & S3_PART_SEALED_FLAG));
+
+		/*
+		 * A sealed part is uploaded as it is and never changes: a write to
+		 * one would be lost to every load from the bucket, silently.  Stop
+		 * here, in every build.
+		 */
+		if (setDirty && (value & S3_PART_SEALED_FLAG))
+			elog(PANIC, "part " INT64_FORMAT " of tree %u/%u (segment %d, part %d) was written by stream %d after it was sealed, last checkpoint %u",
+				 (int64) tag.segNum * S3_PARTS_PER_SEGMENT + index,
+				 tag.key.oids.datoid, tag.key.oids.relnode, tag.segNum, index,
+				 stream, checkpoint_state->lastCheckpointNumber);
 
 		newValue -= S3_PART_LOCKS_ONE;
 		if (setDirty && !(value & S3_PART_LOCAL_FLAG))
