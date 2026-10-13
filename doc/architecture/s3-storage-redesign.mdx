@@ -145,7 +145,9 @@ shipper). 한 버킷에 writer 하나와 reader 여럿이 붙는다. writer 는 
   없으면 clock 을 건너뛴다. 바퀴마다 DEBUG1 로 `S3 eviction cycle: N files measured, N header loads, N parts evicted`
   를 남긴다. Guard: `test_s3_eviction_cycles_read_each_header_once`.
 - 파일의 마지막, 덜 찬 파트는 찬 비율의 확률로 내보낸다(빈 꼬리는 나중의 GET 값어치가 없다). 뽑기가 부호 있는 int32 를
-  unsigned 찬 바이트와 비교해 음수 뽑기(절반)가 늘 크게 읽혀, 찬 정도와 무관하게 절반이 건너뛰어졌다. 단계마다 다시 뽑는다.
+  unsigned 찬 바이트와 비교해 음수 뽑기(절반)가 늘 크게 읽혀, 찬 정도와 무관하게 절반이 건너뛰어졌다. 뽑기는 바퀴의 첫
+  단계에서 한 번이다(전에는 단계마다): 건너뛴 꼬리는 헤더를 읽지 않으므로 뒤 단계가 알 수 없고, 읽으면 뽑기가 아끼는 것을
+  도로 쓴다. 건너뛴 꼬리는 그 바퀴의 clock 이 사용 횟수를 반으로 줄이지도 않는다.
   Guard: `test_s3_a_part_full_last_part_is_evicted_by_its_fill`.
 - 봉인된 파트에 쓰기는 모든 빌드에서 PANIC 이다(`s3_header_unlock_part`): 트리·파트·흐름·마지막 체크포인트를 적는다.
   Assert 뿐이어서 릴리스 빌드는 버킷의 파트와 조용히 어긋났다.

@@ -1889,9 +1889,13 @@ eviction_callback(S3HeaderTag tag)
 		/*
 		 * A file's last, part-full part is evicted with the probability of
 		 * its fill: an emptier one frees less for the GET it costs later.
-		 * Every pass draws again.  (The draw was a signed int32 compared
-		 * with the fill as unsigned: a negative draw, half of them, counted
-		 * as above any fill, and the part was skipped whatever it held.)
+		 * The cycle's first pass draws for the cycle: a tail the draw passes
+		 * over is not read, so the later passes cannot know of it, and
+		 * reading it would cost what the draw saves (a tree of one small
+		 * part is one such file).  Every pass drew again before; the draw
+		 * was a signed int32 compared with the fill as unsigned, so a
+		 * negative draw, half of them, counted as above any fill and the
+		 * part was skipped whatever it held.
 		 */
 		if (i == numParts - 1 && dataSize < (uint64) numParts * (uint64) ORIOLEDB_S3_PART_SIZE)
 		{
@@ -1907,15 +1911,7 @@ eviction_callback(S3HeaderTag tag)
 
 			if (pg_prng_uint64_range(&random_state, 0,
 									 ORIOLEDB_S3_PART_SIZE - 1) > filled)
-			{
-				/* skipped this pass: the next passes draw again */
-				if (evictionColdLimit == 0)
-				{
-					coldNext = true;
-					clockCandidates++;
-				}
 				continue;
-			}
 		}
 
 		value = s3_header_read_value(tag, i);

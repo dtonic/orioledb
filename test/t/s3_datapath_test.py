@@ -468,23 +468,21 @@ class S3DatapathTest(S3BaseTest):
 		reloading each into the small header cache three times, and
 		stat()ed every file, once a second.  A file's size on disk is kept
 		between cycles, and the second cold pass and the clock sweep run
-		only over files the first pass found something for.
+		only over files the first pass found something for.  The trees
+		hold a full part each: a file whose only part is a small tail is
+		passed over by the fill draw before its header is read.
 		"""
 		node = self.node
 		self.conf('2MB', "log_min_messages = debug1")
 		node.start()
 		node.safe_psql("CREATE EXTENSION IF NOT EXISTS orioledb")
-		# in batches: one transaction over 1000 tables exhausts the pool
-		for batch in range(0, 1000, 50):
-			node.safe_psql("".join(
-			    f"CREATE TABLE t{i} (id int PRIMARY KEY) USING orioledb; "
-			    f"INSERT INTO t{i} VALUES (1); "
-			    for i in range(batch, batch + 50)))
+		for i in range(400):
+			self.incompressible_table(f"t{i}", 1100)
 		files = len([
 		    f for _, _, fs in os.walk(f"{node.data_dir}/orioledb_data")
 		    for f in fs if re.fullmatch(r"\d+(\.\d+)?", f)
 		])
-		self.assertGreater(files, 1000)
+		self.assertGreater(files, 400)
 		# nothing is sealed: cycles run and evict nothing
 		before = len(self.eviction_cycles())
 		deadline = time.time() + 60
@@ -505,9 +503,9 @@ class S3DatapathTest(S3BaseTest):
 	def test_s3_a_part_full_last_part_is_evicted_by_its_fill(self):
 		"""
 		A file's last, part-full part is evicted with the probability of
-		its fill (an empty tail frees little for a GET later); a pass that
-		skips it also leaves its usage count unhalved.  The draw was a
-		signed int32 compared with the fill as an unsigned number: a
+		its fill (an empty tail frees little for a GET later); a cycle
+		that skips it also leaves its usage count unhalved.  The draw was
+		a signed int32 compared with the fill as an unsigned number: a
 		negative draw counted as larger than any fill, so a part 88% full
 		was skipped 56% of the time instead of 12%.  Two hundred trees
 		whose one part is 88% full start at the same usage count; with
