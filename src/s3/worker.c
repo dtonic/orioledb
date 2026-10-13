@@ -1295,8 +1295,13 @@ s3worker_main(Datum main_arg)
 
 		/*
 		 * There might be task to process saved into shared memory.  If so,
-		 * pick and process it.
+		 * pick and process it.  The location is recorded before the pick
+		 * (s3_queue_try_pick_task), so one the pick did not take, or one
+		 * another worker erased since, is not a task of ours.
 		 */
+		if (workers_locations[worker_num] != InvalidS3TaskLocation &&
+			!s3_queue_task_is_live(workers_locations[worker_num]))
+			workers_locations[worker_num] = InvalidS3TaskLocation;
 		if (workers_locations[worker_num] != InvalidS3TaskLocation)
 		{
 			/*
@@ -1341,12 +1346,13 @@ s3worker_main(Datum main_arg)
 
 			/*
 			 * Task processing loop.  It might happen that error occurs and
-			 * worker restarts.  We save the task location to the shared
-			 * memory to be able to process it after restart.
+			 * worker restarts.  The task location is saved to shared memory
+			 * before the pick takes it, to be able to process it after a
+			 * restart: recorded after, a death in between left the task
+			 * picked by nobody, and the erased location never passed it.
 			 */
-			while ((taskLocation = s3_queue_try_pick_task()) != InvalidS3TaskLocation)
+			while ((taskLocation = s3_queue_try_pick_task(&workers_locations[worker_num])) != InvalidS3TaskLocation)
 			{
-				workers_locations[worker_num] = taskLocation;
 				s3process_task(taskLocation);
 				workers_locations[worker_num] = InvalidS3TaskLocation;
 			}
