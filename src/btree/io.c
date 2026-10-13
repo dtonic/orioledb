@@ -4239,6 +4239,23 @@ s3_keep_part_floor(OIndexKey key, uint64 inMemoryNext)
 	return floor;
 }
 
+/*
+ * The tree is gone for good, its floor with it.  Not for a tree emptied in
+ * place (cleanup_btree_extended's keepPartFloor): that one numbers on from
+ * the floor its cleanup left.
+ */
+void
+s3_drop_part_floor(OIndexKey key)
+{
+	char	   *filename = part_floor_filename(key);
+
+	if (unlink(filename) < 0 && errno != ENOENT)
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not remove file \"%s\": %m", filename)));
+	pfree(filename);
+}
+
 static void
 fsync_callback(const char *filename, uint32 segno, char *ext, void *arg)
 {

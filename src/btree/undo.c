@@ -1180,8 +1180,11 @@ check_pending_truncates(void)
 		{
 			cleanup_btree_files(trees[i], true);
 			if (orioledb_s3_mode)
+			{
+				s3_drop_part_floor(trees[i]);
 				s3_note_dropped_tree(trees[i].oids.datoid,
 									 trees[i].oids.relnode);
+			}
 		}
 	}
 

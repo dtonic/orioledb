@@ -1574,6 +1574,8 @@ cleanup_btree_extended(OIndexKey ix_key, bool files, bool fsync,
 		cleanup_btree_files(ix_key, fsync);
 	if (files && keepPartFloor && orioledb_s3_mode)
 		s3_write_empty_map(ix_key, next);
+	else if (files && orioledb_s3_mode)
+		s3_drop_part_floor(ix_key);
 }
 
 bool

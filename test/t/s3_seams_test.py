@@ -60,6 +60,19 @@ class S3SeamsTest(S3BaseTest):
 		return glob.glob(
 		    os.path.join(node.data_dir, 'orioledb_data', '*', 's3floor_*'))
 
+	def test_s3_dropped_tree_leaves_no_part_floor(self):
+		"""The floor file is for a tree that lives on under its relnode; a
+		dropped tree takes it along, at the checkpoint that removes the
+		tree's files."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		self.truncate_in_place(node)
+		node.safe_psql("DROP TABLE o_test;")
+		node.safe_psql("CHECKPOINT;")
+		self.assertEqual([], self.floor_files(node))
+		node.stop()
+
 	def test_s3_part_past_the_address_space_is_refused(self):
 		"""A part whose blocks would lie past the 48 bits a downlink holds
 		stops the server instead of being stored under another part's
