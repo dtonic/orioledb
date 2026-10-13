@@ -77,7 +77,7 @@ shipper). 한 버킷에 writer 하나와 reader 여럿이 붙는다. writer 는 
 | 키 | 내용 | 쓰는 쪽, 때, 조건 | 지우는 쪽 |
 | --- | --- | --- | --- |
 | `root` | `format`, `bucket`(무작위 64비트 ID), `token`, `attempt`, `owner`, `checkpoint`, `redo_lsn`, `checkpoint_lsn`, `control_id`, `epoch <첫 K> <T>` 줄들 | postmaster 가 시작 때, 체크포인터가 커밋 때. `If-Match`(처음은 `If-None-Match`) | 없음. `--repair-root` 가 복구 |
-| `roots/<K>` | K 를 커밋한 `root` 본문 사본 | 체크포인터, `root` CAS 직후. postmaster, 시작의 `root` CAS 직후(새 토큰과 epoch, 같은 K). 보통 PUT | GC, 매니페스트 K 와 함께 |
+| `roots/<T>-<K>` | 토큰 T 의 writer 가 K 를 커밋한(또는 K 에서 시작한) `root` 본문 사본 | 체크포인터, `root` CAS 직후. postmaster, 시작의 `root` CAS 직후(새 토큰과 epoch, 같은 K, 자기 토큰 아래). 보통 PUT | GC, 매니페스트 K 와 함께: K 의 토큰과 K 에서 시작한 실행들의 토큰(`s3_map_tokens`) 아래의 사본 |
 | `writer` | 리스: `bucket`, `token`, `attempt`, `owner`, `expires_at`(저장소 시계로 환산한 클라이언트의 추정) | postmaster 가 얻고, 리스 워커가 갱신(체크포인터, S3 워커, shipper 도 남은 시간이 짧으면 갱신), 정상 종료 때 `expires_at 0`. `If-Match`/`If-None-Match` | 없음 |
 | `gc` | `retain`, `folded`, `collected`, `pin_floor`, `pin_warn`, `token` | GC, 한 바퀴에 최대 세 번. 읽은 ETag 로 `If-Match` | 없음 |
 | `readers` | 핀 줄 `<id> <K> <expires_at>` | reader(첫 핀은 postmaster, 갱신은 리스 워커), loader(`loader-<hex>`). 읽은 ETag 로 조건부 교체, 만료된 줄은 그때 버림 | 없음 |
@@ -199,15 +199,24 @@ shipper). 한 버킷에 writer 하나와 reader 여럿이 붙는다. writer 는 
   `root.checkpoint` 보다 뒤처지지 않았는지) → `writer` 읽기 → `root.token` 이 로컬 토큰보다 크면 FATAL("another writer has
   committed …", 버킷에서 다시 받으라는 힌트) → 남의 토큰이 유효한 리스를 쥐면 FATAL → 내 토큰의 리스가 유효하면 만료까지
   기다리고, 그사이 갱신되면 FATAL(데이터 디렉터리 사본이 돌고 있다) → `writer` CAS → `s3_token` fsync → `s3_epochs` 에 새
-  epoch → `root` CAS → `roots/<K>` → 종결 객체(시작마다, *Failover*). loader 가 만든 디렉터리면 그 timeline 을 은퇴시키고
+  epoch → `root` CAS → `roots/<T>-<K>` → 종결 객체(시작마다, *Failover*). loader 가 만든 디렉터리면 그 timeline 을 은퇴시키고
   받은 뒤의 WAL 이 있는지 본다. `s3_loaded` 는 postmaster 가 종결 객체를 둔 뒤 지운다: 그 전에 죽은 시작은 다음 시작에서
   같은 판정을 다시 한다. 시작 단계의 읽기와 CAS 는 1초 간격 10회까지 시도한다.
 - **만료 시계**: `expires_at` 은 보낸 쪽이 저장소의 `Date` 응답 헤더로 잰 시계 차를 더해 적은 추정값이다. 판정은 읽는 쪽이
-  저장소의 `Date` 와 비교한다. 로컬 기한은 마지막 갱신을 보낸 시각 + 리스 길이 − 5초다.
+  저장소의 `Date` 와 비교한다. 로컬 기한은 마지막 갱신을 보낸 시각 + 리스 길이 − 5초다. `Date` 가 없거나 HTTP 날짜로
+  읽히지 않으면 writer 의 시작(리스 얻기, 자기 리스의 만료 대기)은 FATAL(`the S3 store sent no usable Date header`)
+  이다: 다른 인스턴스와 공유하지 않는 로컬 시계로 리스를 판정하지 않는다. reader 핀만 로컬 시계로 대신하고 WARNING 을
+  한 번 남긴다. Guard: `test_s3_start_refuses_a_store_with_no_usable_date`.
 - **갱신**: 리스 워커(`orioledb s3 lease`)가 `orioledb.s3_lease_duration`(기본 30초)의 절반마다 `If-Match` 로 갱신한다.
   뜨자마자 한 번 갱신해 리스가 아직 내 것인지 확인한다. 체크포인터는 `root` 커밋 전에, S3 워커는 세그먼트와 정지 때 WAL
   의 펜싱된 PUT 전에(파트는 아니다: 파트는 토큰 헤더와 `If-None-Match` 가 지킨다), shipper 는 history 와 **조각마다**, 남은
-  시간이 리스 길이의 절반 아래면 직접 갱신한다(`lease_ensure`, `s3_lease_hold`).
+  시간이 리스 길이의 절반 아래면 직접 갱신한다(`lease_ensure`, `s3_lease_hold`). 리스 워커는 S3 워커와 같은
+  `BGWORKER_CLASS_SYSTEM` 워커다: 보통 bgworker 는 정지 체크포인트 전에 내려가 그 체크포인트가 길면(파트·PG 파일 업로드,
+  남은 WAL) 리스가 그 안에서 만료되고 다른 인스턴스가 정지 도중 이어받을 수 있었다. 체크포인터가 끝난 뒤 SIGTERM 을
+  받고, postmaster 는 그 뒤에 리스를 돌려준다. Guard: `test_s3_stop_outlasting_the_lease_keeps_it`. 갱신과 `root` 커밋은
+  `requestLock` 아래에서만 돌아 한 번에 하나이고, 상태 잠금(`lock`)은 복사해 넣고 꺼낼 때만 쥔다: 요청이 도는 동안
+  `orioledb_s3_status()` 와 epoch 조회(S3 워커의 모든 키)는 저장소를 기다리지 않는다. Guard:
+  `test_s3_status_answers_while_the_store_stalls`.
 - **상실**: 리스가 남의 것이 되었거나 기한 안에 갱신하지 못하면 postmaster 에 SIGQUIT 를 보내 인스턴스 전체를 멈춘다
   (`s3_lease_lost`). 동기 대기 중인 백엔드가 "로컬에는 커밋됨" 으로 답하지 않게 하려는 것이다. 정상 종료는 리스를
   돌려주어 다음 시작이 기다리지 않는다.
@@ -253,13 +262,17 @@ shipper). 한 버킷에 writer 하나와 reader 여럿이 붙는다. writer 는 
 8. 매니페스트에 `redo`, `lsn`, `timeline`, `time` 을 더해 다시 올린다. pending 매니페스트가 K 의 것이 아니면(백업 도중 크래시
    뒤 복구 끝의 hook) 커밋하지 않는다.
 9. `root` 를 `If-Match` 로 교체한다. 그 전에 남은 리스가 리스 길이의 절반 아래면 갱신한다. 성공하면 K 가 커밋된 것이다.
-10. `roots/<K>` 에 같은 본문을 올리고, pending 을 `s3_manifest` 로 바꾸고, `s3_retired` 와 커밋된 재구축의 `.bend` 가운데
+10. `roots/<T>-<K>` 에 같은 본문을 올리고, pending 을 `s3_manifest` 로 바꾸고, `s3_retired` 와 커밋된 재구축의 `.bend` 가운데
     매니페스트 준비가 올린 길이(`.bend.up`)까지를 지운다. 그 뒤에 덧붙은 것은 다음 체크포인트의 몫으로 남는다. 제자리
     TRUNCATE 표지는 적은 체크포인트 번호가 K 보다 작은 것만 4단계에서 `.bgone` 에서 `.bend` 로 옮긴다.
 
 WAL 세그먼트 전환: shipper 가 켜져 있으면 체크포인트는 세그먼트를 바꾸지 않는다. 체크포인트 레코드는 조각으로
 올라간다(7단계). shipper 가 꺼져 있으면 세그먼트를 바꾸고 아카이브를 기다린다. 정지 체크포인트에서는 shipper 가 이미
-없으므로 못 보낸 WAL 을 다음 번호의 조각으로 올린다(`s3_wal_ship_rest`, 힌트가 없으면 아카이브 안 된 첫 세그먼트부터). 전송이
+없으므로 못 보낸 WAL 을 다음 번호의 조각으로 올린다(`s3_wal_ship_rest`, 힌트가 없으면 아카이브 안 된 첫 세그먼트부터). 조각마다
+shipper 처럼 리스를 확인하고(`s3_lease_hold`), 리스를 잃었거나 키가 남의 조각이거나 로컬 세그먼트를 읽을 수 없으면 ERROR 대신
+인스턴스를 멈춘다: 정지 체크포인트의 체크포인터는 `ExitOnAnyError` 로 돌아 ERROR 가 곧 exit(1) 이었고, postmaster 에는
+원인 없는 크래시였다. 리스를 먼저 보므로 이어받은 writer 의 종결 객체에 닿기 전에 리스 상실로 멈춘다. Guard:
+`test_s3_stop_ends_when_the_lease_is_lost_in_it`. 전송이
 꺼져 있으면(`orioledb.s3_wal_shipping = off`) 대신 아카이브 안 된 세그먼트를 올린다: WAL 끝 앞의 것은 `wal/<name>` 으로, WAL
 이 끝나는 세그먼트는 `wal/<name>.partial` 로, 그 뒤 재활용 세그먼트는 올리지 않는다. 부분 세그먼트를 아카이브 키에 두면
 복원이 그것을 완성된 세그먼트로 받아, 다음 실행이 전송을 켜고 그 세그먼트에 이어 보낸 조각을 읽지 않는다. Guard:
@@ -284,6 +297,14 @@ PG 파일·control·`root` 는 다음 체크포인트가 쓴다.
   않은 flush 로 keepalive 에 답한다(`wal_sender_timeout`).
 - **412**: 키가 차 있으면 조각 머리를 읽어 토큰·시작·끝이 내 것이면 성공, 아니면 ERROR 로 끝나고, 다시 뜬 shipper 가 시작
   검사에서 인스턴스를 멈춘다. 펜싱된 shipper 는 그 번호 뒤를 보고하지 않는다.
+- **슬롯 무효화**: `max_slot_wal_keep_size` 로 체크포인트가 슬롯이 붙잡던 WAL 을 지우면 슬롯은 무효화되고 walsender 는
+  끝난다. 다시 뜬 shipper 는 스트림을 열기 전에 슬롯의 `invalidated` 를 보고 인스턴스를 멈춘다(`the WAL the S3 bucket needs
+  is gone`, 원인 이름 포함). 슬롯 앞의 세그먼트가 아카이브되어 있지 않은 경우도 같다. 1초마다 다시 떠 실패를 되풀이하며
+  버킷을 기다리는 커밋을 LOG 한 줄 아래 영원히 세워 두지 않는다. 그 전에 체크포인터가 서지 않게, shipper 는 PUT 재시도를
+  기다리는 동안 walsender 가 보낸 메시지를 소켓에서 읽어 순서대로 쥐고 있다가(64 MiB 까지, `reply_while_waiting`) 뒤에
+  처리한다: 죽으라는 신호를 받은 walsender 는 마지막 메시지를 보내야 끝나는데, 아무도 읽지 않는 꽉 찬 소켓에서 영원히
+  기다리고 체크포인터는 그 슬롯이 풀리기를 영원히 기다렸다(`ReplicationSlotDrop`). 읽다가 스트림이 끝났으면 재시도도 ERROR 로
+  끝내고 다시 뜬 shipper 가 슬롯을 판정한다. Guard: `test_s3_invalidated_slot_stops_the_instance`.
 - **조각마다** 리스를 확인한다(`s3_lease_hold`). 리스를 넘겨 멈춰 있던 writer(멈춘 VM, 망 분리)는 다른 writer 가 이어받은
   뒤 조각을 올리기 전에 멈춘다. Guard: `test_s3_copy_and_a_paused_original_do_not_splice`.
 - **이어 보내기와 분기 검사**: 힌트 `s3_wal_seq` 에서 시작해 버킷에 이미 있는 조각을 지나간다. 지나가는 조각은 이 실행의
@@ -454,8 +475,8 @@ GC 는 writer 의 bgworker(`orioledb s3 gc`)로 `orioledb.s3_gc_interval`(기본
    트리는 지워진 트리로 적는다. 지워진 트리는 `trees/<db>/<rel>/` 를 목록으로 찾아 통째로 지운다: 마지막 map 을 읽지 못해도,
    어느 매니페스트도 이름하지 않는 map·파트(체크포인트 전에 죽은 실행이 올린 것)도 함께 간다. R' 다음부터 커밋된
    체크포인트까지 어느 매니페스트가 그 relnode 를 다시 이름하면 지우지 않는다(LOG "a tree has its relnode again"). WAL 은
-   R' 의 REDO 세그먼트 앞의 세그먼트와 `.partial`(모든 timeline), 조각(위)을 지운다. 그 뒤 매니페스트와 `roots/<k>` 를
-   지우고, epoch 를 줄이고, `collected = R'` 를 발표한다. Guard: `test_s3_gc_removes_old_checkpoints`,
+   R' 의 REDO 세그먼트 앞의 세그먼트와 `.partial`(모든 timeline), 조각(위)을 지운다. 그 뒤 매니페스트와 `roots/<T>-<k>`
+   (k 의 토큰과 k 에서 시작한 실행들의 토큰 아래, 그리고 토큰이 키에 들어가기 전의 `roots/<k>`)를 지우고, epoch 를 줄이고, `collected = R'` 를 발표한다. Guard: `test_s3_gc_removes_old_checkpoints`,
    `test_s3_gc_removes_a_dropped_tree`, `test_s3_gc_removes_every_object_of_a_dropped_tree`.
 4. **버려진 트리**: 두 매니페스트 사이에서 만들고 지운 트리, 롤백된 재구축은 어느 매니페스트에도 없다. 트리를 지우는
    쪽(`btree_relnode_undo_callback`, 보류된 truncate)이 `s3_note_dropped_tree` 로 로컬 `s3_dropped_trees` 에 적는다. 기록마다
@@ -516,7 +537,10 @@ writer 를 바꾸는 길은 둘이다.
 3. 새 토큰으로 `writer` 와 `root` 를 CAS 한다. 이 순간부터 옛 writer 의 `root`·`gc` CAS 와 펜싱된 PUT 은 실패한다.
 4. **종결 객체**: 버킷에서 가장 새 timeline(history 객체로 찾는다)의 조각을 나열해 마지막 조각 다음 번호에 `OWT1` 객체를
    `If-None-Match` 로 둔다. 차 있으면(옛 shipper 가 한 개 더 올림) 다음 번호로 간다. 자리를 `wal/<tli>/terminators/<seq>`
-   에 적는다. 이 인스턴스의 전송 설정과 무관하게, 모든 시작이 둔다: 제자리 재시작에서도 같은 데이터 디렉터리의 사본이 직전
+   에 적는다. 그 뒤 종결 객체 다음부터 다시 나열한다(`start-after`): 목록이 쓰기보다 늦는 저장소(RustFS)는 마지막 조각을
+   보이지 않아 종결 객체를 GC 가 비운 빈틈에 두었을 수 있고, 거기서는 아무것도 막지 못하며 복원은 그것을 WAL 의 끝으로 읽는다.
+   더 작은 토큰의 조각이 뒤에 있으면 가장 새 조각 다음에 다시 두고, 빈틈의 것은 표지와 함께 지운다(옛 shipper 는 그 번호를
+   지났다). 8회 뒤에도 그러면 FATAL. Guard: `test_s3_terminator_is_placed_again_after_a_lagging_listing`. 이 인스턴스의 전송 설정과 무관하게, 모든 시작이 둔다: 제자리 재시작에서도 같은 데이터 디렉터리의 사본이 직전
    실행의 토큰으로 돌 수 있다. loader 가 만든 디렉터리면 자리를 로컬 `s3_retired` 에도 적어 그 timeline 을 은퇴시키고, 버킷에
    받은 뒤의 WAL 이 있는데 `s3_restore_bucket` 이 없으면 FATAL. Guard: `test_s3_terminator_fences_the_old_writer`, `test_s3_terminator_goes_after_the_last_chunk`.
 5. 아카이브 복구가 버킷에서 종결 객체 앞까지 재생하고 새 timeline 을 연다. 그동안 클라이언트는 받지 않는다. 리스 워커는
@@ -535,8 +559,8 @@ writer 를 바꾸는 길은 둘이다.
 | 400 `BadDigest`, `IncompleteBody` | 본문이 오는 길에 잘린 것: 다시 보낸다 |
 | 그 밖의 4xx, 필요한 객체의 404 | 부른 프로세스의 FATAL(`could not put object to S3`, `could not get object from S3`) |
 | `root`·`writer` 의 PUT, `gc`·`readers` 의 GET, `readers` 의 PUT | 재시도 없는 한 번짜리(`s3_request_once`, 10초 상한). 판정은 모호한 결과 규칙과 호출자 각자의 재시도가 한다 |
-| 펜싱된 PUT(파트, 세그먼트, history, 정지 때 WAL) | `If-None-Match` + 토큰 헤더. 412·409 면 HEAD 로 저자 토큰을 읽어: 더 크면 리스 상실, 같은 바이트면 끝, 더 작거나 같은 토큰의 다른 바이트면 지우고 다시, 토큰 없는 다른 바이트면 FATAL. `s3_put_object_fenced_until` 은 `s3_lease_hold()` 의 기한까지만 보내고(요청 시간도 그 기한으로 자름) 넘으면 0 을 돌려주어 호출자가 리스를 갱신하고 다시 한다 |
-| 보통 PUT(map, 죽은 목록, 매니페스트, PG 파일, undo, 트리 상태, `roots/<K>`) | 키에 저자 토큰이나 체크포인트 번호가 들어가 다른 writer 와 겹치지 않는다. 같은 writer 가 다시 쓰는 일은 정당하다(재구축의 map 을 체크포인트가 다시 씀) |
+| 펜싱된 PUT(파트, 세그먼트, history, 정지 때 WAL) | `If-None-Match` + 토큰 헤더. 412·409 면 HEAD 로 저자 토큰을 읽어: 더 크면 리스 상실, 같은 바이트면 끝, 더 작거나 같은 토큰의 다른 바이트면 HEAD 가 본 ETag 로 `If-Match` PUT(412·404 면 처음부터 다시: 그사이 더 큰 토큰이 쓴 것을 지우지 않고 다음 바퀴가 그 토큰을 보고 멈춘다. Guard: `test_s3_fenced_put_leaves_a_newer_writers_object`), 토큰 없는 다른 바이트면 FATAL. `s3_put_object_fenced_until` 은 `s3_lease_hold()` 의 기한까지만 보내고(요청 시간도 그 기한으로 자름) 넘으면 0 을 돌려주어 호출자가 리스를 갱신하고 다시 한다 |
+| 보통 PUT(map, 죽은 목록, 매니페스트, PG 파일, undo, 트리 상태, `roots/<T>-<K>`) | 키에 저자 토큰이나 체크포인트 번호가 들어가 다른 writer 와 겹치지 않는다. 같은 writer 가 다시 쓰는 일은 정당하다(재구축의 map 을 체크포인트가 다시 씀) |
 | 응답이 사라진 PUT | 조각·파트·매니페스트·`root`·리스 모두 버킷의 내용으로 판정된다. Guard: `test_s3_puts_whose_answer_is_lost` |
 | 5 GB 넘는 파일 | `s3_put_file` 이 FATAL 로 거절한다(`S3_MAX_SINGLE_PUT`). multipart 는 없다. 큰 PG 파일은 다른 경로(`S3TaskTypeWritePGFile`)로 가며 이 검사가 없지만, 기본 `RELSEG_SIZE`(1 GB)에서는 닿지 않는다 |
 
@@ -558,7 +582,7 @@ Guard: `test_s3_terminator_goes_after_the_last_chunk_path_style`, `test_s3_http_
 | control 은 K, PG 파일 백업 끝 전 | 복구 끝 hook 은 K 의 pending 매니페스트가 없어 커밋하지 않음. 다음 체크포인트가 커밋 | K 의 죽은 목록은 `fold_unpublished` 가 접음. `data/<T>-<K>/` 는 `--sweep`. Guard: `test_s3_crash_while_pg_files_upload` |
 | 매니페스트는 올라갔고 `root` 교체 전 | 다음 체크포인트가 커밋 | K 의 매니페스트는 커밋되지 않았어도 R 아래로 가면 GC 가 접고 거둠 |
 | `root` 교체의 답을 잃음 | `root` 를 읽어 토큰·owner·attempt 로 판정 | 없음 |
-| `root` 교체 뒤 `roots/<K>` 전 | 없음 | `--repair-root` 는 그 앞 사본을 쓴다 |
+| `root` 교체 뒤 `roots/<T>-<K>` 전 | 없음 | `--repair-root` 는 그 앞 사본을 쓴다 |
 | 조각 PUT 전, 커밋 응답 전 | 로컬 복구가 그 커밋을 보이게 함. 클라이언트는 shipper 가 복구 끝까지 올릴 때까지 인증에서 기다림 | 없음. Guard: `test_s3_restart_waits_for_unshipped_wal` |
 | 조각 PUT 뒤, 응답 전 | 힌트 뒤의 내 조각을 지나 이어 감 | 버킷과 로컬이 같은 답. Guard: `test_s3_restart_then_crash_keeps_commits` |
 | 크래시 재초기화(postmaster 는 삶) | 새 토큰과 epoch, 종결 객체. 자기 리스는 기다리지 않고 넘겨받음 | 죽은 실행의 키와 겹치는 것이 없음. Guard: `test_s3_crash_restart_takes_a_new_token` |
@@ -609,7 +633,7 @@ Guard: `test_s3_terminator_goes_after_the_last_chunk_path_style`, `test_s3_http_
 
 | 객체 | 일어나는 일 | 할 일 |
 | --- | --- | --- |
-| `root` 를 읽을 수 없음 | 도는 writer 는 다음 `root` CAS 가 실패하고 읽어 본 본문이 파싱되지 않아 리스 상실로 멈춘다. 시작은 FATAL(`invalid "root" object`) | writer 를 멈추고 `orioledb_s3_loader.py --endpoint … --repair-root`, 다시 시작. 매니페스트가 있는 가장 새 `roots/<K>` 를 쓴다. 읽히는 `root` 는 건드리지 않는다. 사본이 마지막 커밋보다 오래되었어도 로컬이 앞선 것은 허용되고 다음 커밋이 앞으로 간다. Guard: `test_s3_a_damaged_root_is_put_back` |
+| `root` 를 읽을 수 없음 | 도는 writer 는 다음 `root` CAS 가 실패하고 읽어 본 본문이 파싱되지 않아 리스 상실로 멈춘다. 시작은 FATAL(`invalid "root" object`) | writer 를 멈추고 `orioledb_s3_loader.py --endpoint … --repair-root`, 다시 시작. 매니페스트가 있는 사본 가운데 토큰이 가장 큰(같으면 K 가 큰) `roots/<T>-<K>` 를 쓴다: 이어받은 writer 가 같은 K 에 둔 사본이 옛 writer 의 늦게 닿은 사본에 밀리지 않는다(같은 키였을 때는 덮였다. Guard: `test_s3_repair_root_takes_the_newest_writers_copy`). 읽히는 `root` 는 건드리지 않는다. 사본이 마지막 커밋보다 오래되었어도 로컬이 앞선 것은 허용되고 다음 커밋이 앞으로 간다. Guard: `test_s3_a_damaged_root_is_put_back` |
 | `gc` 가 없거나 필드가 깨짐 | 없는 필드는 0 으로 읽혀 다음 바퀴가 처음부터 다시 접고 거둔다. 멱등이라 안전하고 요청만 든다. 다음 발표까지 reader·loader 의 시작 검사(`retain`)는 0 과 비교된다. 읽기 자체가 실패하면 GC 는 그 바퀴를 건너뛴다 | 보통은 할 일이 없다. 다음 발표가 고친다 |
 | `readers` 가 깨지거나 지워짐 | 파싱되지 않는 줄은 핀이 아니다. GC 가 그 핀을 모른 채 reader 가 읽는 체크포인트를 거둘 수 있고, 그 reader 는 404 로 FATAL 이 된다. 도는 reader 는 TTL 의 3분의 1(기본 200초)마다 자기 줄을 다시 쓴다. 읽기가 실패하면(200·404 외) GC 는 아무것도 지우지 않는다 | 실행 중에 GC 만 멈추는 스위치는 없다(`s3_gc_interval` 은 postmaster 수준). writer 를 멈추고, reader 들이 핀을 다시 쓰게 둔(또는 객체를 되돌린) 뒤 writer 를 띄운다 |
 
@@ -629,10 +653,10 @@ Guard: `test_s3_terminator_goes_after_the_last_chunk_path_style`, `test_s3_http_
 | --- | --- | --- |
 | 커밋 묶음 | 조각 1 | 세그먼트가 아카이브되면 DELETE 1(shipper) |
 | 세그먼트(16 MiB WAL) | 세그먼트 1 | 조각 정리의 HEAD |
-| 체크포인트 | 더러운 트리마다 봉인 파트 ≥ 1, map 1, 죽은 목록 ≤ 1, 재구축 트리마다 `.build` 1; 바뀐 PG 파일, 작은 파일 묶음, 빈 디렉터리 객체, 체크섬 2, xid 2, control 2, undo 파일; 매니페스트 2, `root` 1, `roots/<K>` 1 | 모호한 답이면 GET |
+| 체크포인트 | 더러운 트리마다 봉인 파트 ≥ 1, map 1, 죽은 목록 ≤ 1, 재구축 트리마다 `.build` 1; 바뀐 PG 파일, 작은 파일 묶음, 빈 디렉터리 객체, 체크섬 2, xid 2, control 2, undo 파일; 매니페스트 2, `root` 1, `roots/<T>-<K>` 1 | 모호한 답이면 GET |
 | 리스 | 15초마다 `writer` 1 | |
 | GC 한 바퀴(60초) | `gc` 최대 3, 바뀐 트리 상태 | `gc`·`readers` GET, 접는 목록 GET, 지우는 객체마다 DELETE(없는 `.partial` 도), timeline 마다 조각 LIST, 지워진 트리마다 LIST |
-| 시작 | `writer` 1, `root` 1, `roots/<K>` 1, 종결 객체와 표지 2 | `root`·`writer` GET, 조각 LIST |
+| 시작 | `writer` 1, `root` 1, `roots/<T>-<K>` 1, 종결 객체와 표지 2 | `root`·`writer` GET, 조각 LIST(둔 뒤 한 번 더) |
 | reader | TTL/3 마다 `readers` 1 | 파트 GET(캐시에 없을 때), `restore_command` 의 LIST·GET |
 
 조각 PUT 이 객체 수의 거의 전부다. walker 부하(8연결 무작위 UPDATE, 약 1,400 tps)에서 조각 PUT 은 초당 약 330개였다.
@@ -728,6 +752,13 @@ RustFS, 같은 Docker 호스트, 릴리스 빌드. 100만 행 표에 8연결 무
   빌드에서 워커 종료). 다시 읽는다. 축출은 상한을 넘으면 사용 횟수가 없는 파트를 모두 쫓아내, 스캔 뒤 모든 파트의
   횟수가 함께 0 이 되는 바퀴에서 로컬이 상한의 몇 %까지 떨어졌다. 정렬한 디스크 downlink 는 길이 비트가 앞서 압축 트리에서
   파일 순서가 아니었다.
+- 2026-10-13 리스·제어 객체 검토에서 확인한 결함: 펜싱된 PUT 이 작은 토큰의 객체를 조건 없는 DELETE 로 지우다 그사이 큰
+  토큰이 쓴 것을 함께 지움(HEAD 의 ETag 로 `If-Match`), 리스 워커가 보통 bgworker 라 정지 체크포인트 전에 내려가 긴 정지
+  중 리스가 만료됨(`BGWORKER_CLASS_SYSTEM`), 정지 때 남은 WAL 을 올리는 길이 리스를 안 보고 남의 조각에서 ERROR(체크포인터의
+  exit) 로 끝남, 같은 K 의 `roots/<K>` 를 옛 writer 의 늦은 사본이 덮음(`roots/<T>-<K>`, `--repair-root` 는 토큰 우선), `Date` 없는
+  답을 로컬 시계로 대신함(writer 는 FATAL), 무효화된 슬롯에서 shipper 가 1초마다 다시 뜨며 동기 커밋이 멈춤(인스턴스 정지),
+  늦는 목록이 종결 객체를 빈틈에 두게 함(둔 뒤 다시 나열), 갱신과 커밋이 LWLock 을 쥔 채 저장소를 기다려
+  `orioledb_s3_status()` 와 epoch 조회가 서던 것(`requestLock`).
 
 ## Not done and open questions
 
