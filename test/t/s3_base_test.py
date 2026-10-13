@@ -278,6 +278,40 @@ class HoldFirstGet:
 		return orig_get_object(response)
 
 
+class HoldWrites:
+	"""
+	A MotoServerSSL.before_write hook: the first `count` writes (of
+	`methods`) whose request path matches `pattern` are held -- for
+	`seconds`, or until `release` is set -- before the store takes its write
+	lock, so every other write goes on meanwhile.  `entered` is set when the
+	first one is held.
+	"""
+
+	def __init__(self, pattern, count=1, seconds=None, methods=('PUT', )):
+		self.pattern = re.compile(pattern)
+		self.count = count
+		self.seconds = seconds
+		self.methods = methods
+		self.held = 0
+		self.lock = threading.Lock()
+		self.entered = threading.Event()
+		self.release = threading.Event()
+
+	def __call__(self, environ):
+		if environ.get('REQUEST_METHOD') not in self.methods or \
+		    not self.pattern.search(environ.get('PATH_INFO', '')):
+			return
+		with self.lock:
+			if self.held >= self.count:
+				return
+			self.held += 1
+		self.entered.set()
+		if self.seconds is not None:
+			time.sleep(self.seconds)
+		else:
+			self.release.wait(180)
+
+
 class FlakyPutObject:
 	"""
 	A put_object() that answers the first `failures` requests for a part
@@ -547,6 +581,9 @@ class MotoServerSSL:
 		self._server: Optional[BaseWSGIServer] = None
 		self._server_ready = False
 		self._ssl_context = ssl_context
+		# called with the WSGI environ of every write before the write lock
+		# is taken (a hold there does not hold the other writes)
+		self.before_write = None
 
 	def _server_entry(self) -> None:
 		backend = DomainDispatcherApplication(create_backend_app)
@@ -567,6 +604,9 @@ class MotoServerSSL:
 				else:
 					body = b''
 				environ['wsgi.input'] = io.BytesIO(body)
+				hook = self.before_write
+				if hook is not None:
+					hook(environ)
 				with puts:
 					return list(backend(environ, start_response))
 			return backend(environ, start_response)
