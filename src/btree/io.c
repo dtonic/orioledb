@@ -1269,6 +1269,39 @@ s3_alloc_extent(BTreeDescr *desc, BTreeMetaPage *metaPage, int stream,
 }
 
 /*
+ * S3 mode writes nothing over.  A page first written at this checkpoint goes
+ * to a new extent (less_num), and so does a compressed page that grew; one
+ * that shrank keeps the head of its extent.  What the page leaves behind is
+ * dead from this checkpoint on, and free_extent_for_checkpoint() records it
+ * for the GC.  Called before the extent is reallocated or cut.
+ */
+static void
+s3_free_replaced_extent(BTreeDescr *desc, FileExtent *extent, bool less_num,
+						size_t write_size, uint32 checkpoint_number)
+{
+	if (!FileExtentIsValid(*extent))
+		return;
+
+	if (less_num)
+		free_extent_for_checkpoint(desc, extent, checkpoint_number);
+	else if (OCompressIsValid(desc->compress))
+	{
+		uint16		old_len = extent->len,
+					new_len = FileExtentLen(write_size);
+
+		if (old_len < new_len)
+			free_extent_for_checkpoint(desc, extent, checkpoint_number);
+		else if (old_len > new_len)
+		{
+			FileExtent	tail = {.off = extent->off + new_len,
+			.len = old_len - new_len};
+
+			free_extent_for_checkpoint(desc, &tail, checkpoint_number);
+		}
+	}
+}
+
+/*
  * Fills free file extent for B-tree.
  *
  * FileExtentIsValid(extent) == false if fails.
@@ -2201,17 +2234,12 @@ perform_page_io(BTreeDescr *desc, OInMemoryBlkno blkno,
 	 */
 	chkp_index = checkpoint_number % 2;
 	if (orioledb_s3_mode)
+		s3_free_replaced_extent(desc, &page_desc->fileExtent, less_num,
+								write_size, checkpoint_number);
+	if (orioledb_s3_mode)
 	{
-		/*
-		 * Nothing is written over: a page goes to a new extent, and the one
-		 * it leaves dies at this checkpoint (free_extent_for_checkpoint()
-		 * records it for the GC).
-		 */
 		if (less_num)
 		{
-			if (FileExtentIsValid(page_desc->fileExtent))
-				free_extent_for_checkpoint(desc, &page_desc->fileExtent,
-										   checkpoint_number);
 			err = !get_free_disk_extent(desc, checkpoint_number, write_size, &page_desc->fileExtent);
 			*dirty_parent = true;
 		}
@@ -2229,17 +2257,11 @@ perform_page_io(BTreeDescr *desc, OInMemoryBlkno blkno,
 
 				if (old_len < new_len)
 				{
-					free_extent_for_checkpoint(desc, &page_desc->fileExtent,
-											   checkpoint_number);
 					err = !get_free_disk_extent(desc, checkpoint_number, write_size, &page_desc->fileExtent);
 					*dirty_parent = true;
 				}
 				else if (old_len > new_len)
 				{
-					FileExtent	tail = {.off = page_desc->fileExtent.off + new_len,
-					.len = old_len - new_len};
-
-					free_extent_for_checkpoint(desc, &tail, checkpoint_number);
 					page_desc->fileExtent.len = new_len;
 					*dirty_parent = true;
 				}
