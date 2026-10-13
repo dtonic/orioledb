@@ -474,16 +474,12 @@ class S3DatapathTest(S3BaseTest):
 		self.conf('2MB', "log_min_messages = debug1")
 		node.start()
 		node.safe_psql("CREATE EXTENSION IF NOT EXISTS orioledb")
-		node.safe_psql("""
-			DO $$
-			BEGIN
-				FOR i IN 1..1000 LOOP
-					EXECUTE format('CREATE TABLE t%s (id int PRIMARY KEY) '
-								   'USING orioledb', i);
-					EXECUTE format('INSERT INTO t%s VALUES (1)', i);
-				END LOOP;
-			END $$;
-		""")
+		# in batches: one transaction over 1000 tables exhausts the pool
+		for batch in range(0, 1000, 50):
+			node.safe_psql("".join(
+			    f"CREATE TABLE t{i} (id int PRIMARY KEY) USING orioledb; "
+			    f"INSERT INTO t{i} VALUES (1); "
+			    for i in range(batch, batch + 50)))
 		files = len([
 		    f for _, _, fs in os.walk(f"{node.data_dir}/orioledb_data")
 		    for f in fs if re.fullmatch(r"\d+(\.\d+)?", f)
@@ -509,14 +505,15 @@ class S3DatapathTest(S3BaseTest):
 	def test_s3_a_part_full_last_part_is_evicted_by_its_fill(self):
 		"""
 		A file's last, part-full part is evicted with the probability of
-		its fill (an empty tail frees little for a GET later).  The draw
-		was a signed int32 compared with the fill as an unsigned number:
-		a negative draw counted as larger than any fill, so half the time
-		the part was skipped whatever it held.  Two hundred trees whose
-		one part is 88% full, under a bound that needs all but a few gone:
-		the inserts left every part's usage count at its maximum, the
-		clock sweep halves them together for seven cycles, and the cycle
-		that finds them cold evicts 88% of them (44% with the bug).
+		its fill (an empty tail frees little for a GET later); a pass that
+		skips it also leaves its usage count unhalved.  The draw was a
+		signed int32 compared with the fill as an unsigned number: a
+		negative draw counted as larger than any fill, so a part 88% full
+		was skipped 56% of the time instead of 12%.  Two hundred trees
+		whose one part is 88% full start at the same usage count; with
+		the bug the clock sweep halves each of them in less than half of
+		its cycles, and most are not cold after twice the cycles the fix
+		needs to evict them all.
 		"""
 		node = self.node
 		self.conf('1000MB', "log_min_messages = debug1")
@@ -529,13 +526,14 @@ class S3DatapathTest(S3BaseTest):
 		node.safe_psql("ALTER SYSTEM SET orioledb.s3_desired_size = '4MB'")
 		node.reload()
 		deadline = time.time() + 120
-		while sum(c[2] for c in self.eviction_cycles()[before:]) < 150:
+		while sum(c[2] for c in self.eviction_cycles()[before:]) < 190:
 			self.assertLess(time.time(), deadline, "the parts were not evicted")
 			time.sleep(0.5)
 		cycles = [c[2] for c in self.eviction_cycles()[before:]]
-		self.assertGreaterEqual(
-		    max(cycles), 140,
-		    f"no cycle evicted most of the 200 part-full parts: {cycles}")
+		self.assertLessEqual(
+		    len(cycles), 15,
+		    f"evicting 190 of the 200 part-full parts took {len(cycles)} "
+		    f"cycles: {cycles}")
 		node.stop()
 
 	def test_s3_a_large_object_is_not_read_into_memory(self):
