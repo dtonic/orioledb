@@ -138,11 +138,30 @@ shipper). 한 버킷에 writer 하나와 reader 여럿이 붙는다. writer 는 
   사용 횟수가 남은 파트는 반으로 줄여 남기고, 없는 파트를 내보내며, 멈춘 파일(손)에서 다음 바퀴를 시작한다. 스캔이 지나간
   파트까지 함께 세면, 큰 테이블을 훑은 뒤 질의가 쓰던 파트가 먼저 나갔다(작은 테이블의 조회가 파트 15개를 다시 받음).
   Guards: `test_s3_scan_does_not_evict_what_queries_use`, `test_s3_eviction_keeps_the_desired_size`.
+- 한 바퀴가 파일마다 헤더를 세 번 읽고(차가운 두 단계와 clock) 파일마다 `stat()` 했다: 작은 트리 수천 개에서 아무것도
+  못 내보내는 바퀴가 초마다 헤더 캐시를 세 번 다시 채웠다. 파일의 디스크 크기는 바퀴 사이에 기억하고 16바퀴마다(또는
+  항목이 없을 때) 다시 재며 내보낸 만큼은 바로 뺀다(`occupied_callback`). 첫 차가운 단계가 두 번째 단계에 볼 파일(사용
+  횟수 1 인 내보낼 수 있는 파트가 있는 파일)과 clock 에 남은 것이 있는지를 적어 두어, 뒤 단계는 그 파일만 읽고 남은 것이
+  없으면 clock 을 건너뛴다. 바퀴마다 DEBUG1 로 `S3 eviction cycle: N files measured, N header loads, N parts evicted`
+  를 남긴다. Guard: `test_s3_eviction_cycles_read_each_header_once`.
+- 파일의 마지막, 덜 찬 파트는 찬 비율의 확률로 내보낸다(빈 꼬리는 나중의 GET 값어치가 없다). 뽑기가 부호 있는 int32 를
+  unsigned 찬 바이트와 비교해 음수 뽑기(절반)가 늘 크게 읽혀, 찬 정도와 무관하게 절반이 건너뛰어졌다. 단계마다 다시 뽑는다.
+  Guard: `test_s3_a_part_full_last_part_is_evicted_by_its_fill`.
+- 봉인된 파트에 쓰기는 모든 빌드에서 PANIC 이다(`s3_header_unlock_part`): 트리·파트·흐름·마지막 체크포인트를 적는다.
+  Assert 뿐이어서 릴리스 빌드는 버킷의 파트와 조용히 어긋났다.
 - 로컬에 없는 파트가 필요한 프로세스는 그 파트를 Loading 으로 표시하고 **직접 받는다**(`s3_header_load_part`). 큐에 넣으면
   앞에 들어온 작업(체크포인트 업로드, WAL 조각 GC 의 삭제)이 워커를 모두 쥔 동안 기다린다. 임계 구역 안, S3 워커, 저장소가
-  파트를 주지 않을 때(`s3_try_get_file_part` 가 false)는 예전처럼 표시한 채 큐에 넣고 워커가 받는다(워커는 실패하면 다시 뜨며
-  재시도한다). 직접 받다 ERROR·FATAL 로 끝나면 표시를 되돌린다(`s3_headers_error_cleanup`, `before_shmem_exit`).
+  파트를 주지 않을 때(`s3_try_get_file_part` 가 200 이 아닌 답)는 예전처럼 표시한 채 큐에 넣고 워커가 받는다. 직접 받다
+  ERROR·FATAL 로 끝나면 표시를 되돌린다(`s3_headers_error_cleanup`, `before_shmem_exit`). 표시는 claim 전에 적어 둔다:
+  claim 과 기록 사이에 죽으면 파트가 영원히 Loading 으로 남았다.
   Guard: `test_s3_part_read_does_not_wait_for_busy_workers`.
+- **버킷에 없는 파트(404)와 저장소가 끝내 거절한 파트(`s3_auth_retry_time` 뒤의 403)는 그 질의의 ERROR** 로, 객체 키를
+  이름한다. 워커에 넘기면 워커가 404 로 죽고 1초 뒤 다시 떠 같은 작업을 영원히 재생하는 동안 백엔드는 아무 메시지 없이
+  파트 상태를 기다렸다. 워커가 받는 claimed 파트(임계 구역, 그 밖의 4xx)를 저장소가 주지 않으면 워커는 파트를 Failed 로
+  표시하고(`s3_header_mark_part_failed`, WARNING) 다음 작업으로 간다; 기다리던 쪽은 Failed 를 보고 ERROR 를 내며 파트를
+  NotLoaded 로 되돌려 다음 읽기가 다시 시도한다. Failed 는 적재 수에서 NotLoaded 와 같다.
+  Guards: `test_s3_a_part_missing_from_the_bucket_is_an_error`, `test_s3_a_part_the_store_refuses_is_an_error`,
+  `test_s3_a_part_refused_past_the_retry_time_is_an_error`.
 - 다른 프로세스가 받는 중인 파트는 **그 파트의 상태**를 기다린다(`s3_header_wait_part_settled`, `partSettledCV`). 큐에
   작업을 넣으면 S3 워커 하나를 깨운다(`insertLocationCV`). 워커는 일이 없으면 `bgwriter_delay` 까지 잔다.
   Guards: `test_s3_part_read_does_not_wait_for_a_worker_poll`, `test_s3_part_read_waits_for_its_part_only`.
