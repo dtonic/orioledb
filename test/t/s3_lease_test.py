@@ -174,3 +174,26 @@ class S3LeaseTest(S3BaseTest):
 		finally:
 			self.kill_quietly(node)
 
+	def test_s3_status_answers_while_the_store_stalls(self):
+		"""The lease's renewal is a request to the store; while it waits,
+		orioledb_s3_status() reads the shared state without waiting for
+		it.  The state was locked across the request, and every reader of
+		it stood behind a stalled store."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("CREATE EXTENSION orioledb;")
+		hold = HoldWrites(r'/writer$', seconds=6)
+		self.s3_server.before_write = hold
+		try:
+			self.assertTrue(hold.entered.wait(30), "no renewal came")
+			started = time.time()
+			row = node.execute("SELECT token, lease_remaining FROM orioledb_s3_status()")
+			elapsed = time.time() - started
+			self.assertEqual(int(self.kv('writer')['token']), row[0][0])
+			self.assertLess(elapsed, 1.0)
+		finally:
+			self.s3_server.before_write = None
+		time.sleep(7)
+		self.assertNotIn('lost the S3 writer lease', self.log(node))
+		node.stop()
