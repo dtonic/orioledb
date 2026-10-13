@@ -40,6 +40,7 @@
 #include "recovery/recovery.h"
 #include "recovery/wal.h"
 #include "s3/checkpoint.h"
+#include "s3/commit.h"
 #include "s3/gc.h"
 #include "s3/lease.h"
 #include "s3/manifest.h"
@@ -2570,37 +2571,7 @@ o_after_checkpoint_cleanup_hook(XLogRecPtr checkPointRedo, int flags)
 	location = s3_schedule_file_write(chkpNum, CONTROL_FILENAME, false);
 	maxLocation = Max(maxLocation, location);
 	s3_queue_wait_for_location(maxLocation);
-
-	{
-		bool		crc_ok;
-		ControlFileData *cf = get_controlfile(DataDir, &crc_ok);
-
-		if (!crc_ok)
-			elog(ERROR, "pg_control checksum mismatch");
-
-		/*
-		 * Root names a checkpoint only with its manifest up: a checkpoint
-		 * whose PG file backup did not finish (a crash in it, then this hook
-		 * at the end of recovery) is not committed, the next one is.
-		 */
-		/*
-		 * Nor before its checkpoint record is in the bucket: a restore from
-		 * root starts by reading it.  A checkpoint the shipper cannot vouch
-		 * for (it stopped) is left for the next one.
-		 */
-		if (XLogInsertAllowed() && s3_wal_shipping &&
-			!s3_wal_shipper_wait(GetFlushRecPtr(NULL)))
-			ereport(LOG,
-					(errmsg("S3 checkpoint %u is not committed: the WAL shipper is not running",
-							chkpNum)));
-		else if (s3_manifest_publish(chkpNum, cf->checkPointCopy.redo, cf->checkPoint,
-									 cf->checkPointCopy.ThisTimeLineID))
-		{
-			s3_root_commit(chkpNum, cf->checkPointCopy.redo, cf->checkPoint);
-			s3_manifest_committed(chkpNum);
-		}
-		pfree(cf);
-	}
+	s3_checkpoint_commit(chkpNum);
 }
 
 

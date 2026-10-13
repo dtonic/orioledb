@@ -63,6 +63,7 @@ OBJS = src/btree/btree.o \
 	   src/rewind/rewind.o \
 	   src/s3/archive.o \
 	   src/s3/checkpoint.o \
+	   src/s3/commit.o \
 	   src/s3/control.o \
 	   src/s3/checksum.o \
 	   src/s3/compact.o \
