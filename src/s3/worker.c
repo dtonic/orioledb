@@ -288,7 +288,7 @@ flush_worker_checksum_state(void)
  * by that name for as long as any checkpoint refers to it.  A map is the
  * tree's state at one checkpoint.
  */
-static char *
+char *
 s3_part_object_name(OIndexKey key, int64 partNum)
 {
 	return psprintf("trees/%u/%u/parts/" INT64_FORMAT,
@@ -414,6 +414,7 @@ s3process_task(uint64 taskLocation)
 		int64		partNum = task->typeSpecific.filePart.partNum;
 		int32		segNum = partNum / S3_PARTS_PER_SEGMENT,
 					index = partNum % S3_PARTS_PER_SEGMENT;
+		long		code;
 
 		tag.key = task->typeSpecific.filePart.key;
 		tag.segNum = segNum;
@@ -438,17 +439,38 @@ s3process_task(uint64 taskLocation)
 
 		elog(DEBUG1, "S3 part get %s %s", objectname, filename);
 
-		if (task->typeSpecific.filePart.claimed)
-			s3_get_file_part(objectname, filename, index);
-		else if (!s3_try_get_file_part(objectname, filename, index))
+		code = s3_try_get_file_part(objectname, filename, index,
+									!task->typeSpecific.filePart.claimed);
+		if (code != S3_RESPONSE_OK)
 		{
-			/*
-			 * A hint for a part the store does not have (a read ahead past
-			 * the tree's last part): give it back rather than end the worker.
-			 * A part a query needs is downloaded by the process that needs
-			 * it, which reports a part that is missing.
-			 */
-			s3_header_release_part_load(tag, index);
+			if (task->typeSpecific.filePart.claimed)
+			{
+				/*
+				 * A part somebody waits for that the store did not give
+				 * (not there, or refused for good: a transient failure is
+				 * retried inside the request).  Dying on it replayed the
+				 * task for ever, a restart a second, while the waiters
+				 * waited with no message.  The part is marked failed: the
+				 * waiter reports it and gives it back for the next try.
+				 */
+				ereport(WARNING,
+						(errmsg("could not get S3 object \"%s\" for part " INT64_FORMAT " of tree %u/%u",
+								objectname, partNum,
+								tag.key.oids.datoid, tag.key.oids.relnode),
+						 errdetail("http code = %ld", code)));
+				s3_header_mark_part_failed(tag, index);
+			}
+			else
+			{
+				/*
+				 * A hint for a part the store does not have (a read ahead
+				 * past the tree's last part) or refuses: give it back
+				 * rather than end the worker.  A part a query needs is
+				 * downloaded by the process that needs it, which reports a
+				 * part that is missing.
+				 */
+				s3_header_release_part_load(tag, index);
+			}
 			pfree(filename);
 			pfree(objectname);
 			goto part_done;
@@ -920,10 +942,11 @@ s3_schedule_file_part_read(uint32 chkpNum, OIndexKey key, int64 partNum,
 	if (partNum >= 0 && !claim)
 	{
 		S3HeaderTag tag = {.key = key,.segNum = partNum / S3_PARTS_PER_SEGMENT};
+		S3PartStatus status;
 
 		/* a hint: the worker claims the part when it gets to the task */
-		if (s3_header_part_status(tag, partNum % S3_PARTS_PER_SEGMENT) !=
-			S3PartStatusNotLoaded)
+		status = s3_header_part_status(tag, partNum % S3_PARTS_PER_SEGMENT);
+		if (status != S3PartStatusNotLoaded && status != S3PartStatusFailed)
 			return 0;
 	}
 	else if (partNum >= 0)
@@ -1203,22 +1226,23 @@ s3_schedule_part_read_ahead(OIndexKey key, int64 partNum)
 }
 
 /*
- * Download a part the caller marked loading, in the calling process: false
- * when the store did not give it (the caller then leaves it to the workers).
+ * Download a part the caller marked loading, in the calling process: the HTTP
+ * status, S3_RESPONSE_OK when the part is here (the caller judges the rest:
+ * a part that is not in the bucket, one refused, or one left to the workers).
  */
-bool
+long
 s3_load_file_part_here(OIndexKey key, int32 segNum, int32 partNum)
 {
 	int64		part = (int64) segNum * S3_PARTS_PER_SEGMENT + partNum;
 	char	   *filename = btree_filename(key, segNum, 0);
 	char	   *objectname = s3_part_object_name(key, part);
-	bool		loaded;
+	long		code;
 
 	elog(DEBUG1, "S3 part get here %s %s", objectname, filename);
-	loaded = s3_try_get_file_part(objectname, filename, partNum);
+	code = s3_try_get_file_part(objectname, filename, partNum, false);
 	pfree(objectname);
 	pfree(filename);
-	return loaded;
+	return code;
 }
 
 void

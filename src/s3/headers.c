@@ -22,6 +22,7 @@
 #include "btree/io.h"
 #include "checkpoint/checkpoint.h"
 #include "s3/headers.h"
+#include "s3/requests.h"
 #include "s3/worker.h"
 
 #include "catalog/pg_tablespace.h"
@@ -653,26 +654,72 @@ s3_header_release_part_load(S3HeaderTag tag, int index)
  * after a start (SNB SF1, local data evicted).  Inside a critical section, in
  * an S3 worker, or when the store does not give the part, the S3 workers
  * download it, and the caller waits for its status.
+ *
+ * A part the bucket does not hold (404), or one the store refuses for good
+ * (403 past orioledb.s3_auth_retry_time), is the query's error, naming the
+ * object: handed to the workers, it was replayed for ever by a worker dying
+ * on it, a restart a second, while the query waited for the part's status
+ * with no message.
  */
 static void
 s3_header_load_part(S3HeaderTag tag, int index)
 {
-	if (CritSectionCount == 0 && !s3_worker_process &&
-		s3_header_mark_part_loading(tag, index) == S3PartStatusNotLoaded)
+	if (CritSectionCount == 0 && !s3_worker_process)
 	{
-		bool		loaded;
+		uint32		value = s3_header_read_value(tag, index);
 
+		if (S3_PART_GET_STATUS(value) == S3PartStatusEvicting)
+			value = s3_header_wait_part_settled(tag, index, true);
+
+		/*
+		 * The part is recorded as this process's download before it is
+		 * claimed, so a claim it does not live to see through is given back
+		 * (s3_headers_error_cleanup releases a recorded part that is
+		 * Loading); recorded after the claim, a death in between left the
+		 * part Loading for good.
+		 */
 		curLoadingTag = tag;
 		curLoadingIndex = index;
-		loaded = s3_load_file_part_here(tag.key, tag.segNum, index);
+		while (S3_PART_GET_STATUS(value) == S3PartStatusNotLoaded ||
+			   S3_PART_GET_STATUS(value) == S3PartStatusFailed)
+		{
+			uint32		newValue = S3_PART_SET_STATUS(value, S3PartStatusLoading);
+
+			if (s3_header_compare_and_swap(tag, index, &value, newValue))
+			{
+				int64		part = (int64) tag.segNum * S3_PARTS_PER_SEGMENT + index;
+				long		code;
+
+				pg_atomic_fetch_add_u64(&meta->numberOfLoadedParts, 1);
+				code = s3_load_file_part_here(tag.key, tag.segNum, index);
+				if (code == S3_RESPONSE_OK)
+					s3_header_mark_part_loaded(tag, index);
+				else
+					s3_header_release_part_load(tag, index);
+				curLoadingTag.key.oids.datoid = InvalidOid;
+				curLoadingTag.key.oids.relnode = InvalidOid;
+				if (code == S3_RESPONSE_OK)
+					return;
+				if (code == S3_RESPONSE_NOT_FOUND)
+					ereport(ERROR,
+							(errcode(ERRCODE_CONNECTION_EXCEPTION),
+							 errmsg("part " INT64_FORMAT " of tree %u/%u is not in the S3 bucket",
+									part, tag.key.oids.datoid, tag.key.oids.relnode),
+							 errdetail("Object \"%s\" does not exist.",
+									   s3_part_object_name(tag.key, part))));
+				if (code == 403)
+					ereport(ERROR,
+							(errcode(ERRCODE_CONNECTION_EXCEPTION),
+							 errmsg("the S3 store refused part " INT64_FORMAT " of tree %u/%u",
+									part, tag.key.oids.datoid, tag.key.oids.relnode),
+							 errdetail("Object \"%s\", http code 403, past orioledb.s3_auth_retry_time.",
+									   s3_part_object_name(tag.key, part))));
+				/* any other answer: the S3 workers' turn */
+				break;
+			}
+		}
 		curLoadingTag.key.oids.datoid = InvalidOid;
 		curLoadingTag.key.oids.relnode = InvalidOid;
-		if (loaded)
-		{
-			s3_header_mark_part_loaded(tag, index);
-			return;
-		}
-		s3_header_release_part_load(tag, index);
 	}
 	s3_load_file_part(tag.key, tag.segNum, index);
 }
@@ -794,6 +841,25 @@ s3_header_lock_part(S3HeaderTag tag, int index, uint32 *loadId)
 			value = s3_header_wait_part_settled(tag, index, true);
 			continue;
 		}
+		else if (status == S3PartStatusFailed)
+		{
+			int64		part = (int64) tag.segNum * S3_PARTS_PER_SEGMENT + index;
+
+			/*
+			 * An S3 worker could not download it (s3_header_mark_part_failed).
+			 * The part goes back to NotLoaded, for the next reader to try the
+			 * store again, and this one reports it.
+			 */
+			newValue = S3_PART_SET_STATUS(value, S3PartStatusNotLoaded);
+			if (s3_header_compare_and_swap(tag, index, &value, newValue))
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_EXCEPTION),
+						 errmsg("could not read part " INT64_FORMAT " of tree %u/%u from the S3 bucket",
+								part, tag.key.oids.datoid, tag.key.oids.relnode),
+						 errdetail("An S3 worker could not get object \"%s\"; its log says why.",
+								   s3_part_object_name(tag.key, part))));
+			continue;
+		}
 		else
 		{
 			Assert(status == S3PartStatusLoaded);
@@ -834,6 +900,9 @@ s3_header_mark_part_loading(S3HeaderTag tag, int index)
 		S3PartStatus status;
 
 		status = S3_PART_GET_STATUS(value);
+		/* nothing is here after a failed download, as for NotLoaded */
+		if (status == S3PartStatusFailed)
+			status = S3PartStatusNotLoaded;
 
 		if (status == S3PartStatusLoaded ||
 			status == S3PartStatusLoading)
@@ -908,6 +977,37 @@ s3_header_mark_part_loaded(S3HeaderTag tag, int index)
 
 		if (s3_header_compare_and_swap(tag, index, &value, newValue))
 		{
+			ConditionVariableBroadcast(&meta->partSettledCV);
+			return;
+		}
+	}
+}
+
+/*
+ * An S3 worker could not download a part it was to load: the bucket does not
+ * hold it, or the store refused it for good.  Marked failed, the part counts
+ * as not loaded, whoever waits for it reports it instead of waiting on
+ * (s3_header_lock_part), and the next reader tries the store again.  Only a
+ * part still Loading is marked: one a waiter already reported was given back.
+ */
+void
+s3_header_mark_part_failed(S3HeaderTag tag, int index)
+{
+	uint32		value;
+
+	value = s3_header_read_value(tag, index);
+
+	while (true)
+	{
+		uint32		newValue;
+
+		if (S3_PART_GET_STATUS(value) != S3PartStatusLoading)
+			return;
+		newValue = S3_PART_SET_STATUS(value, S3PartStatusFailed);
+
+		if (s3_header_compare_and_swap(tag, index, &value, newValue))
+		{
+			pg_atomic_fetch_sub_u64(&meta->numberOfLoadedParts, 1);
 			ConditionVariableBroadcast(&meta->partSettledCV);
 			return;
 		}
@@ -995,7 +1095,7 @@ s3_header_open_part(S3HeaderTag tag, int index, int stream, bool localOnly)
 			bool		wasUnsealed = (value & S3_PART_DIRTY_FLAG) &&
 				!(value & (S3_PART_SEALED_FLAG | S3_PART_LOCAL_FLAG));
 
-			if (status == S3PartStatusNotLoaded)
+			if (status == S3PartStatusNotLoaded || status == S3PartStatusFailed)
 				pg_atomic_fetch_add_u64(&meta->numberOfLoadedParts, 1);
 			if (!localOnly && !wasUnsealed)
 				pg_atomic_fetch_add_u64(&meta->numberOfUnsealedParts, 1);
@@ -1412,6 +1512,7 @@ initial_parts_counting_callback(S3HeaderTag tag)
 		if (status == S3PartStatusNotLoaded ||
 			status == S3PartStatusLoading ||
 			status == S3PartStatusEvicting ||
+			status == S3PartStatusFailed ||
 			(values[i] & S3_PART_LOCAL_FLAG))
 		{
 
