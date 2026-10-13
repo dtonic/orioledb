@@ -12,8 +12,9 @@ shipper). 한 버킷에 writer 하나와 reader 여럿이 붙는다. writer 는 
 
 이 문서는 작업 트리의 구현을 적는다. 결정의 근거와 측정값은 남기고, 단계별 경과는 *History* 에 한 줄씩만 둔다. 바뀐
 곳은 저장 계층(`src/s3/`), 엔진의 S3 접점(`btree/io.c`, `checkpoint/checkpoint.c`, `btree/merge.c`, `btree/undo.c`,
-`tableam/descr.c`, `transam/oxid.c`), `orioledb_s3_loader.py` 다. `orioledb.s3_mode` 는 지금도 개발 빌드(`IS_DEV`)에서만
-켜진다.
+`tableam/descr.c`, `transam/oxid.c`), `orioledb_s3_loader.py` 다(*Engine touch points*). `orioledb.s3_mode` 는 이
+포크의 모든 빌드에서 켜진다: upstream 은 개발 빌드(`IS_DEV`)에서만 허용하고, 포크는 그 문(`orioledb_enable_s3_check_hook`)을
+열어 두었다. 도커 이미지는 `IS_DEV` 없이 빌드하므로 시험용 SQL 함수(`sql/*_dev.sql`)는 들어 있지 않다.
 
 ## Goals
 
@@ -386,6 +387,76 @@ xidrange 파일: 체크포인트 K 의 `[xmin, xmax)` xidmap 항목(항목당 cs
 `(UINT64_MAX, 1, xmin, xmax)` 뒤에 항목마다 앞 항목과의 차이를 zigzag varint 로 적은 것이다(`write_xidmap_range_file`,
 loader 의 `decode_xidmap_items`). 머리가 `UINT64_MAX` 로 시작하지 않으면 예전 형식(그대로의 항목)이다. Guard:
 `test_s3_load_sees_commits_behind_a_long_transaction`.
+
+## Engine touch points
+
+upstream 을 병합하는 사람을 위한 지도다. `git diff e4a7b327..HEAD --stat`(test/ 제외)에 나오는 upstream 파일마다, S3 재설계가
+닿는 함수와 그 훅이 하는 일을 적는다. 저장 계층 자체(`src/s3/`, `include/s3/`)는 포크가 더한 파일이 대부분이고 upstream 과
+충돌하지 않으므로 여기 적지 않는다. 포크의 다른 수정(S3 가 아닌 것)은 따로 모아 둔다.
+
+| 파일 | 닿는 함수 | 훅이 하는 일 |
+| --- | --- | --- |
+| `src/btree/io.c` | `btree_filename`, `btree_open_smgr_file`, `btree_init_smgr`, `btree_open_smgr`, `btree_close_smgr` | `if (orioledb_s3_mode)` 가지에서 한 줄로 `s3_smgr_*` 를 부른다. 파트는 로컬 모드와 같은 세그먼트 파일의 조각이므로 S3 smgr 는 배열 smgr 의 사본이다(`s3_smgr_open_file` 등, upstream 의 `else` 가지는 그대로). 체크포인트 번호 파일(`<rel>-<chkp>`)과 `s3Files_hash` 는 없다 |
+| | `btree_smgr_write`, `btree_smgr_read`, `btree_smgr_writeback`, `btree_smgr_sync`, `btree_smgr_punch_hole` | 파트 잠금 `s3_header_lock_part`/`unlock_part(…, stream)` 에 흐름(`chkpNum % 2`)을 넘긴다. `btree_s3_flush` 와 dirtyParts 예약은 없다(봉인은 `checkpoint_ix` 가 한다) |
+| | `s3_alloc_extent`, `get_free_disk_extent`, `perform_page_io_build` | 두 흐름의 파트 할당(*Address space and allocation*): 열린 파트에 덧붙이거나 새 파트를 연다. 48비트 주소 상한을 넘는 파트는 PANIC. 재구축은 자기 메타 페이지에 흐름 0 으로 쓴다 |
+| | `perform_page_io` | `s3_free_replaced_extent` 한 줄: 페이지가 떠나는 extent(또는 줄어든 꼬리)를 `free_extent_for_checkpoint` 로 죽은 것으로 적는다. upstream 의 S3 블록은 그대로 |
+| | `read_page_from_disk`, `write_page_to_disk`, `writeback_put_extent`, `perform_page_io_autonomous` | 오프셋에 체크포인트 비트가 없다(`S3_GET_CHKP_NUM`/`S3_OFFSET_MASK` 삭제). 쓰기는 `curChkpNum` 을 흐름으로 넘긴다 |
+| | `load_page` | 내부 페이지의 자식 미리 받기를 범위 스캔(`s3_headers_in_range_step`)으로 한정 |
+| | `evict_btree` | 축출 데이터에 `S3TreeCursors`(두 흐름의 커서와 `sealFrom`)와 죽은 extent 목록(`nextChkp[i]`)의 끝을 남긴다 |
+| | `btree_s3_seal_stream`, `btree_s3_seal_build`, `s3_seal_parts`, `s3_upload_sealed`, `s3_record_part_end`, `s3_build_note_part_end` | 포크 함수: 흐름의 파트 봉인과 업로드 예약, 파트 끝 기록(GC 용) |
+| | `iterate_relnode_files`, `cleanup_btree_files`, `s3_part_floor`, `s3_keep_part_floor`, `s3_drop_part_floor`, `s3_bucket_next_part` | 파트 번호 바닥 파일 `s3floor_<rel>`(제자리 TRUNCATE 가 남기고 DROP 이 지움), 버킷의 다음 파트 번호. 첫 세그먼트 파일(`<rel>`)도 S3 모드에서 지운다 |
+| `src/checkpoint/checkpoint.c` | `o_perform_checkpoint_guts` | `S3_WRITER_MODE` 에서 `s3_manifest_begin`, 파트·map·undo 업로드 대기 `s3_queue_wait_for_location`, 죽은 extent 목록을 쓰는 트리만 seq buf 를 둠(`s3_tree_records_dead`) |
+| | `checkpoint_ix`, `checkpoint_btree_loop`, `checkpoint_tables_callback` | 트리 동기화 뒤 `btree_s3_seal_stream`(흐름 봉인·업로드), map 업로드 위치, `s3_manifest_note_tree` |
+| | `o_after_checkpoint_cleanup_hook`, `after_checkpoint_sync_wal` | 복구 끝에 `s3_wal_shipper_set_catch_up`; shipper 가 켜져 있으면 세그먼트 전환 없이 `s3_wal_ship_rest`, 아니면 정지가 남긴 WAL 세그먼트와 `.partial` 을 올림(`s3_schedule_wal_file_write`); 마지막에 `s3_checkpoint_commit(chkpNum)` 한 줄(`src/s3/commit.c`: 매니페스트 발행, shipper 대기, `s3_root_commit`, `s3_manifest_committed`) |
+| | `free_extent_for_checkpoint` | S3 모드는 공간을 재사용하지 않는다: extent 를 흐름의 죽은 목록(`nextChkp[chkp % 2]`)에 적는다 |
+| | `checkpoint_init_new_seq_bufs`, `s3_tree_fill_dead_buffers`, `s3_dead_list_start`, `s3_tree_records_dead` | 죽은 extent 목록 파일(`'d'`, `*.dead`) 의 생성과 머리(`S3_DEAD_UNIT_LEN`) |
+| | `evictable_tree_init_meta`, `checkpointable_tree_init`, `backend_set_autonomous_level`, `tbl_data_exists` | 로드한 트리의 커서·`s3NextPart` 복원(`S3TreeCursors`, `s3_part_floor`, 머리 잃은 map 은 `s3_bucket_next_part`); 로드 때 죽은 목록 버퍼(`s3_tree_fill_dead_buffers`); 트리 데이터의 존재는 평문 `<rel>` 파일이 아니라 마지막 map(버킷에서 받아서라도)으로 판단 |
+| | `write_empty_map_file`, `s3_write_empty_map` | 제자리 TRUNCATE 뒤 빈 map 을 마지막·다음 체크포인트 번호로 쓰고 올린다 |
+| | `checkpoint_btree_loop`, `checkpoint_internal_pass`, `writeback_put_extent` | 오프셋에 체크포인트 비트가 없다(`S3_OFFSET_MASK` 삭제); 자율 하강이 떠나는 extent 는 `free_extent_for_checkpoint` 가 죽은 것으로 적는다 |
+| `src/btree/build.c` | `btree_write_index_data`, `btree_write_file_header` | 재구축 메타 페이지의 커서를 `InvalidFileExtentOff` 로, `s3NextPart`/`sealFrom` 초기화; 끝에 `btree_s3_seal_build`; map 업로드는 `s3_schedule_map_file_write`(`S3_WRITER_MODE`) |
+| `src/btree/page_contents.c` | `init_meta_page` | 같은 초기화(커서 Invalid, `s3NextPart` 0, `sealFrom` Invalid); `dirtyParts` 삭제 |
+| `src/btree/scan.c` | `note_oldest_scan`, `load_next_internal_page`, `load_prev_internal_page`, `add_on_disk_downlink`, `read_ahead_disk_leaves`, `BTreeSeqScan.readAhead*` | GC 에 가장 오래된 스캔의 체크포인트 번호를 알림(`s3_gc_note_scans`); 범위 단계 표시(`s3_headers_range_step`); 디스크 downlink 정렬을 `DOWNLINK_GET_DISK_OFF` 로; leaf 미리 받기(`s3_schedule_downlink_load`, `S3_SCAN_READ_AHEAD_PARTS`) |
+| `src/btree/iterator.c` | `btree_iterator_check_load_next_page` | 다음 페이지 로드를 범위 단계로 표시(`s3_headers_range_step`) |
+| `src/btree/undo.c` | `check_pending_truncates`, `btree_relnode_undo_callback` | 지운 트리를 매니페스트에 알림(`s3_note_dropped_tree`), 바닥 파일 삭제(`s3_drop_part_floor`) |
+| `src/catalog/indices.c` | `build_secondary_index` | map 업로드 위치를 받아 `s3_queue_wait_for_location` |
+| `src/tableam/descr.c` | `cleanup_btree`, `cleanup_btree_extended` | `keepPartFloor`(제자리 TRUNCATE): `s3_keep_part_floor`, `s3_tree_parts_gone`, `s3_write_empty_map`; 그 밖의 삭제는 `s3_drop_part_floor` |
+| `src/tableam/operations.c` | `o_truncate_table` | `cleanup_btree_extended(…, keepPartFloor = !is_temp)` |
+| `src/transam/oxid.c` | `fsync_xidmap_range`, `write_xidmap_range_file`, `put_zigzag` | 체크포인트의 `.xidrange`(*Recovery and the loader*) |
+| `src/recovery/recovery.c` | `cleanup_tablespace_old_files` | 체크포인트 번호 파일명 처리 삭제; `*.dead` 도 정리 대상 |
+| `src/utils/seq_buf.c` | `get_seq_buf_filename` | `'d'` → `dead` |
+| `src/workers/bgwriter.c` | `bgwriter_main` | SIGHUP 으로 설정을 다시 읽는다(`orioledb.s3_desired_size`, `orioledb.s3_max_unsealed_size`) |
+| `src/orioledb.c` | `_PG_init`, `orioledb_on_shmem_exit`, `o_proc_shmem_init`, `orioledb_enable_s3_check_hook` | GUC `s3_reader`, `s3_wal_shipping`, `s3_wal_conninfo`, `s3_gc_*`, `s3_compact_*`, `s3_wal_chunk_delay`, `s3_auth_retry_time`, `s3_reader_pin_ttl`, `s3_lease_duration`, `s3_max_unsealed_size`; 공유 메모리 `s3_lease`/`s3_wal_shipper`/`s3_gc`; 종료 때 `s3_headers_error_cleanup`, 정상 정지의 `s3_lease_release`; `IS_DEV` 문을 열어 둠 |
+| `src/s3/archive.c`, `checkpoint.c`, `control.c`, `headers.c`, `queue.c`, `requests.c`, `worker.c` | upstream 에 있던 S3 파일 | 대부분 다시 쓰였다(*Object layout*, *Writer lease, tokens and fencing*). `checkpoint.c::s3_perform_backup` 은 묶음·매니페스트 등록, `worker.c::s3process_task` 는 파트·map·undo·WAL 작업의 새 키 |
+| `include/btree/btree.h`, `include/btree/io.h`, `include/btree/page_contents.h`, `include/checkpoint/checkpoint.h`, `include/orioledb.h`, `include/tableam/descr.h`, `include/transam/oxid.h`, `include/s3/*` | — | `BTreeS3PartsInfo.sealFrom`, `BTreeDescr.build*`, `s3NextPart`, `S3TreeCursors`, `S3_PART_BLOCKS`/`S3_PARTS_PER_SEGMENT`/`S3_DEAD_*`, `S3_WRITER_MODE`, `orioledb_s3_reader`, `s3_max_unsealed_size`, `cleanup_btree_extended`, `write_xidmap_range_file`; `include/s3/{commit,gc,lease,manifest,wal_shipper}.h` 는 새 파일 |
+| `Makefile`, `sql/orioledb--1.9--1.10_dtonic.sql`, `docker/Dockerfile*`, `.github/workflows/dtonic-check.yml`, `orioledb_s3_loader.py` | — | `src/s3/{commit,compact,gc,lease,manifest,wal_shipper}.o`; 포크의 SQL 함수(`orioledb_s3_compact`, `orioledb_s3_status`)는 `*_dtonic.sql` 에 두고 `sql/%.sql` 규칙이 `_prod` → `_dtonic` → `_dev`(IS_DEV) 로 잇는다; 이미지는 PG 패치를 적용하고 `IS_DEV` 없이 빌드; CI 는 패치를 적용한 `orioledb/postgres` 위에서 `ci/*.sh` 를 돈다; loader 는 *Recovery and the loader* |
+
+### Not S3
+
+같은 범위에 들어 있지만 S3 재설계와 무관한 포크 수정이다. 병합 충돌이 나면 이 문서가 아니라 각 커밋 메시지와
+dtonic/orioledb PR #1–#3 을 본다.
+
+| 파일 | 함수 | 내용 |
+| --- | --- | --- |
+| `src/recovery/logical.c`, `src/recovery/wal.c`, `src/catalog/ddl.c`, `include/recovery/{logical,wal}.h` | `decode_on_record`, `orioledb_decode`, `remove_skipped_dml`, `wal_joint_commit`, `wal_start_table_rewrite`/`wal_end_table_rewrite`, `log_logical_wal_container_with_payload`, `rewrite_table` | 논리 복제: 큰 트랜잭션, 서브트랜잭션, 크래시 뒤 디코딩, 테이블 재작성 표시(`WAL_CONTAINER_TABLE_REWRITE`), joint commit |
+| `src/transam/oxid.c`, `src/transam/undo.c`, `include/transam/undo.h`, `include/orioledb.h`(`logicalWalRetainXmin`) | `oxid_subxact_callback`, `hold_released_logical_xid`, `pass_released_logical_xids`, `release_assigned_logical_xids`, `set_my_logical_wal_retain_location(xmin)`, `logical_wal_retain_xmin`, `logical_retain_ring_floor`, `undo_subxact_callback`, autonomous 트랜잭션 함수들, `o_slot_retain_location` | 서브트랜잭션의 논리 xid 와 undo 보존, `orioledb.serializable` 기본값 |
+| `src/catalog/cic_spool.c`, `src/tableam/operations.c`, `src/indexam/handler.c`, `include/tableam/{handler,operations}.h` | `stream_read_one`, `cic_spool_*`, `cic_spool_capture_needed`, `cic_spool_capture`, `o_update_secondary_index`, `o_tbl_index_delete`, `orioledb_aminsert`/`amupdate`/`amdelete` | CREATE/DROP INDEX CONCURRENTLY 아래의 동시 쓰기 |
+| `src/btree/iterator.c` | `undo_image_lokey`, `page_contains_key`, `page_contains_end` | undo 이미지의 왼쪽 경계 |
+| `src/btree/io.c::read_page_from_disk` | undo 링크 정리 블록 | 재시작·standby 뒤 이 서버의 undo 에 없는 페이지 undo 링크를 버린다 |
+| `src/tableam/index_scan.c`, `include/tableam/index_scan.h` | `fetch_primary_tuple`, `o_index_scan_getnext` | 보조 인덱스 스캔의 주 트리 페이지 힌트 |
+| `src/tuple/slot.c` | `tts_orioledb_getsomeattrs` | 채운 속성 표시 |
+| `src/checkpoint/checkpoint.c::wait_recovery_undo_loc_flushed` | — | 정지 restartpoint 에서 뜨지 않은 복구 워커를 기다리지 않는다 |
+| `docker/init/default-orioledb.sh` | — | `postgres` 데이터베이스에도 확장을 만든다 |
+
+### PostgreSQL patches
+
+이미지와 CI 가 `orioledb/postgres`(`.pgtags` 의 PG 18 태그) 위에 이름 순서로 적용한다(`docker/patches/postgres/`). 셋 다
+포크의 S3 모드가 기대는 postmaster 와 디코더의 동작이다.
+
+| 패치 | 하는 일 |
+| --- | --- |
+| `0001-release-system-bgworker-slot-to-bgworker-pool.patch` | `BGWORKER_CLASS_SYSTEM` 워커의 자식 슬롯을 꺼낸 풀(`B_BG_WORKER`)로 돌려준다. S3 워커 하나가 끝나면 postmaster 가 `pmchild freelist` 오류로 죽던 것을 막는다 |
+| `0002-reorderbuffer-txn-status-hook.patch` | 디코딩 플러그인이 자기가 만든 xid 의 상태를 답하는 훅. PG 18 의 `ReorderBufferCheckAndTruncateAbortedTXN()` 이 CLOG 에 없는 orioledb 논리 xid 를 물어 `logical_decoding_work_mem` 을 넘는 트랜잭션의 디코딩이 실패하던 것을 고친다(S3 가 아닌 논리 복제 수정이 기댄다) |
+| `0003-start-system-bgworkers-during-crash-recovery.patch` | 크래시 재초기화 뒤에도 `BgWorkerStart_PostmasterStart` 의 시스템 워커를 띄운다. S3 모드의 복구 끝 체크포인트는 S3 워커의 업로드를 기다리므로, 이것이 없으면 거기서 멈춘다 |
 
 ## Dead-extent accounting, retention and GC
 
