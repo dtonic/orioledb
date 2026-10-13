@@ -355,6 +355,47 @@ class S3LeaseTest(S3BaseTest):
 		self.assertEqual([(1, )], node.execute("SELECT 1"))
 		node.stop()
 
+	def test_s3_invalidated_slot_stops_the_instance(self):
+		"""The WAL the shipper has not put yet is kept by its slot.  When
+		max_slot_wal_keep_size lets a checkpoint remove it, the slot is
+		invalidated: the instance stops, naming the cause, instead of the
+		shipper failing to stream every second for ever while commits that
+		wait for the bucket hang."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		# testgres keeps 320 MB for standbys: only the slot keeps WAL here
+		node.append_conf("""
+			max_slot_wal_keep_size = 16MB
+			wal_keep_size = 0
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		flaky = FlakyPutObject(10**9, contains='/chunks/')
+		try:
+			with patch('moto.s3.responses.S3Response.put_object',
+			           new=lambda response: flaky(response)):
+				for i in range(11, 16):
+					node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+					node.safe_psql("SELECT pg_switch_wal();")
+				deadline = time.time() + 60
+				while flaky.failed == 0 and time.time() < deadline:
+					time.sleep(0.2)
+				self.assertGreater(flaky.failed, 0)
+				checkpoint = self.checkpoint_in_background(node)
+				self.assertTrue(self.wait_stopped(node, 150),
+				                "the instance went on without its WAL")
+				checkpoint.join(10)
+			log = self.log(node)
+			self.assertIn('invalidated', log)
+			self.assertIn('wal_removed', log)
+		finally:
+			self.kill_quietly(node)
+
 	def test_s3_terminator_is_placed_again_after_a_lagging_listing(self):
 		"""The chunks before the one a loaded data directory was at are gone
 		(archived), and the listing that looks for the last chunk lags the

@@ -901,12 +901,56 @@ static void send_reply(WalReceiverConn *conn, XLogRecPtr flushed,
 
 static WalReceiverConn *replyConn = NULL;
 
-/* while a put waits to be retried: tell the walsender we are alive */
+/*
+ * Messages the walsender sent while a put was being retried, taken off the
+ * socket and kept for the loop in their order.  Left on the socket, they fill
+ * it, and a walsender told to die (a checkpoint invalidating its slot) hangs
+ * sending its last message, with the checkpointer waiting for it to release
+ * the slot and nothing reading.  Up to STASH_MAX_BYTES are kept; past that the
+ * socket holds the rest, as before (a store down for long under a load that
+ * does not wait for it).
+ */
+typedef struct
+{
+	int			len;
+	char	   *data;
+} StashedMessage;
+
+static List *stashed = NIL;
+static Size stashedBytes = 0;
+
+#define STASH_MAX_BYTES			(64 * 1024 * 1024)
+
+/*
+ * While a put waits to be retried: tell the walsender we are alive, and take
+ * what it sent.  A stream that ended ends the put too: the shipper starts
+ * again, judges its slot, and ships the chunk again from the hint.
+ */
 static void
 reply_while_waiting(void)
 {
-	if (replyConn)
-		send_reply(replyConn, pg_atomic_read_u64(&shipper->flushedLsn), false);
+	if (replyConn == NULL)
+		return;
+	send_reply(replyConn, pg_atomic_read_u64(&shipper->flushedLsn), false);
+	while (stashedBytes < STASH_MAX_BYTES)
+	{
+		char	   *buf;
+		pgsocket	fd;
+		int			len = walrcv_receive(replyConn, &buf, &fd);
+		StashedMessage *msg;
+
+		if (len == 0)
+			break;
+		if (len < 0)
+			ereport(ERROR,
+					(errmsg("WAL shipper stream ended while a put was retried")));
+		msg = palloc(sizeof(StashedMessage));
+		msg->len = len;
+		msg->data = palloc(len);
+		memcpy(msg->data, buf, len);
+		stashed = lappend(stashed, msg);
+		stashedBytes += len;
+	}
 }
 
 static void
@@ -963,10 +1007,11 @@ default_conninfo(void)
 
 /*
  * The physical slot that keeps the WAL the bucket does not have yet; created
- * on the first start.  Returns where it holds WAL from.
+ * on the first start.  Returns where it holds WAL from, and in *cause why it
+ * was invalidated (RS_INVAL_NONE: it was not).
  */
 static XLogRecPtr
-ensure_slot(void)
+ensure_slot(ReplicationSlotInvalidationCause *cause)
 {
 	ReplicationSlot *slot;
 	XLogRecPtr	restart;
@@ -994,6 +1039,7 @@ ensure_slot(void)
 
 	SpinLockAcquire(&slot->mutex);
 	restart = slot->data.restart_lsn;
+	*cause = slot->data.invalidated;
 	SpinLockRelease(&slot->mutex);
 	return restart;
 }
@@ -1300,6 +1346,7 @@ s3_wal_shipper_main(Datum main_arg)
 	TimestampTz lastReply = 0;
 	TimestampTz lastGc = 0;
 	bool		fenced = false;
+	ReplicationSlotInvalidationCause cause;
 
 	pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
@@ -1315,7 +1362,21 @@ s3_wal_shipper_main(Datum main_arg)
 	if (WalReceiverFunctions == NULL)
 		elog(ERROR, "libpqwalreceiver didn't initialize correctly");
 
-	slotRestart = ensure_slot();
+	slotRestart = ensure_slot(&cause);
+
+	/*
+	 * The slot kept the WAL the bucket does not have yet.  Invalidated (a
+	 * checkpoint removed that WAL under max_slot_wal_keep_size), the stream
+	 * cannot start, and a shipper started again every second would only keep
+	 * the commits that wait for the bucket waiting: the instance stops, and
+	 * says why.
+	 */
+	if (cause != RS_INVAL_NONE)
+		s3_stop_instance("the WAL the S3 bucket needs is gone",
+						 psprintf("Replication slot \"%s\" was invalidated (%s): WAL "
+								  "the shipper had not put yet was removed.  Load the "
+								  "data directory from the bucket again.",
+								  SHIPPER_SLOT, GetSlotInvalidationCauseName(cause)));
 
 	conninfo = (s3_wal_conninfo && *s3_wal_conninfo) ?
 		s3_wal_conninfo : default_conninfo();
@@ -1495,11 +1556,11 @@ walk:
 			archived = s3_object_exists(key);
 			pfree(key);
 			if (!archived)
-				ereport(ERROR,
-						(errmsg("the WAL after %X/%08X that the bucket needs is gone",
-								LSN_FORMAT_ARGS(start)),
-						 errdetail("Segment %s is neither kept for the shipper nor archived.",
-								   name)));
+				s3_stop_instance("the WAL the S3 bucket needs is gone",
+								 psprintf("Segment %s, after %X/%08X, is neither kept for "
+										  "the shipper nor archived.  Load the data "
+										  "directory from the bucket again.",
+										  name, LSN_FORMAT_ARGS(start)));
 		}
 		ereport(LOG,
 				(errmsg("WAL of timeline %u from %X/%08X is archived, shipping from %X/%08X",
@@ -1549,11 +1610,22 @@ walk:
 		pgsocket	wait_fd = PGINVALID_SOCKET;
 		int			len;
 		bool		replyNow = false;
+		StashedMessage *taken = NULL;
 
 		CHECK_FOR_INTERRUPTS();
 		s3_take_config_reload();
 
-		len = walrcv_receive(conn, &buf, &wait_fd);
+		/* what came while a put was retried, before what comes now */
+		if (stashed != NIL)
+		{
+			taken = linitial(stashed);
+			stashed = list_delete_first(stashed);
+			stashedBytes -= taken->len;
+			buf = taken->data;
+			len = taken->len;
+		}
+		else
+			len = walrcv_receive(conn, &buf, &wait_fd);
 		if (len < 0)
 		{
 			ereport(LOG, (errmsg("WAL shipper stream ended")));
@@ -1596,6 +1668,11 @@ walk:
 				default:
 					ereport(ERROR,
 							(errmsg("WAL shipper received an unexpected message")));
+			}
+			if (taken)
+			{
+				pfree(taken->data);
+				pfree(taken);
 			}
 			/*
 			 * Take what else is ready into this chunk, but not for longer
