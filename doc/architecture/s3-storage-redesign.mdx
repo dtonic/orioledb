@@ -530,10 +530,12 @@ writer 를 바꾸는 길은 둘이다.
 
 | 상황 | 처리 |
 | --- | --- |
-| curl 오류, 5xx, 429 | 서버 프로세스는 끝없이 재시도: 100 ms 부터 두 배, 상한 60초, 503·429 는 1초부터. 10회마다 WARNING. 5초 조각으로 기다리며 인터럽트, 설정 다시 읽기, 대기 hook(shipper 의 keepalive)을 처리. postmaster 는 재시도하지 않는다(설정 오류일 수 있다) |
-| 403 | 첫 거절부터 `orioledb.s3_auth_retry_time`(기본 300초) 동안 재시도. 그 뒤(0 이면 바로) 거절이 답이다. 그 답으로 죽은 S3 워커는 곧 다시 떠 남은 작업을 이어 하는데, 그 전에 1초 쉰다: 계속 거절되는 키로 초당 수십 번 재시작하며 저장소를 두드리지 않는다. Guard: `test_s3_keys_rotate_on_a_reload`, `test_s3_a_refused_key_fails_with_no_retry_time` |
-| 400 `BadDigest`, `IncompleteBody` | 본문이 오는 길에 잘린 것: 다시 보낸다 |
+| curl 오류, 5xx, 429 | 서버 프로세스는 끝없이 재시도: 100 ms 부터 두 배, 상한 60초, 503·429 는 1초부터. 10회마다 WARNING. 5초 조각으로 기다리며 인터럽트, 설정 다시 읽기, 대기 hook(shipper 의 keepalive)을 처리. postmaster 는 재시도하지 않는다(설정 오류일 수 있다). 60초 동안 진행이 없는 전송은 포기하고(`CURLOPT_LOW_SPEED_TIME`, curl 오류 28) 같은 길로 재시도한다: 연결을 받고 답하지 않는 저장소가 요청을 영원히 쥐었다. TCP keepalive 를 켠다. Guard: `test_s3_a_stalled_get_is_given_up_and_retried` |
+| 403 | 첫 거절부터 `orioledb.s3_auth_retry_time`(기본 300초) 동안 재시도. 그 뒤(0 이면 바로) 거절이 답이다. 그 답으로 죽은 S3 워커는 곧 다시 떠 남은 작업을 이어 하는데, 그 전에 1초 쉰다: 계속 거절되는 키로 초당 수십 번 재시작하며 저장소를 두드리지 않는다. 미리 읽기 힌트는 재시도하지 않는다. Guard: `test_s3_keys_rotate_on_a_reload`, `test_s3_a_refused_key_fails_with_no_retry_time` |
+| 400 `BadDigest`, `IncompleteBody`, `RequestTimeout` | 본문이 오는 길에 잘리거나 때맞춰 닿지 않은 것: 다시 보낸다. Guard: `test_s3_a_request_timeout_is_retried` |
+| 파트의 404, 403(재시도 창 뒤) | 그 파트를 기다리는 질의의 ERROR(`part N of tree D/R is not in the S3 bucket`, 객체 키를 DETAIL 에). 워커가 받던 파트면 Failed 로 표시해 기다리는 쪽이 ERROR 를 낸다(*Address space and allocation*) |
 | 그 밖의 4xx, 필요한 객체의 404 | 부른 프로세스의 FATAL(`could not put object to S3`, `could not get object from S3`) |
+| 256 MB 넘는 GET 본문 | ERROR(`too large to read into memory`). 메모리에 받는 GET 의 상한이다(`S3_MAX_BUFFERED_GET`); 서버가 통째로 읽는 객체는 모두 그보다 훨씬 작다. 펜싱된 PUT 의 내용 비교(`s3_object_holds`, 세그먼트 1 GB 까지)는 받으면서 비교하고 본문을 쥐지 않는다. Guard: `test_s3_a_large_object_is_not_read_into_memory` |
 | `root`·`writer` 의 PUT, `gc`·`readers` 의 GET, `readers` 의 PUT | 재시도 없는 한 번짜리(`s3_request_once`, 10초 상한). 판정은 모호한 결과 규칙과 호출자 각자의 재시도가 한다 |
 | 펜싱된 PUT(파트, 세그먼트, history, 정지 때 WAL) | `If-None-Match` + 토큰 헤더. 412·409 면 HEAD 로 저자 토큰을 읽어: 더 크면 리스 상실, 같은 바이트면 끝, 더 작거나 같은 토큰의 다른 바이트면 지우고 다시, 토큰 없는 다른 바이트면 FATAL. `s3_put_object_fenced_until` 은 `s3_lease_hold()` 의 기한까지만 보내고(요청 시간도 그 기한으로 자름) 넘으면 0 을 돌려주어 호출자가 리스를 갱신하고 다시 한다 |
 | 보통 PUT(map, 죽은 목록, 매니페스트, PG 파일, undo, 트리 상태, `roots/<K>`) | 키에 저자 토큰이나 체크포인트 번호가 들어가 다른 writer 와 겹치지 않는다. 같은 writer 가 다시 쓰는 일은 정당하다(재구축의 map 을 체크포인트가 다시 씀) |
@@ -594,8 +596,9 @@ Guard: `test_s3_terminator_goes_after_the_last_chunk_path_style`, `test_s3_http_
 
 `orioledb.s3_accesskey`·`orioledb.s3_secretkey` 는 `PGC_SIGHUP` 이다. 리스·GC·S3 워커와 shipper 는 루프를 돌 때마다,
 모든 서버 프로세스(체크포인터 포함)는 거절된 요청의 재시도를 기다리는 동안 설정을 다시 읽는다(`s3_take_config_reload`).
-클라이언트 백엔드는 명령 사이에 읽는다. reader 의 `restore_command`(loader `--restore`)는 세그먼트마다 설정 파일에서 키를
-읽는다. 절차는:
+클라이언트 백엔드도 그렇다: 명령 사이에만 읽을 때는 파트를 직접 받다 거절된 백엔드가 회수된 키로 재시도 창을 다 기다렸다
+(Guard: `test_s3_a_backend_takes_rotated_keys_while_it_is_refused`). reader 의 `restore_command`(loader `--restore`)는
+세그먼트마다 설정 파일에서 키를 읽는다. 절차는:
 
 1. IAM 에 새 키를 더한다.
 2. 두 GUC 를 바꾸고 `SELECT pg_reload_conf()`.
@@ -728,6 +731,10 @@ RustFS, 같은 Docker 호스트, 릴리스 빌드. 100만 행 표에 8연결 무
   빌드에서 워커 종료). 다시 읽는다. 축출은 상한을 넘으면 사용 횟수가 없는 파트를 모두 쫓아내, 스캔 뒤 모든 파트의
   횟수가 함께 0 이 되는 바퀴에서 로컬이 상한의 몇 %까지 떨어졌다. 정렬한 디스크 downlink 는 길이 비트가 앞서 압축 트리에서
   파일 순서가 아니었다.
+- 2026-10-13 데이터 경로 검토(요청 계층·헤더·큐·축출): 버킷에 없는 파트가 질의를 영원히 멈추던 것(워커가 404 로 죽고
+  재생), 진행 없는 전송의 시간 제한, `RequestTimeout` 재시도, 거절 대기 중 백엔드의 설정 다시 읽기, 고리 버퍼 지우기의
+  순서(claim 뒤 0 이 새 작업을 지움)와 집기·claim 전에 기록, 봉인된 파트 재기록을 PANIC 으로, 축출 바퀴의 헤더 세 번
+  읽기와 `stat()` 캐시, 마지막 파트 뽑기의 부호 결함, 1 GB GET 의 StringInfo, 죽은 `S3TaskTypeWriteRootFile`, 403 힌트.
 
 ## Not done and open questions
 
