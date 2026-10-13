@@ -385,7 +385,10 @@ class S3BaseTest(BaseTest):
 		if host_param:
 			host_name = host_param
 		host_port = f"{protocol}://{host_name}:{self.port}"
-		self.ssl_key = make_ssl_devcert(f'/tmp/ordb_test_key', cn=host_name)
+		# a certificate of this process's own: two processes writing one
+		# path made each other's clients fail the verification
+		self.ssl_key = make_ssl_devcert(f'/tmp/ordb_test_key_{os.getpid()}',
+		                                cn=host_name)
 		if protocol == 'https':
 			ssl_context = self.ssl_key
 			self.s3_cainfo = self.ssl_key[0]
@@ -487,6 +490,9 @@ class S3BaseTest(BaseTest):
 		self.iam_client.delete_user(UserName=self.user)
 		self.s3_server.stop()
 		connection.create_connection = self._orig_create_connection
+		for path in self.ssl_key:
+			if os.path.exists(path):
+				os.unlink(path)
 
 
 class OrioledbS3Loader:
