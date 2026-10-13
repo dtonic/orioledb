@@ -53,6 +53,8 @@
 #include "btree/page_chunks.h"
 #include "btree/scan.h"
 #include "s3/gc.h"
+#include "s3/headers.h"
+#include "s3/worker.h"
 #include "btree/undo.h"
 #include "tableam/descr.h"
 #include "tableam/key_range.h"
@@ -185,6 +187,13 @@ struct BTreeSeqScan
 	int64		downlinksCount; /* Used only for serial scan */
 	int64		downlinkIndex;
 	int64		allocatedDownlinks;
+
+	/*
+	 * S3 mode read-ahead of the disk phase (read_ahead_disk_leaves()): the
+	 * next downlink to look at and the last part scheduled.
+	 */
+	int64		readAheadIndex;
+	int64		readAheadPart;
 
 	BTreeIterator *iter;
 	OTuple		iterEnd;
@@ -635,11 +644,19 @@ load_next_internal_page(BTreeSeqScan *scan, OTuple prevHikey,
 		{
 			STOPEVENT(STOPEVENT_SEQ_SCAN_LOAD_INTERNAL_PAGE,
 					  btree_lokey_stopevent_params(scan->desc, prevHikey, prevIsLeftmostOrNone));
+			if (orioledb_s3_mode)
+				s3_headers_range_step(true);
 			findResult = find_page(&scan->context, &prevHikey, BTreeKeyNonLeafKey, 1);
+			if (orioledb_s3_mode)
+				s3_headers_range_step(false);
 		}
 		else
 		{
+			if (orioledb_s3_mode)
+				s3_headers_range_step(true);
 			findResult = find_page(&scan->context, NULL, BTreeKeyNone, 1);
+			if (orioledb_s3_mode)
+				s3_headers_range_step(false);
 		}
 		Assert(findResult == OFindPageResultSuccess);
 
@@ -860,8 +877,12 @@ add_on_disk_downlink(BTreeSeqScan *scan, uint64 downlink, CommitSeqNo csn,
 static int
 cmp_downlinks(const void *p1, const void *p2)
 {
-	uint64		d1 = ((BTreeSeqScanDiskDownlink *) p1)->downlink;
-	uint64		d2 = ((BTreeSeqScanDiskDownlink *) p2)->downlink;
+	/*
+	 * By file offset: the downlink's high bits hold the page length, which
+	 * put a compressed tree's pages in length order before file order.
+	 */
+	uint64		d1 = DOWNLINK_GET_DISK_OFF(((BTreeSeqScanDiskDownlink *) p1)->downlink);
+	uint64		d2 = DOWNLINK_GET_DISK_OFF(((BTreeSeqScanDiskDownlink *) p2)->downlink);
 
 	if (d1 < d2)
 		return -1;
@@ -1804,6 +1825,39 @@ tuple_in_scan_range(BTreeSeqScan *scan, OTuple tuple)
 }
 
 /*
+ * In S3 mode, schedule the loads of the parts holding the next disk leaves,
+ * up to S3_SCAN_READ_AHEAD_PARTS parts past the one of the leaf at `index`.
+ * The disk phase reads its leaves in file order, so the parts read ahead are
+ * the ones it reaches next; without this it waited for each part's download
+ * in turn.  A part already loaded or loading is not scheduled again.
+ */
+#define S3_SCAN_READ_AHEAD_PARTS 16
+
+static void
+read_ahead_disk_leaves(BTreeSeqScan *scan, BTreeSeqScanDiskDownlink *downlinks,
+					   int64 index, int64 count)
+{
+	int64		limit = s3_downlink_part(scan->desc, downlinks[index].downlink) +
+		S3_SCAN_READ_AHEAD_PARTS;
+	int64		i;
+
+	for (i = Max(scan->readAheadIndex, index + 1); i < count; i++)
+	{
+		uint64		downlink = downlinks[i].downlink;
+		int64		part = s3_downlink_part(scan->desc, downlink);
+
+		if (part >= limit)
+			break;
+		if (part != scan->readAheadPart)
+		{
+			(void) s3_schedule_downlink_load(scan->desc, downlink);
+			scan->readAheadPart = part;
+		}
+	}
+	scan->readAheadIndex = i;
+}
+
+/*
  * Read one on-disk leaf page into scan->leafImg and apply undo down to the
  * scan snapshot's CSN.  Shared by the deferred, physically-sorted disk phase
  * (load_next_disk_leaf_page) and the inline ordered path (iterate_internal_
@@ -1816,8 +1870,13 @@ read_disk_leaf_into_img(BTreeSeqScan *scan, uint64 downlinkLoc, CommitSeqNo csn)
 	OReadPageResult read_result;
 	BTreePageHeader *header;
 
+	/* a scan's read does not keep the part from eviction (s3/headers.c) */
+	if (orioledb_s3_mode)
+		s3_headers_scan_read(true);
 	read_result = read_page_from_disk(scan->desc, scan->leafImg, downlinkLoc,
 									  &extent);
+	if (orioledb_s3_mode)
+		s3_headers_scan_read(false);
 	header = (BTreePageHeader *) scan->leafImg;
 
 	/*
@@ -1937,10 +1996,14 @@ load_prev_internal_page(BTreeSeqScan *scan, OTuple lokey, Page page,
 	scan->context.flags |= BTREE_PAGE_FIND_DOWNLINK_LOCATION |
 		BTREE_PAGE_FIND_KEEP_LOKEY | BTREE_PAGE_FIND_KEEP_PARENT;
 
+	if (orioledb_s3_mode)
+		s3_headers_range_step(true);
 	if (O_TUPLE_IS_NULL(lokey))
 		findResult = find_page(&scan->context, NULL, BTreeKeyRightmost, 1);
 	else
 		findResult = find_page(&scan->context, &lokey, BTreeKeyPageHiKey, 1);
+	if (orioledb_s3_mode)
+		s3_headers_range_step(false);
 	Assert(findResult == OFindPageResultSuccess);
 
 	if (STOPEVENT_CONDITION(STOPEVENT_SEQ_SCAN_LOAD_INTERNAL_PAGE_FAIL,
@@ -2414,6 +2477,10 @@ load_next_disk_leaf_page(BTreeSeqScan *scan)
 				return false;
 
 			downlink = scan->diskDownlinks[scan->downlinkIndex];
+			if (orioledb_s3_mode)
+				read_ahead_disk_leaves(scan, scan->diskDownlinks,
+									   scan->downlinkIndex,
+									   scan->downlinksCount);
 		}
 		else
 		{
@@ -2429,6 +2496,11 @@ load_next_disk_leaf_page(BTreeSeqScan *scan)
 				return false;
 			}
 			downlink = ((BTreeSeqScanDiskDownlink *) dsm_segment_address(scan->dsmSeg))[index];
+			if (orioledb_s3_mode)
+				read_ahead_disk_leaves(scan,
+									   (BTreeSeqScanDiskDownlink *) dsm_segment_address(scan->dsmSeg),
+									   index,
+									   pg_atomic_read_u64(&poscan->downlinksCount));
 		}
 
 		read_disk_leaf_into_img(scan, downlink.downlink, downlink.csn);
@@ -2711,6 +2783,8 @@ make_btree_seq_scan_internal(BTreeDescr *desc, OSnapshot *oSnapshot,
 	scan->allocatedDownlinks = 16;
 	scan->downlinksCount = 0;
 	scan->downlinkIndex = 0;
+	scan->readAheadIndex = 0;
+	scan->readAheadPart = -1;
 	scan->diskDownlinks = (BTreeSeqScanDiskDownlink *) MemoryContextAlloc(btree_seqscan_context,
 																		  sizeof(scan->diskDownlinks[0]) * scan->allocatedDownlinks);
 	scan->mctx = CurrentMemoryContext;

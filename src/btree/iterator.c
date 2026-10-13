@@ -20,6 +20,7 @@
 #include "btree/iterator.h"
 #include "btree/page_chunks.h"
 #include "btree/undo.h"
+#include "s3/headers.h"
 #include "catalog/sys_trees.h"
 #include "tableam/descr.h"
 #include "tableam/key_range.h"
@@ -1982,7 +1983,14 @@ btree_iterator_check_load_next_page(BTreeIterator *it, BtreeIterationEnd *end)
 		iterator_materialize_cur_key(it);
 
 		if (IT_IS_FORWARD(it))
+		{
+			/* a range scan: its misses read ahead at once (S3 mode) */
+			if (orioledb_s3_mode)
+				s3_headers_range_step(true);
 			step_result = find_right_page(context, &key_buf);
+			if (orioledb_s3_mode)
+				s3_headers_range_step(false);
+		}
 		else
 			step_result = find_left_page(context, &key_buf);
 

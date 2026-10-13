@@ -1534,6 +1534,37 @@ s3_get_file_part(char *objectname, char *filename, int partnum)
 }
 
 /*
+ * Get the file part as s3_get_file_part() does, but answer false where the
+ * store did not give it, instead of ending the process: a backend downloading
+ * the part it needs leaves the part to the S3 workers then.  Transient
+ * failures are retried as for any request.
+ */
+bool
+s3_try_get_file_part(char *objectname, char *filename, int partnum)
+{
+	StringInfoData buf;
+	long		http_code;
+	int			sc;
+
+	initStringInfo(&buf);
+	http_code = s3_request("GET", objectname, NULL, 0, NULL, NULL, false, true,
+						   0, &buf, NULL, NULL, &sc, NULL, NULL);
+	if (sc != 0 || http_code != S3_RESPONSE_OK)
+	{
+		pfree(buf.data);
+		return false;
+	}
+
+	write_file_part(filename,
+					partnum * ORIOLEDB_S3_PART_SIZE + ORIOLEDB_BLCKSZ,
+					buf.data,
+					buf.len);
+
+	pfree(buf.data);
+	return true;
+}
+
+/*
  * Put empty dir as S3 object.
  */
 void
