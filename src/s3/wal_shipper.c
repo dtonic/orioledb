@@ -1609,7 +1609,10 @@ walk:
  * with it, as the next chunks.  A partial segment is never put under the
  * archive's key: a restore takes an archived segment as complete, and would
  * read no chunk over it.  Returns false when the shipper never ran here, so
- * nothing says what the bucket has.
+ * nothing says what the bucket has.  Nothing here raises an ERROR: the
+ * checkpointer runs the shutdown checkpoint with ExitOnAnyError, so an ERROR
+ * was its exit(1), a crash to the postmaster, with no word of the cause.  What
+ * cannot be shipped stops the instance and says why.
  */
 bool
 s3_wal_ship_rest(TimeLineID tli)
@@ -1666,20 +1669,29 @@ s3_wal_ship_rest(TimeLineID tli)
 			n = Min(chunkEnd - pos, wal_segment_size - off);
 			fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
 			if (fd < 0)
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not open file \"%s\": %m", path)));
+				s3_stop_instance("could not ship the WAL a stop leaves to S3",
+								 psprintf("could not open file \"%s\": %m", path));
 			if (pg_pread(fd, buf + (pos - start), n, off) != (ssize_t) n)
-				ereport(ERROR,
-						(errcode_for_file_access(),
-						 errmsg("could not read file \"%s\": %m", path)));
+				s3_stop_instance("could not ship the WAL a stop leaves to S3",
+								 psprintf("could not read file \"%s\": %m", path));
 			close(fd);
 			pos += n;
 		}
+
+		/*
+		 * The lease is still ours, as before every chunk the shipper puts: a
+		 * writer another took over from while it stopped (its lease worker
+		 * stuck, or the lease run out in a long checkpoint) stops here, with
+		 * the lease, rather than meet the new writer's terminator below.
+		 */
+		(void) s3_lease_hold();
 		if (!put_chunk(tli, nextSeq, start, chunkEnd, buf))
-			ereport(ERROR,
-					(errmsg("WAL chunk %llu of timeline %u belongs to another writer",
-							(unsigned long long) nextSeq, tli)));
+			s3_stop_instance("the S3 bucket has WAL past this data directory",
+							 psprintf("WAL chunk %llu of timeline %u belongs to another "
+									  "writer: the stop checkpoint cannot ship the WAL "
+									  "it leaves.  Load the data directory from the "
+									  "bucket again.",
+									  (unsigned long long) nextSeq, tli));
 		nextSeq++;
 		start = chunkEnd;
 		write_seq_file(tli, nextSeq, start, false);

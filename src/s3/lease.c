@@ -1856,7 +1856,13 @@ register_s3_lease_worker(void)
 	BackgroundWorker worker;
 
 	memset(&worker, 0, sizeof(worker));
-	worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
+	/*
+	 * A system worker, as the S3 workers are: a regular one is stopped before
+	 * the shutdown checkpoint, which uploads and commits for as long as that
+	 * takes, and the lease ran out in it.  It gets its SIGTERM once the
+	 * checkpointer is gone, and the postmaster gives the lease back after it.
+	 */
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_CLASS_SYSTEM;
 	worker.bgw_start_time = BgWorkerStart_PostmasterStart;
 	worker.bgw_restart_time = 1;
 	strcpy(worker.bgw_library_name, "orioledb");

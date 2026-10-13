@@ -174,6 +174,108 @@ class S3LeaseTest(S3BaseTest):
 		finally:
 			self.kill_quietly(node)
 
+	def test_s3_stop_outlasting_the_lease_keeps_it(self):
+		"""The lease worker renews through the shutdown checkpoint: a stop
+		whose checkpoint takes longer than the lease does not let a loaded
+		copy take the bucket over meanwhile.  A regular background worker
+		was stopped before the checkpoint, and the lease ran out in it."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		token = self.kv('writer')['token']
+		hold = HoldWrites(r'/data/\d+-\d+/')
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as other:
+			self.loader.download(other.data_dir)
+			other.append_conf(port=other.port)
+			self.s3_server.before_write = hold
+			stopper = Thread(target=lambda: node.stop(['-t', '300']))
+			stopper.daemon = True
+			stopper.start()
+			try:
+				self.assertTrue(hold.entered.wait(90),
+				                "the stop checkpoint put no file")
+				# the copy waits for the lease to run out, and sees it renewed
+				with self.assertRaises(StartNodeException):
+					other.start()
+				self.assertIn('a copy of this data directory is running',
+				              self.log(other))
+			finally:
+				hold.release.set()
+				self.s3_server.before_write = None
+				stopper.join(300)
+				self.kill_quietly(other)
+			self.assertNotEqual(NodeStatus.Running, node.status())
+			self.assertEqual(token, self.kv('writer')['token'])
+			self.assertEqual('0', self.kv('writer')['expires_at'])
+			self.assertNotIn('lost the S3 writer lease', self.log(node))
+			other.cleanup()
+
+	def test_s3_stop_ends_when_the_lease_is_lost_in_it(self):
+		"""The lease worker is stuck through a stop: the stop reaches its
+		checkpoint all the same (a system worker is not waited for), the
+		lease lapses in it and a loaded copy takes the bucket over.  The
+		stop checkpoint, shipping the WAL the shipper left, checks the lease
+		before it puts and stops the instance with the lease lost.  Before,
+		a stuck lease worker held the stop before its checkpoint, and a stop
+		whose lease lapsed shipped into the new writer's bucket until it met
+		the terminator."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		token = int(self.kv('writer')['token'])
+		lease = self.child_pid(node, 'orioledb s3 lease')
+		hold = HoldWrites(r'/data/\d+-\d+/')
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as other:
+			self.loader.download(other.data_dir)
+			other.append_conf(port=other.port)
+			os.kill(lease, signal.SIGSTOP)
+			self.s3_server.before_write = hold
+			stopper = Thread(target=lambda: node.stop(['-t', '300']))
+			stopper.daemon = True
+			stopper.start()
+			try:
+				self.assertTrue(hold.entered.wait(90),
+				                "the stop did not reach its checkpoint")
+				other.start()
+				self.assertEqual(token + 1, int(self.kv('writer')['token']))
+				hold.release.set()
+				self.s3_server.before_write = None
+				self.assertTrue(
+				    self.wait_logged(node, 'lost the S3 writer lease', 90),
+				    "the stop went on after the lease was lost")
+			finally:
+				hold.release.set()
+				self.s3_server.before_write = None
+				try:
+					os.kill(lease, signal.SIGCONT)
+				except ProcessLookupError:
+					pass
+			self.assertTrue(self.wait_stopped(node, 60), "the stop never ended")
+			stopper.join(60)
+			# the checkpointer saw the lease lost, before it put a chunk
+			log = self.log(node)
+			checkpointer = re.search(r'\[(\d+)\] LOG:  checkpoint starting: shutdown',
+			                         log).group(1)
+			self.assertIn(f'[{checkpointer}] LOG:  lost the S3 writer lease', log)
+			self.assertNotIn('belongs to another writer', log)
+			self.assertEqual(token + 1, int(self.kv('writer')['token']))
+			self.assertEqual([(10, )],
+			                 other.execute("SELECT count(*) FROM o_test"))
+			other.stop()
+			other.cleanup()
+
 	def test_s3_status_answers_while_the_store_stalls(self):
 		"""The lease's renewal is a request to the store; while it waits,
 		orioledb_s3_status() reads the shared state without waiting for
