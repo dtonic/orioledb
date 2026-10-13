@@ -103,8 +103,9 @@ class OrioledbS3ObjectLoader:
 		    dest='repair_root',
 		    action='store_true',
 		    help="Put root back when the bucket's is missing or cannot be "
-		    "read: from the copy the latest checkpoint whose manifest is "
-		    "there left under roots/.  With the writer stopped")
+		    "read: from the copy under roots/ of the largest writer token "
+		    "(then the latest checkpoint) whose manifest is there.  With "
+		    "the writer stopped")
 		parser.add_argument(
 		    '--sweep',
 		    dest='sweep',
@@ -558,9 +559,12 @@ class OrioledbS3ObjectLoader:
 			f.write(data)
 
 	def repair_root(self):
-		"""Put root back from the newest copy under roots/ whose
-		checkpoint's manifest is in the bucket; a root that reads is left
-		alone."""
+		"""Put root back from the copy under roots/ of the largest writer
+		token, then the newest checkpoint, whose checkpoint's manifest is in
+		the bucket; a root that reads is left alone.  The token first: a
+		writer that took the bucket over leaves its copy under the same
+		checkpoint number as the writer it fenced off, and that one's would
+		let it in again."""
 		try:
 			root = self.read_root(self.bucket_name)
 			if root is not None and 'checkpoint' in root and \
@@ -572,9 +576,12 @@ class OrioledbS3ObjectLoader:
 		copies = []
 		for key in self.list_objects(self.bucket_name, 'roots/'):
 			name = key.rsplit('/', 1)[-1]
-			if name.isdigit():
-				copies.append((int(name), key))
-		for chkp, key in sorted(copies, reverse=True):
+			# roots/<token>-<checkpoint>; a copy from before the token was in
+			# the key counts as the smallest token
+			m = re.fullmatch(r'(?:(\d+)-)?(\d+)', name)
+			if m:
+				copies.append((int(m.group(1) or 0), int(m.group(2)), key))
+		for _, chkp, key in sorted(copies, reverse=True):
 			body = self.s3.get_object(Bucket=self.bucket_name,
 			                          Key=key)['Body'].read()
 			copy = parse_root_body(body.decode())

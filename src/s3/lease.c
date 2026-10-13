@@ -888,16 +888,18 @@ wait_for_own_lease(WriterBody *writer, char *writerEtag, int64 storageNow)
  * lease, or has written root since this data directory last did.
  */
 /*
- * A copy of root under its checkpoint's number: root is a single object, and
- * a root lost or damaged is put back from the last copy whose manifest is
- * there (orioledb_s3_loader.py --repair-root).  Each commit leaves one, and so
- * does a start, whose root carries the new token and epoch under the same
- * checkpoint.  The GC removes the copies with the manifests.
+ * A copy of root under its writer's token and its checkpoint's number: root is
+ * a single object, and a root lost or damaged is put back from the copy of the
+ * largest token whose manifest is there (orioledb_s3_loader.py --repair-root).
+ * Each commit leaves one, and so does a start, whose root carries the new
+ * token and epoch under the same checkpoint: with the token in the key the
+ * two do not share one, and a copy a fenced writer puts late never replaces
+ * the new writer's.  The GC removes the copies with the manifests.
  */
 static void
-put_root_copy(uint32 checkpointNum, StringInfo body)
+put_root_copy(uint64 token, uint32 checkpointNum, StringInfo body)
 {
-	char	   *key = psprintf(ROOT_COPY_FORMAT, checkpointNum);
+	char	   *key = psprintf(ROOT_COPY_FORMAT, token, checkpointNum);
 
 	if (s3_put_object_conditional(key, body->data, body->len, NULL, false,
 								  NULL) != S3_RESPONSE_OK)
@@ -1139,7 +1141,7 @@ s3_lease_acquire(void)
 	strlcpy(pm_lease.rootEtag, rootEtag, S3_ETAG_LEN);
 	/* a takeover's root, with its token and epoch, is the one to put back */
 	if (newRoot.checkpoint > 0)
-		put_root_copy(newRoot.checkpoint, &body);
+		put_root_copy(pm_lease.token, newRoot.checkpoint, &body);
 
 	/*
 	 * No chunk of an earlier writer after this: of the one this load takes
@@ -1526,7 +1528,7 @@ s3_root_commit(uint32 checkpointNum, XLogRecPtr redoLsn,
 	LWLockRelease(&lease->lock);
 	LWLockRelease(&lease->requestLock);
 
-	put_root_copy(checkpointNum, &body);
+	put_root_copy(r.token, checkpointNum, &body);
 
 	elog(DEBUG1, "S3 root now points at checkpoint %u", checkpointNum);
 	pfree(body.data);

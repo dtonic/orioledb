@@ -276,6 +276,69 @@ class S3LeaseTest(S3BaseTest):
 			other.stop()
 			other.cleanup()
 
+	def test_s3_repair_root_takes_the_newest_writers_copy(self):
+		"""A writer's copy of root lands late, after the writer that took
+		the bucket over left its own under the same checkpoint number.  The
+		copies are keyed by token too, so neither replaces the other, and
+		--repair-root takes the newest token's: the old writer's would let
+		the fenced writer in again."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 10);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		node.safe_psql("INSERT INTO o_test SELECT generate_series(11, 20);")
+		hold = HoldWrites(r'/roots/')
+		self.s3_server.before_write = hold
+		checkpoint = self.checkpoint_in_background(node)
+		try:
+			self.assertTrue(hold.entered.wait(60), "no copy of root was put")
+			# root names the checkpoint; its copy is on the way; the writer dies
+			node.stop(['-m', 'immediate'])
+			checkpoint.join(30)
+			chkp = int(self.kv('root')['checkpoint'])
+			token_a = int(self.kv('root')['token'])
+			with self.initNode(self.getBasePort() + 1, 'tgsb') as other:
+				self.loader.download(other.data_dir)
+				other.append_conf(port=other.port)
+				other.start()
+				token_b = int(self.kv('root')['token'])
+				self.assertEqual(token_a + 1, token_b)
+				# the old writer's copy lands now
+				hold.release.set()
+				self.s3_server.before_write = None
+				deadline = time.time() + 60
+				while not any(c[1] == chkp and int(c[3]['token']) == token_a
+				              for c in self.root_copies()):
+					self.assertLess(time.time(), deadline,
+					                "the late copy never landed")
+					time.sleep(0.2)
+				other.stop(['-m', 'immediate'])
+				# the copies after the takeover's are gone, and root is damaged
+				for _, k, key, _ in self.root_copies():
+					if k > chkp:
+						self.client.delete_object(Bucket=self.bucket_name,
+						                          Key=key)
+				self.client.put_object(Bucket=self.bucket_name, Key='root',
+				                       Body=b'\x00garbage')
+				self.loader.download(None, repair_root=True)
+				self.assertEqual(token_b, int(self.kv('root')['token']))
+				self.assertEqual(chkp, int(self.kv('root')['checkpoint']))
+				# the new writer goes on from it: the local state is ahead
+				other.start()
+				self.assertEqual([(20, )],
+				                 other.execute("SELECT count(*) FROM o_test"))
+				other.stop()
+				other.cleanup()
+		finally:
+			hold.release.set()
+			self.s3_server.before_write = None
+			self.kill_quietly(node)
+
 	def test_s3_status_answers_while_the_store_stalls(self):
 		"""The lease's renewal is a request to the store; while it waits,
 		orioledb_s3_status() reads the shared state without waiting for
