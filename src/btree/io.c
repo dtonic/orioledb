@@ -1254,6 +1254,19 @@ s3_alloc_extent(BTreeDescr *desc, BTreeMetaPage *metaPage, int stream,
 		part = pg_atomic_fetch_add_u64(&metaPage->s3NextPart, 1);
 
 		cur = part * blocksPerPart;
+
+		/*
+		 * A downlink holds 48 bits of block address (DOWNLINK_GET_DISK_OFF),
+		 * and a part past them would be stored under another part's
+		 * address.  Two EiB of parts for one tree is out of reach, so this
+		 * stops a corruption rather than serves a case: the cursor was
+		 * moved past the limit by a part number carried over wrongly.
+		 */
+		if (cur + len > InvalidFileExtentOff)
+			ereport(PANIC,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("could not allocate part " UINT64_FORMAT " of tree (%u, %u): its blocks would lie past the 48-bit address space of a downlink",
+							part, desc->oids.datoid, desc->oids.relnode)));
 		if (!localOnly && !FileExtentOffIsValid(metaPage->partsInfo[stream].sealFrom))
 			metaPage->partsInfo[stream].sealFrom = part;
 		s3_header_open_part(s3_part_tag(desc, part), part % S3_PARTS_PER_SEGMENT,
