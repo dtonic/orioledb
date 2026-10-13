@@ -319,7 +319,6 @@ class FlakyPutObject:
 class S3BaseTest(BaseTest):
 	bucket_name = "test-bucket"
 	host = "localhost"
-	port = 5001
 	user = "ORDB_USER"
 	region = "us-east-1"
 	policy_name = "ORDB_POLICY"
@@ -358,6 +357,8 @@ class S3BaseTest(BaseTest):
 	def setUp(self):
 		super().setUp()
 
+		# a port of this process's own, so test processes run side by side
+		self.port = free_port()
 		protocol = 'https'
 		prefix = None
 		host_param = None
@@ -391,7 +392,7 @@ class S3BaseTest(BaseTest):
 		else:
 			ssl_context = None
 			self.s3_cainfo = None
-		self.s3_server = MotoServerSSL(ssl_context=ssl_context)
+		self.s3_server = MotoServerSSL(port=self.port, ssl_context=ssl_context)
 		self.s3_server.start()
 
 		self._orig_create_connection = connection.create_connection
@@ -535,11 +536,19 @@ class OrioledbS3Loader:
 		sys.argv = old_argv
 
 
+def free_port() -> int:
+	"""A TCP port nothing listens on right now."""
+	with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+		sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+		sock.bind(('', 0))
+		return sock.getsockname()[1]
+
+
 class MotoServerSSL:
 
 	def __init__(self,
 	             host: str = "localhost",
-	             port: int = 5001,
+	             port: int = 0,
 	             ssl_context=None):
 		self._host = host
 		self._port = port
