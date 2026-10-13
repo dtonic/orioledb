@@ -56,7 +56,7 @@
 #include "utils/syscache.h"
 #include "funcapi.h"
 
-static int	btree_smgr_read(BTreeDescr *desc, char *buffer,
+static int	btree_smgr_read(BTreeDescr *desc, char *buffer, uint32 chkpNum,
 							int amount, off_t offset);
 
 /*
@@ -71,6 +71,11 @@ static int	btree_smgr_read(BTreeDescr *desc, char *buffer,
 
 static void s3_record_part_end(BTreeDescr *desc, int stream, uint64 end);
 static void s3_build_note_part_end(BTreeDescr *desc, uint64 end);
+static char *s3_smgr_filename(const char *db_prefix, OIndexKey key, int segno);
+static File s3_smgr_open_file(BTreeDescr *desc, uint32 num);
+static void s3_smgr_init(BTreeDescr *descr);
+static void s3_smgr_open(BTreeDescr *descr);
+static void s3_smgr_close(BTreeDescr *descr);
 
 typedef struct
 {
@@ -232,15 +237,20 @@ btree_filename(OIndexKey key, int segno, uint32 chkpNum)
 	o_get_prefixes_for_tablespace(key.oids.datoid, key.oids.spcoid,
 								  NULL, &db_prefix);
 
-	if (segno == 0)
-		result = psprintf("%s/%u",
-						  db_prefix,
-						  key.oids.relnode);
+	if (orioledb_s3_mode)
+		result = s3_smgr_filename(db_prefix, key, segno);
 	else
-		result = psprintf("%s/%u.%u",
-						  db_prefix,
-						  key.oids.relnode,
-						  segno);
+	{
+		if (segno == 0)
+			result = psprintf("%s/%u",
+							  db_prefix,
+							  key.oids.relnode);
+		else
+			result = psprintf("%s/%u.%u",
+							  db_prefix,
+							  key.oids.relnode,
+							  segno);
+	}
 
 	pfree(db_prefix);
 	return result;
@@ -277,7 +287,127 @@ btree_smgr_ensure_dir(BTreeDescr *desc)
 }
 
 static File
-btree_open_smgr_file(BTreeDescr *desc, uint32 num)
+btree_open_smgr_file(BTreeDescr *desc, uint32 num, uint32 chkpNum,
+					 uint32 loadId)
+{
+	if (orioledb_s3_mode)
+		return s3_smgr_open_file(desc, num);
+	else
+	{
+		char	   *filename;
+
+		if (num >= desc->smgr.array.filesAllocated)
+		{
+			int			i = desc->smgr.array.filesAllocated;
+
+			/*
+			 * btree_open_smgr should have been called before, so
+			 * filesAllocated should be greater than 0
+			 */
+			Assert(desc->smgr.array.filesAllocated > 0);
+
+			while (num >= desc->smgr.array.filesAllocated)
+				desc->smgr.array.filesAllocated *= 2;
+
+			desc->smgr.array.files = (File *) repalloc(desc->smgr.array.files,
+													   sizeof(File) * desc->smgr.array.filesAllocated);
+			for (; i < desc->smgr.array.filesAllocated; i++)
+				desc->smgr.array.files[i] = -1;
+		}
+
+		if (desc->smgr.array.files[num] >= 0)
+			return desc->smgr.array.files[num];
+
+		filename = btree_smgr_filename(desc,
+									   (off_t) num * ORIOLEDB_SEGMENT_SIZE,
+									   chkpNum);
+		desc->smgr.array.files[num] = PathNameOpenFile(filename, O_RDWR | O_CREAT | PG_BINARY);
+		if (desc->smgr.array.files[num] <= 0 && errno == ENOENT)
+		{
+			/* The data directory may not exist - create and retry. */
+			btree_smgr_ensure_dir(desc);
+			desc->smgr.array.files[num] = PathNameOpenFile(filename, O_RDWR | O_CREAT | PG_BINARY);
+		}
+
+		if (desc->smgr.array.files[num] <= 0)
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("could not open data file %s: %m", filename)));
+		pfree(filename);
+		return desc->smgr.array.files[num];
+	}
+}
+
+void
+btree_init_smgr(BTreeDescr *descr)
+{
+	if (orioledb_s3_mode)
+		s3_smgr_init(descr);
+	else
+	{
+		descr->smgr.array.files = NULL;
+		descr->smgr.array.filesAllocated = 0;
+	}
+}
+
+void
+btree_open_smgr(BTreeDescr *descr)
+{
+	if (orioledb_s3_mode)
+		s3_smgr_open(descr);
+	else
+	{
+		int			i;
+
+		if (descr->smgr.array.files)
+			return;
+
+		descr->smgr.array.filesAllocated = 16;
+		descr->smgr.array.files = (File *) MemoryContextAlloc(TopMemoryContext,
+															  sizeof(File) * descr->smgr.array.filesAllocated);
+		for (i = 0; i < descr->smgr.array.filesAllocated; i++)
+			descr->smgr.array.files[i] = -1;
+		(void) btree_open_smgr_file(descr, 0, 0, 0);
+	}
+}
+
+void
+btree_close_smgr(BTreeDescr *descr)
+{
+	int			i;
+
+	if (orioledb_s3_mode)
+		s3_smgr_close(descr);
+	else if (descr->smgr.array.files)
+	{
+		for (i = 0; i < descr->smgr.array.filesAllocated; i++)
+		{
+			if (descr->smgr.array.files[i] >= 0)
+				FileClose(descr->smgr.array.files[i]);
+		}
+		pfree(descr->smgr.array.files);
+	}
+	descr->smgr.array.filesAllocated = 0;
+	descr->smgr.array.files = NULL;
+}
+
+/*
+ * The S3 smgr.  A tree's parts are slices of the same segment files local
+ * mode writes (s3_part_tag), so the file layer under S3 mode is the array
+ * smgr: these are its S3 entry points, written out apart from the array
+ * arms above so that those stay as upstream has them.  A change upstream
+ * makes to the array smgr is carried over here by hand.
+ */
+static char *
+s3_smgr_filename(const char *db_prefix, OIndexKey key, int segno)
+{
+	if (segno == 0)
+		return psprintf("%s/%u", db_prefix, key.oids.relnode);
+	return psprintf("%s/%u.%u", db_prefix, key.oids.relnode, segno);
+}
+
+static File
+s3_smgr_open_file(BTreeDescr *desc, uint32 num)
 {
 	char	   *filename;
 
@@ -285,10 +415,7 @@ btree_open_smgr_file(BTreeDescr *desc, uint32 num)
 	{
 		int			i = desc->smgr.array.filesAllocated;
 
-		/*
-		 * btree_open_smgr should have been called before, so
-		 * filesAllocated should be greater than 0
-		 */
+		/* btree_open_smgr() has been called, so there is an array to grow */
 		Assert(desc->smgr.array.filesAllocated > 0);
 
 		while (num >= desc->smgr.array.filesAllocated)
@@ -322,15 +449,15 @@ btree_open_smgr_file(BTreeDescr *desc, uint32 num)
 	return desc->smgr.array.files[num];
 }
 
-void
-btree_init_smgr(BTreeDescr *descr)
+static void
+s3_smgr_init(BTreeDescr *descr)
 {
 	descr->smgr.array.files = NULL;
 	descr->smgr.array.filesAllocated = 0;
 }
 
-void
-btree_open_smgr(BTreeDescr *descr)
+static void
+s3_smgr_open(BTreeDescr *descr)
 {
 	int			i;
 
@@ -342,8 +469,9 @@ btree_open_smgr(BTreeDescr *descr)
 														  sizeof(File) * descr->smgr.array.filesAllocated);
 	for (i = 0; i < descr->smgr.array.filesAllocated; i++)
 		descr->smgr.array.files[i] = -1;
-	(void) btree_open_smgr_file(descr, 0);
+	(void) s3_smgr_open_file(descr, 0);
 
+	/* a build's parts: none open, nothing to seal (btree_s3_seal_build) */
 	descr->buildNextPart = 0;
 	descr->buildSealFrom = InvalidFileExtentOff;
 	descr->buildWriteMaxLocation = 0;
@@ -352,22 +480,19 @@ btree_open_smgr(BTreeDescr *descr)
 	descr->buildPartEndsAlloc = 0;
 }
 
-void
-btree_close_smgr(BTreeDescr *descr)
+static void
+s3_smgr_close(BTreeDescr *descr)
 {
 	int			i;
 
-	if (descr->smgr.array.files)
+	if (!descr->smgr.array.files)
+		return;
+	for (i = 0; i < descr->smgr.array.filesAllocated; i++)
 	{
-		for (i = 0; i < descr->smgr.array.filesAllocated; i++)
-		{
-			if (descr->smgr.array.files[i] >= 0)
-				FileClose(descr->smgr.array.files[i]);
-		}
-		pfree(descr->smgr.array.files);
+		if (descr->smgr.array.files[i] >= 0)
+			FileClose(descr->smgr.array.files[i]);
 	}
-	descr->smgr.array.filesAllocated = 0;
-	descr->smgr.array.files = NULL;
+	pfree(descr->smgr.array.files);
 }
 
 /*
@@ -549,15 +674,16 @@ btree_smgr_write(BTreeDescr *desc, char *buffer, uint32 chkpNum,
 		int			segno = curOffset / ORIOLEDB_SEGMENT_SIZE;
 		int			partno = 0;
 		File		file;
+		uint32		loadId = 0;
 
 		if (orioledb_s3_mode)
 		{
 			tag.segNum = segno;
 			partno = (curOffset % ORIOLEDB_SEGMENT_SIZE) / ORIOLEDB_S3_PART_SIZE;
-			s3_header_lock_part(tag, partno, NULL);
+			s3_header_lock_part(tag, partno, &loadId);
 		}
 
-		file = btree_open_smgr_file(desc, segno);
+		file = btree_open_smgr_file(desc, segno, chkpNum, loadId);
 		if ((curOffset + amount) / granularity == curOffset / granularity)
 		{
 			result += OFileWrite(file, buffer, amount,
@@ -588,7 +714,8 @@ btree_smgr_write(BTreeDescr *desc, char *buffer, uint32 chkpNum,
 }
 
 static int
-btree_smgr_read(BTreeDescr *desc, char *buffer, int amount, off_t offset)
+btree_smgr_read(BTreeDescr *desc, char *buffer, uint32 chkpNum,
+				int amount, off_t offset)
 {
 	int			result = 0;
 	off_t		granularity;
@@ -633,15 +760,16 @@ btree_smgr_read(BTreeDescr *desc, char *buffer, int amount, off_t offset)
 		int			segno = offset / ORIOLEDB_SEGMENT_SIZE;
 		int			partno = 0;
 		File		file;
+		uint32		loadId = 0;
 
 		if (orioledb_s3_mode)
 		{
 			tag.segNum = segno;
 			partno = (offset % ORIOLEDB_SEGMENT_SIZE) / ORIOLEDB_S3_PART_SIZE;
-			s3_header_lock_part(tag, partno, NULL);
+			s3_header_lock_part(tag, partno, &loadId);
 		}
 
-		file = btree_open_smgr_file(desc, segno);
+		file = btree_open_smgr_file(desc, segno, chkpNum, loadId);
 		if ((offset + amount) / granularity == offset / granularity)
 		{
 			result += OFileRead(file, buffer, amount,
@@ -695,7 +823,7 @@ btree_smgr_writeback(BTreeDescr *desc, uint32 chkpNum,
 		int			segno = offset / ORIOLEDB_SEGMENT_SIZE;
 		File		file;
 
-		file = btree_open_smgr_file(desc, segno);
+		file = btree_open_smgr_file(desc, segno, chkpNum, 0);
 		if ((offset + amount) / ORIOLEDB_SEGMENT_SIZE == segno)
 		{
 			FileWriteback(file,
@@ -729,7 +857,7 @@ btree_smgr_sync(BTreeDescr *desc, uint32 chkpNum, off_t length)
 	{
 		File		file;
 
-		file = btree_open_smgr_file(desc, num);
+		file = btree_open_smgr_file(desc, num, chkpNum, 0);
 		FileSync(file, WAIT_EVENT_DATA_FILE_SYNC);
 	}
 }
@@ -810,7 +938,7 @@ btree_smgr_punch_hole(BTreeDescr *desc, uint32 chkpNum,
 		off_t		segoffset;
 		int			seglength;
 
-		file = btree_open_smgr_file(desc, segno);
+		file = btree_open_smgr_file(desc, segno, chkpNum, 0);
 
 		segoffset = offset % ORIOLEDB_SEGMENT_SIZE;
 		if ((offset + length) / ORIOLEDB_SEGMENT_SIZE == segno)
@@ -1411,6 +1539,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 	off_t		byte_offset,
 				read_size;
 	uint64		offset = DOWNLINK_GET_DISK_OFF(downlink);
+	uint32		chkpNum = 0;
 	uint16		len = DOWNLINK_GET_DISK_LEN(downlink);
 	bool		err = false;
 	OrioleDBOndiskPageHeader ondisk_page_header = {0};
@@ -1435,7 +1564,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 			byte_offset = (off_t) offset * (off_t) ORIOLEDB_BLCKSZ;
 		read_size = ORIOLEDB_BLCKSZ;
 
-		err = btree_smgr_read(desc, img, read_size, byte_offset) != read_size;
+		err = btree_smgr_read(desc, img, chkpNum, read_size, byte_offset) != read_size;
 		if (err)
 			return OReadPageResultIOError;
 
@@ -1462,7 +1591,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 			byte_offset = (off_t) offset * (off_t) ORIOLEDB_COMP_BLCKSZ;
 			read_size = len * ORIOLEDB_COMP_BLCKSZ;
 
-			err = btree_smgr_read(desc, buf, read_size, byte_offset) != read_size;
+			err = btree_smgr_read(desc, buf, chkpNum, read_size, byte_offset) != read_size;
 			if (err)
 				return OReadPageResultIOError;
 
@@ -1491,14 +1620,14 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 			read_size = O_PAGE_HEADER_SIZE;
 
 			/* details about written image parts are in write_page_to_disk */
-			err = btree_smgr_read(desc, (Pointer) &ondisk_page_header, read_size, byte_offset) != read_size;
+			err = btree_smgr_read(desc, (Pointer) &ondisk_page_header, chkpNum, read_size, byte_offset) != read_size;
 			byte_offset += read_size;
 
 			if (err)
 				return OReadPageResultIOError;
 
 			read_size = ORIOLEDB_BLCKSZ - O_PAGE_HEADER_SIZE;
-			err = btree_smgr_read(desc, img + O_PAGE_HEADER_SIZE, read_size, byte_offset) != read_size;
+			err = btree_smgr_read(desc, img + O_PAGE_HEADER_SIZE, chkpNum, read_size, byte_offset) != read_size;
 			if (err)
 				return OReadPageResultIOError;
 

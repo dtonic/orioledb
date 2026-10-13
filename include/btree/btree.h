@@ -199,7 +199,6 @@ typedef union
 		File	   *files;
 		int			filesAllocated;
 	}			array;
-	struct s3Files_hash *hash;
 } OSmgr;
 
 typedef enum
