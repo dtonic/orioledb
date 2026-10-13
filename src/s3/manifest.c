@@ -51,6 +51,7 @@
 #define FILE_CHECKSUMS			ORIOLEDB_DATA_DIR "/file_checksums"
 #define SMALL_FILE_CHECKSUMS	ORIOLEDB_DATA_DIR "/small_file_checksums"
 #define RETIRED_FILENAME		ORIOLEDB_DATA_DIR "/s3_retired"
+#define BUNDLES_NOTE			ORIOLEDB_DATA_DIR "/s3_bundles"
 
 static StringInfo collected = NULL;
 static StringInfo catalogTrees = NULL;
@@ -600,6 +601,87 @@ write_durable(const char *path, StringInfo body)
 	pfree(tmp);
 }
 
+/*
+ * Checkpoint chkpNum put up `bundles` small file bundles, and is about to
+ * make its small file checksums the current ones.  From then on the checksums
+ * name chkpNum's bundles, and only the manifest says how many there are: a
+ * crash before the manifest is written would lose the count for good, and
+ * every later manifest would be incomplete.  The count goes to a local note
+ * first, a line "<checkpoint> <count>" kept for the last BUNDLES_NOTED
+ * checkpoints (the one after a crash takes a number of its own before the
+ * next manifest asks); s3_manifest_prepare() reads it when no manifest has
+ * the count.
+ */
+#define BUNDLES_NOTED	16
+
+void
+s3_manifest_note_bundles(uint32 chkpNum, int bundles)
+{
+	StringInfoData body;
+	FILE	   *f = AllocateFile(BUNDLES_NOTE, "r");
+	unsigned int noted;
+	int			count;
+
+	initStringInfo(&body);
+	while (f != NULL && fscanf(f, "%u %d", &noted, &count) == 2)
+		if (noted != chkpNum && noted + BUNDLES_NOTED > chkpNum)
+			appendStringInfo(&body, "%u %d\n", noted, count);
+	if (f != NULL)
+		FreeFile(f);
+	appendStringInfo(&body, "%u %d\n", chkpNum, bundles);
+	write_durable(BUNDLES_NOTE, &body);
+	pfree(body.data);
+}
+
+/*
+ * The bundle count of checkpoint chkpNum when no manifest has it: the note
+ * of the checkpoint that crashed before its manifest, else the bundles
+ * listed in the bucket, which are numbered densely from 0.  -1 when neither
+ * tells.
+ */
+static int
+recover_bundles(uint32 chkpNum)
+{
+	FILE	   *f = AllocateFile(BUNDLES_NOTE, "r");
+	unsigned int noted;
+	int			count;
+	uint64		token;
+	char	   *prefix;
+	List	   *keys;
+	ListCell   *lc;
+	int			highest = -1;
+
+	if (f != NULL)
+	{
+		bool		found = false;
+
+		while (!found && fscanf(f, "%u %d", &noted, &count) == 2)
+			found = noted == chkpNum;
+		FreeFile(f);
+		if (found)
+			return count;
+	}
+	if (!s3_checkpoint_token_known(chkpNum, &token))
+		return -1;
+	prefix = psprintf("data/" UINT64_FORMAT "-%u/" ORIOLEDB_DATA_DIR "/small_files_",
+					  token, chkpNum);
+	keys = s3_list_objects(prefix, NULL);
+	foreach(lc, keys)
+	{
+		unsigned int n;
+
+		if (sscanf((char *) lfirst(lc) + strlen(prefix), "%u", &n) == 1)
+			highest = Max(highest, (int) n);
+	}
+	list_free_deep(keys);
+	pfree(prefix);
+	if (highest >= 0)
+		ereport(LOG,
+				(errmsg("S3 manifest counted %d small file bundles of checkpoint %u in the bucket",
+						highest + 1, chkpNum)));
+	return highest >= 0 ? highest + 1 : -1;
+}
+
 static void
 upload(uint32 chkpNum, StringInfo body)
 {
@@ -803,7 +885,15 @@ s3_manifest_prepare(uint32 chkpNum, int bundles)
 		if (b)
 			appendStringInfo(&body, "bundles %u %d\n", *chkp, b->count);
 		else
-			complete = false;
+		{
+			/* one that crashed between its checksums and its manifest */
+			int			count = recover_bundles(*chkp);
+
+			if (count >= 0)
+				appendStringInfo(&body, "bundles %u %d\n", *chkp, count);
+			else
+				complete = false;
+		}
 	}
 	hash_destroy(smallChkps);
 

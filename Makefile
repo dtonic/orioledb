@@ -288,6 +288,7 @@ TESTGRESCHECKS_PART_2 = test/t/checkpoint_concurrent_test.py \
 						test/t/s3_loader_test.py \
 						test/t/s3_seams_test.py \
 						test/t/s3_lease_test.py \
+						test/t/s3_gc_test.py \
 						test/t/schema_test.py \
 						test/t/seq_scan_own_write_test.py \
 						test/t/seq_scan_resowner_test.py \

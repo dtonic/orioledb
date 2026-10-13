@@ -1592,11 +1592,13 @@ s3_lease_root_checkpoint(void)
  * below it); folded, the checkpoints whose lists of dead extents are in the
  * trees' GC states; collected, the checkpoints whose manifests and the
  * objects only they referred to are gone.  Another writer that takes the
- * bucket over goes on from there.
+ * bucket over goes on from there.  `skipped` is lines "skipped <db> <rel>"
+ * (NULL: none): the trees whose lists the GC left because it could not read
+ * their state, which --sweep leaves too.
  */
 void
 s3_gc_publish(uint32 retain, uint32 folded, uint32 collected,
-			  uint32 pinFloor, uint32 pinWarn)
+			  uint32 pinFloor, uint32 pinWarn, const char *skipped)
 {
 	StringInfoData body;
 
@@ -1613,6 +1615,8 @@ s3_gc_publish(uint32 retain, uint32 folded, uint32 collected,
 					 "pin_floor %u\npin_warn %u\ntoken " UINT64_FORMAT "\n",
 					 LEASE_FORMAT, retain, folded, collected, pinFloor, pinWarn,
 					 lease->token);
+	if (skipped)
+		appendStringInfoString(&body, skipped);
 
 	/*
 	 * Put over what is there only while it is ours or an earlier writer's,
@@ -1656,10 +1660,12 @@ s3_gc_publish(uint32 retain, uint32 folded, uint32 collected,
 }
 
 /*
- * What the GC published last.  False when the bucket cannot tell.
+ * What the GC published last.  False when the bucket cannot tell.  The
+ * "skipped" lines go to `skipped` when it is not NULL.
  */
 bool
-s3_gc_progress(uint32 *retain, uint32 *folded, uint32 *collected)
+s3_gc_progress(uint32 *retain, uint32 *folded, uint32 *collected,
+			   StringInfo skipped)
 {
 	StringInfoData body;
 	char		etag[S3_ETAG_LEN];
@@ -1677,18 +1683,39 @@ s3_gc_progress(uint32 *retain, uint32 *folded, uint32 *collected)
 			*folded = (uint32) strtoul(value, NULL, 10);
 		if (kv_get(body.data, "collected", value, sizeof(value)))
 			*collected = (uint32) strtoul(value, NULL, 10);
+		if (skipped)
+		{
+			const char *line = body.data;
+
+			while (line && *line)
+			{
+				const char *end = strchr(line, '\n');
+
+				if (strncmp(line, "skipped ", 8) == 0)
+					appendBinaryStringInfo(skipped, line,
+										   end ? end - line + 1 : strlen(line));
+				line = end ? end + 1 : NULL;
+			}
+		}
 	}
 	pfree(body.data);
 	return code == S3_RESPONSE_OK || code == S3_RESPONSE_NOT_FOUND;
 }
 
 /*
- * Pins are lines "<id> <checkpoint> <expires_at>" of the readers object, the
- * store's clock.  Returns the lowest checkpoint of a pin not expired, or
- * upper when there is none.
+ * Pins are lines "<id> <checkpoint> <expires_at> [<ttl>]" of the readers
+ * object, the store's clock.  Returns the lowest checkpoint of a pin not
+ * expired, or upper when there is none.  A pin below `floor` is not counted;
+ * one below `pinFloor` is not counted once its reader has had a renewal in
+ * which to see pin_warn and stop -- the pin is older than a renewal interval,
+ * a third of its time to live (the line's; a line without one, a pin from
+ * before the field, is taken for this writer's s3_reader_pin_ttl).  A pin
+ * written since was renewed before the floor passed it: its reader does not
+ * know yet, and may be reading what is below.
  */
 static uint32
-pins_min(const char *body, int64 storageNow, uint32 upper, uint32 floor)
+pins_min(const char *body, int64 storageNow, uint32 upper, uint32 floor,
+		 uint32 pinFloor)
 {
 	const char *line = body;
 	uint32		result = upper;
@@ -1697,11 +1724,19 @@ pins_min(const char *body, int64 storageNow, uint32 upper, uint32 floor)
 	{
 		char		id[64];
 		unsigned int chkp;
-		long long	expires;
+		long long	expires,
+					ttl = s3_reader_pin_ttl;
+		int			n = sscanf(line, "%63s %u %lld %lld", id, &chkp, &expires, &ttl);
 
-		if (sscanf(line, "%63s %u %lld", id, &chkp, &expires) == 3 &&
-			expires >= storageNow && chkp >= floor && chkp < result)
-			result = chkp;
+		if (n >= 3 && expires >= storageNow && chkp >= floor && chkp < result)
+		{
+			int64		age = (int64) ttl - (expires - storageNow);
+
+			if (chkp < pinFloor && age >= ttl / 3)
+				;				/* passed over: its reader was told */
+			else
+				result = chkp;
+		}
 		line = strchr(line, '\n');
 		if (line)
 			line++;
@@ -1710,7 +1745,7 @@ pins_min(const char *body, int64 storageNow, uint32 upper, uint32 floor)
 }
 
 uint32
-s3_reader_pins_min(uint32 upper, uint32 floor)
+s3_reader_pins_min(uint32 upper, uint32 floor, uint32 pinFloor)
 {
 	StringInfoData body;
 	char		etag[S3_ETAG_LEN];
@@ -1726,7 +1761,7 @@ s3_reader_pins_min(uint32 upper, uint32 floor)
 		result = 0;				/* not known: collect nothing */
 	else
 		result = pins_min(body.data, store_clock_or_local(storageNow, READERS_KEY),
-						  upper, floor);
+						  upper, floor, pinFloor);
 	pfree(body.data);
 	return result;
 }
@@ -1765,6 +1800,7 @@ reader_pin(const char *id, uint32 chkp)
 		exists = code == S3_RESPONSE_OK;
 		storageNow = store_clock_or_local(storageNow, READERS_KEY);
 
+		/* the others' lines as they are: a field this reader does not know stays */
 		for (line = exists ? body.data : ""; line && *line;)
 		{
 			char		other[64];
@@ -1774,11 +1810,14 @@ reader_pin(const char *id, uint32 chkp)
 
 			if (sscanf(line, "%63s %u %lld", other, &otherChkp, &expires) == 3 &&
 				strcmp(other, id) != 0 && expires >= storageNow)
-				appendStringInfo(&next, "%s %u %lld\n", other, otherChkp, expires);
+			{
+				appendBinaryStringInfo(&next, line, end ? end - line : strlen(line));
+				appendStringInfoChar(&next, '\n');
+			}
 			line = end ? end + 1 : NULL;
 		}
-		appendStringInfo(&next, "%s %u " INT64_FORMAT "\n", id, chkp,
-						 storageNow + s3_reader_pin_ttl);
+		appendStringInfo(&next, "%s %u " INT64_FORMAT " %d\n", id, chkp,
+						 storageNow + s3_reader_pin_ttl, s3_reader_pin_ttl);
 
 		code = s3_request_once("PUT", READERS_KEY, next.data, next.len,
 							   exists ? etag : NULL, !exists,
@@ -1808,7 +1847,7 @@ gc_kept(void)
 				folded,
 				collected;
 
-	if (!s3_gc_progress(&retain, &folded, &collected))
+	if (!s3_gc_progress(&retain, &folded, &collected, NULL))
 		ereport(FATAL,
 				(errcode(ERRCODE_CONNECTION_EXCEPTION),
 				 errmsg("could not read \"%s\" from the S3 bucket", GC_KEY)));
