@@ -115,14 +115,15 @@ class S3DatapathTest(S3BaseTest):
 		with open(self.node.pg_log_file) as f:
 			return f.read()
 
-	def lookup_error(self, key=30000, timeout='60s'):
-		"""The error a lookup of an evicted part ends in, and how long it
-		took."""
+	def lookup_error(self, timeout='60s'):
+		"""The error a lookup of evicted parts ends in, and how long it took.
+		Five keys spread over the table: the eviction spares a file's last
+		part most cycles, so one key could find its part still here."""
 		started = time.time()
 		with self.assertRaises(QueryException) as e:
 			self.node.safe_psql(f"SET statement_timeout = '{timeout}'; "
 			                    f"SELECT length(value) FROM o_test "
-			                    f"WHERE id = {key}")
+			                    f"WHERE id IN (2000, 10000, 20000, 30000, 38000)")
 		return e.exception.message, time.time() - started
 
 	def test_s3_a_part_missing_from_the_bucket_is_an_error(self):
@@ -159,9 +160,10 @@ class S3DatapathTest(S3BaseTest):
 		# worker died on the way
 		for key, body in saved.items():
 			self.client.put_object(Bucket=self.bucket_name, Key=key, Body=body)
-		self.assertEqual([(960, )],
+		self.assertEqual([(960, )] * 5,
 		                 node.execute("SELECT length(value) FROM o_test "
-		                              "WHERE id = 30000"))
+		                              "WHERE id IN (2000, 10000, 20000, "
+		                              "30000, 38000)"))
 		log = self.server_log()
 		self.assertEqual(
 		    workers_started,
@@ -195,9 +197,10 @@ class S3DatapathTest(S3BaseTest):
 		self.assertIn("from the S3 bucket", message)
 		self.assertLess(elapsed, 20, f"the error took {elapsed:.0f} s")
 		# the store gives the part again: the part is read
-		self.assertEqual([(960, )],
+		self.assertEqual([(960, )] * 5,
 		                 node.execute("SELECT length(value) FROM o_test "
-		                              "WHERE id = 30000"))
+		                              "WHERE id IN (2000, 10000, 20000, "
+		                              "30000, 38000)"))
 		self.assertNotIn("could not get object from S3", self.server_log())
 		node.stop()
 
@@ -223,9 +226,10 @@ class S3DatapathTest(S3BaseTest):
 		self.assertIn("refused part", message)
 		self.assertIn("trees/", message)
 		self.assertLess(elapsed, 20, f"the error took {elapsed:.0f} s")
-		self.assertEqual([(960, )],
+		self.assertEqual([(960, )] * 5,
 		                 node.execute("SELECT length(value) FROM o_test "
-		                              "WHERE id = 30000"))
+		                              "WHERE id IN (2000, 10000, 20000, "
+		                              "30000, 38000)"))
 		node.stop()
 
 	def test_s3_a_stalled_get_is_given_up_and_retried(self):
@@ -255,7 +259,7 @@ class S3DatapathTest(S3BaseTest):
 				started = time.time()
 				node.safe_psql("SET statement_timeout = '240s'; "
 				               "SELECT length(value) FROM o_test "
-				               "WHERE id = 30000")
+				               "WHERE id IN (2000, 10000, 20000, 30000, 38000)")
 				elapsed = time.time() - started
 		finally:
 			release.set()
@@ -325,7 +329,7 @@ class S3DatapathTest(S3BaseTest):
 			read = Thread(target=lambda: done.append(
 			    node.safe_psql("SET statement_timeout = '150s'; "
 			                   "SELECT length(value) FROM o_test "
-			                   "WHERE id = 30000")))
+			                   "WHERE id IN (2000, 10000, 20000, 30000, 38000)")))
 			read.start()
 			deadline = time.time() + 60
 			while refused[0] < 2 and time.time() < deadline:
