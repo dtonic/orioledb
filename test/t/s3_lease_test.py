@@ -355,6 +355,75 @@ class S3LeaseTest(S3BaseTest):
 		self.assertEqual([(1, )], node.execute("SELECT 1"))
 		node.stop()
 
+	def test_s3_terminator_is_placed_again_after_a_lagging_listing(self):
+		"""The chunks before the one a loaded data directory was at are gone
+		(archived), and the listing that looks for the last chunk lags the
+		store's writes: it shows none, and the terminator goes into the gap.
+		There it fences nothing, and a restore takes it for the end of the
+		WAL.  A second listing from the terminator on shows the chunks of
+		the fenced writer past it: the terminator is put after the newest
+		again, and the one in the gap goes."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			with open(os.path.join(new_node.data_dir, 'orioledb_data',
+			                       's3_wal_seq')) as f:
+				hint = int(f.read().split()[1])
+			hint_key = f'wal/00000001/chunks/{hint:020d}'
+			for i in range(1, 6):
+				node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+				wal_file = node.execute(
+				    "SELECT pg_walfile_name(pg_current_wal_lsn());")[0][0]
+				node.safe_psql("SELECT pg_switch_wal();")
+				deadline = time.time() + 60
+				while not self.keys(f'wal/{wal_file}'):
+					self.assertLess(time.time(), deadline)
+					time.sleep(0.1)
+			# the chunks from the hint on are gone, later ones are not
+			deadline = time.time() + 60
+			while time.time() < deadline and \
+			    any(k <= hint_key for k in self.chunk_keys()):
+				node.safe_psql("SELECT 1;")
+				time.sleep(1)
+			self.assertFalse(any(k <= hint_key for k in self.chunk_keys()))
+			for i in range(6, 9):
+				node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+			self.assertTrue(self.chunk_keys())
+			os.kill(node.pid, signal.SIGKILL)
+
+			lagged = []
+
+			def lagging_listing(response):
+				body = orig_list_objects_v2(response)
+				if not lagged and response.querystring.get('start-after') and \
+				    'chunks/' in response.querystring.get('prefix', [''])[0]:
+					lagged.append(True)
+					return re.sub(r"<Contents>.*?</Contents>", "", body,
+					              flags=re.S)
+				return body
+
+			new_node.append_conf(port=new_node.port)
+			with patch('moto.s3.responses.S3Response.list_objects_v2',
+			           new=lagging_listing):
+				new_node.start()
+			self.assertEqual([True], lagged)
+			self.assertEqual([(8, )],
+			                 new_node.execute("SELECT count(*) FROM o_test"))
+			self.assertIn('put the WAL terminator again', self.log(new_node))
+			self.assertEqual([], self.keys(hint_key))
+			self.assertEqual([], self.keys(
+			    f'wal/00000001/terminators/{hint:020d}'))
+			new_node.stop()
+			new_node.cleanup()
+
 	def test_s3_status_answers_while_the_store_stalls(self):
 		"""The lease's renewal is a request to the store; while it waits,
 		orioledb_s3_status() reads the shared state without waiting for

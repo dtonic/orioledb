@@ -89,6 +89,7 @@
 #define RESTORE_BUCKET_FILENAME	ORIOLEDB_DATA_DIR "/s3_restore_bucket"
 #define CHUNK_MAX_BYTES			(16 * 1024 * 1024)
 #define CHUNK_GC_INTERVAL_MS	10000
+#define TERMINATOR_ATTEMPTS		8
 
 bool		s3_wal_shipping = true;
 int			s3_wal_chunk_delay = 1;
@@ -700,6 +701,7 @@ s3_wal_place_terminator(uint64 token, bool loaded)
 	bool		crc_ok;
 	ControlFileData *cf;
 	StringInfoData retired;
+	uint64		misplaced = 0;	/* the previous attempt's terminator, see below */
 
 	cf = get_controlfile(DataDir, &crc_ok);
 	if (!crc_ok)
@@ -733,23 +735,88 @@ s3_wal_place_terminator(uint64 token, bool loaded)
 	header.magic = TERMINATOR_MAGIC;
 	header.timeline = tli;
 	header.token = token;
-	for (;; seq++)
+	for (int attempt = 0;; attempt++)
 	{
-		char	   *key = chunk_key(tli, seq);
-		long		code;
+		uint64		newest = 0;
+		bool		past = false;
+		char	   *prefix,
+				   *after;
+		List	   *keys;
+		ListCell   *lc;
 
-		/* taken: the fenced writer put one more meanwhile */
-		code = s3_put_object_conditional(key, (Pointer) &header, sizeof(header),
-										 NULL, true, NULL);
-		pfree(key);
-		if (code == S3_RESPONSE_OK)
+		for (;; seq++)
+		{
+			char	   *key = chunk_key(tli, seq);
+			long		code;
+
+			/* taken: the fenced writer put one more meanwhile */
+			code = s3_put_object_conditional(key, (Pointer) &header, sizeof(header),
+											 NULL, true, NULL);
+			pfree(key);
+			if (code == S3_RESPONSE_OK)
+				break;
+		}
+		{
+			char	   *mark = terminator_mark_key(tli, seq);
+
+			(void) s3_put_object_conditional(mark, "", 0, NULL, true, NULL);
+			pfree(mark);
+		}
+
+		/* the one the lagging listing had put short of the end (below) */
+		if (attempt > 0)
+		{
+			char	   *key = chunk_key(tli, misplaced);
+			char	   *mark = terminator_mark_key(tli, misplaced);
+
+			s3_delete_object(key);
+			s3_delete_object(mark);
+			pfree(key);
+			pfree(mark);
+		}
+
+		/*
+		 * The listing may lag the store's writes (RustFS): a chunk put before
+		 * it and not in it leaves the terminator short of the end, in a gap
+		 * the GC made, where it fences nothing and a restore takes it for the
+		 * end of the WAL.  List again from the terminator on: a chunk of a
+		 * smaller token past it says so.  The terminator goes again after the
+		 * newest, and the one in the gap is removed once the new one is up --
+		 * the fenced writer's shipper is past that key, which it never puts
+		 * again.  A listing that lags on and on is given up on.
+		 */
+		prefix = psprintf("wal/%08X/chunks/", tli);
+		after = chunk_key(tli, seq);
+		keys = s3_list_objects(prefix, after);
+		foreach(lc, keys)
+		{
+			uint64		listed = strtou64((char *) lfirst(lc) + strlen(prefix), NULL, 10);
+			ChunkHeader existing;
+
+			newest = Max(newest, listed);
+			if (!past && read_chunk_header(tli, listed, &existing) &&
+				existing.token < token)
+				past = true;
+		}
+		list_free_deep(keys);
+		pfree(prefix);
+		pfree(after);
+		if (!past)
 			break;
-	}
-	{
-		char	   *mark = terminator_mark_key(tli, seq);
-
-		(void) s3_put_object_conditional(mark, "", 0, NULL, true, NULL);
-		pfree(mark);
+		if (attempt >= TERMINATOR_ATTEMPTS)
+			ereport(FATAL,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("could not put a WAL terminator after the last chunk of timeline %u",
+							tli),
+					 errdetail("The bucket still lists a chunk of an earlier writer past "
+							   "the terminator at chunk %llu, after %d attempts.",
+							   (unsigned long long) seq, attempt + 1)));
+		ereport(LOG,
+				(errmsg("the listing lagged: put the WAL terminator again at chunk %llu "
+						"of timeline %u, past chunk %llu",
+						(unsigned long long) newest + 1, tli, (unsigned long long) seq)));
+		misplaced = seq;
+		seq = newest + 1;
 	}
 
 	/*
