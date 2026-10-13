@@ -337,6 +337,48 @@ is_transient(long code)
 }
 
 /*
+ * The lease is judged on the store's clock, read from the Date header of its
+ * answers.  An answer without one that reads leaves nothing to judge the
+ * lease by: a writer refuses to take or wait for a lease then, rather than
+ * judge it on its own clock, which another instance does not share.
+ */
+static void
+require_store_clock(int64 storageNow, const char *key)
+{
+	if (storageNow >= 0)
+		return;
+	ereport(FATAL,
+			(errcode(ERRCODE_CONNECTION_EXCEPTION),
+			 errmsg("the S3 store sent no usable Date header"),
+			 errdetail("The answer to GET \"%s\" carries no Date header that "
+					   "reads as an HTTP date; the writer lease is judged on "
+					   "the store's clock.", key)));
+}
+
+/*
+ * The same clock where only a reader pin is at stake: the local clock stands
+ * in, said once.  A pin judged a little off stays a pin.
+ */
+static int64
+store_clock_or_local(int64 storageNow, const char *key)
+{
+	static bool warned = false;
+
+	if (storageNow >= 0)
+		return storageNow;
+	if (!warned)
+	{
+		warned = true;
+		ereport(WARNING,
+				(errmsg("the S3 store sent no usable Date header, judging the "
+						"reader pins on the local clock"),
+				 errdetail("The answer to GET \"%s\" carries no Date header that "
+						   "reads as an HTTP date.", key)));
+	}
+	return (int64) time(NULL);
+}
+
+/*
  * Read an object: 200 with its body and ETag, 404, or a transient code.
  */
 static long
@@ -868,8 +910,7 @@ wait_for_own_lease(WriterBody *writer, char *writerEtag, int64 storageNow)
 			ereport(FATAL,
 					(errmsg("the \"%s\" object of the S3 bucket changed while "
 							"waiting for it", WRITER_KEY)));
-		if (storageNow < 0)
-			storageNow = (int64) time(NULL);
+		require_store_clock(storageNow, WRITER_KEY);
 		if (strcmp(etag, writerEtag) != 0)
 			ereport(FATAL,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -982,8 +1023,7 @@ s3_lease_acquire(void)
 	if (writerExists && !parse_writer(body.data, &writer))
 		ereport(FATAL,
 				(errmsg("invalid \"%s\" object in the S3 bucket", WRITER_KEY)));
-	if (storageNow < 0)
-		storageNow = (int64) time(NULL);
+	require_store_clock(storageNow, WRITER_KEY);
 
 	if (rootExists)
 		bucket = root.bucket;
@@ -1685,7 +1725,7 @@ s3_reader_pins_min(uint32 upper, uint32 floor)
 	else if (code != S3_RESPONSE_OK)
 		result = 0;				/* not known: collect nothing */
 	else
-		result = pins_min(body.data, storageNow >= 0 ? storageNow : (int64) time(NULL),
+		result = pins_min(body.data, store_clock_or_local(storageNow, READERS_KEY),
 						  upper, floor);
 	pfree(body.data);
 	return result;
@@ -1723,8 +1763,7 @@ reader_pin(const char *id, uint32 chkp)
 			continue;
 		}
 		exists = code == S3_RESPONSE_OK;
-		if (storageNow < 0)
-			storageNow = (int64) time(NULL);
+		storageNow = store_clock_or_local(storageNow, READERS_KEY);
 
 		for (line = exists ? body.data : ""; line && *line;)
 		{

@@ -339,6 +339,22 @@ class S3LeaseTest(S3BaseTest):
 			self.s3_server.before_write = None
 			self.kill_quietly(node)
 
+	def test_s3_start_refuses_a_store_with_no_usable_date(self):
+		"""The lease's expiry is judged on the store's clock, read from the
+		Date header: a store whose answers carry none that reads is refused
+		at start, instead of being judged on the local clock."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		with patch.object(werkzeug.serving.WSGIRequestHandler,
+		                  'date_time_string',
+		                  new=lambda self, timestamp=None: 'some day'):
+			with self.assertRaises(StartNodeException):
+				node.start()
+		self.assertIn('no usable Date', self.log(node))
+		node.start()
+		self.assertEqual([(1, )], node.execute("SELECT 1"))
+		node.stop()
+
 	def test_s3_status_answers_while_the_store_stalls(self):
 		"""The lease's renewal is a request to the store; while it waits,
 		orioledb_s3_status() reads the shared state without waiting for
