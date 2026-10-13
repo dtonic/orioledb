@@ -6,7 +6,6 @@ import os
 import time
 
 from .s3_base_test import S3BaseTest
-from .s3_base_test import s3_test_attrs
 
 from testgres.exceptions import QueryException
 
