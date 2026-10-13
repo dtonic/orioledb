@@ -25,7 +25,13 @@ typedef enum
 	S3PartStatusNotLoaded = 0,
 	S3PartStatusLoading = 1,
 	S3PartStatusLoaded = 2,
-	S3PartStatusEvicting = 3
+	S3PartStatusEvicting = 3,
+	/*
+	 * An S3 worker could not download the part (s3_header_mark_part_failed):
+	 * a reader finding it reports the part and puts it back to NotLoaded.
+	 * Nothing is here, as for NotLoaded.
+	 */
+	S3PartStatusFailed = 4
 } S3PartStatus;
 
 /*
@@ -54,6 +60,7 @@ extern uint64 s3_headers_unsealed_parts(void);
 extern S3PartStatus s3_header_part_status(S3HeaderTag tag, int index);
 extern S3PartStatus s3_header_mark_part_loading(S3HeaderTag tag, int index);
 extern void s3_header_release_part_load(S3HeaderTag tag, int index);
+extern void s3_header_mark_part_failed(S3HeaderTag tag, int index);
 extern void s3_header_mark_part_loaded(S3HeaderTag tag, int index);
 extern void s3_header_unlock_part(S3HeaderTag tag, int index, bool setDirty,
 								  int stream);

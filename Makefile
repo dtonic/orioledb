@@ -63,6 +63,7 @@ OBJS = src/btree/btree.o \
 	   src/rewind/rewind.o \
 	   src/s3/archive.o \
 	   src/s3/checkpoint.o \
+	   src/s3/commit.o \
 	   src/s3/control.o \
 	   src/s3/checksum.o \
 	   src/s3/compact.o \
@@ -284,6 +285,11 @@ TESTGRESCHECKS_PART_2 = test/t/checkpoint_concurrent_test.py \
 						test/t/restartpoint_xids_test.py \
 						test/t/tbl_check_free_extents_test.py \
 						test/t/s3_test.py \
+						test/t/s3_loader_test.py \
+						test/t/s3_seams_test.py \
+						test/t/s3_lease_test.py \
+						test/t/s3_gc_test.py \
+						test/t/s3_datapath_test.py \
 						test/t/schema_test.py \
 						test/t/seq_scan_own_write_test.py \
 						test/t/seq_scan_resowner_test.py \
@@ -310,14 +316,18 @@ PERFCHECKS = $(sort $(wildcard perf/*_perf.py))
 PG_REGRESS_ARGS=--no-locale --inputdir=test --outputdir=test --temp-instance=./test/tmp_check
 PG_ISOLATION_REGRESS_ARGS=--no-locale --inputdir=test --outputdir=test/output_iso --temp-instance=./test/tmp_check_iso
 
+# A generated sql/X.sql is upstream's X_prod.sql, then the fork's X_dtonic.sql
+# where there is one, then X_dev.sql under IS_DEV.  The parts are the
+# prerequisites, so a change to any of them regenerates the file.
+.SECONDEXPANSION:
 ifdef IS_DEV
 override PG_CPPFLAGS += -DIS_DEV
 
-sql/%.sql:
-	@cat sql/$*_prod.sql sql/$*_dev.sql > $@
+sql/%.sql: sql/%_prod.sql $$(wildcard sql/$$*_dtonic.sql) sql/%_dev.sql
+	@cat $^ > $@
 else
-sql/%.sql:
-	@cat sql/$*_prod.sql > $@
+sql/%.sql: sql/%_prod.sql $$(wildcard sql/$$*_dtonic.sql)
+	@cat $^ > $@
 endif
 
 ifdef USE_PGXS

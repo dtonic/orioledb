@@ -85,6 +85,7 @@ typedef struct
 extern void s3_manifest_begin(uint32 chkpNum);
 extern void s3_manifest_note(uint32 chkpNum, const char *fmt,...) pg_attribute_printf(2, 3);
 extern void s3_manifest_note_tree(Oid datoid, Oid relnode, Oid spcoid);
+extern void s3_manifest_note_bundles(uint32 chkpNum, int bundles);
 extern void s3_manifest_prepare(uint32 chkpNum, int bundles);
 extern bool s3_manifest_publish(uint32 chkpNum, XLogRecPtr redoLsn,
 								XLogRecPtr checkpointLsn, TimeLineID timeline);

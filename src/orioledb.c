@@ -549,14 +549,10 @@ static RmgrData rmgr =
 static bool
 orioledb_enable_s3_check_hook(bool *newval, void **extra, GucSource source)
 {
-#ifndef IS_DEV
-	if (*newval)
-	{
-		ereport(WARNING,
-				errmsg("orioledb.s3_mode is only available in development builds (IS_DEV=1), ignoring"));
-		*newval = false;
-	}
-#endif
+	/*
+	 * S3 mode is in every build of this fork, release builds included;
+	 * upstream gates it here to development builds (IS_DEV).
+	 */
 	return true;
 }
 

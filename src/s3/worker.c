@@ -288,7 +288,7 @@ flush_worker_checksum_state(void)
  * by that name for as long as any checkpoint refers to it.  A map is the
  * tree's state at one checkpoint.
  */
-static char *
+char *
 s3_part_object_name(OIndexKey key, int64 partNum)
 {
 	return psprintf("trees/%u/%u/parts/" INT64_FORMAT,
@@ -414,6 +414,7 @@ s3process_task(uint64 taskLocation)
 		int64		partNum = task->typeSpecific.filePart.partNum;
 		int32		segNum = partNum / S3_PARTS_PER_SEGMENT,
 					index = partNum % S3_PARTS_PER_SEGMENT;
+		long		code;
 
 		tag.key = task->typeSpecific.filePart.key;
 		tag.segNum = segNum;
@@ -438,17 +439,38 @@ s3process_task(uint64 taskLocation)
 
 		elog(DEBUG1, "S3 part get %s %s", objectname, filename);
 
-		if (task->typeSpecific.filePart.claimed)
-			s3_get_file_part(objectname, filename, index);
-		else if (!s3_try_get_file_part(objectname, filename, index))
+		code = s3_try_get_file_part(objectname, filename, index,
+									!task->typeSpecific.filePart.claimed);
+		if (code != S3_RESPONSE_OK)
 		{
-			/*
-			 * A hint for a part the store does not have (a read ahead past
-			 * the tree's last part): give it back rather than end the worker.
-			 * A part a query needs is downloaded by the process that needs
-			 * it, which reports a part that is missing.
-			 */
-			s3_header_release_part_load(tag, index);
+			if (task->typeSpecific.filePart.claimed)
+			{
+				/*
+				 * A part somebody waits for that the store did not give
+				 * (not there, or refused for good: a transient failure is
+				 * retried inside the request).  Dying on it replayed the
+				 * task for ever, a restart a second, while the waiters
+				 * waited with no message.  The part is marked failed: the
+				 * waiter reports it and gives it back for the next try.
+				 */
+				ereport(WARNING,
+						(errmsg("could not get S3 object \"%s\" for part " INT64_FORMAT " of tree %u/%u",
+								objectname, partNum,
+								tag.key.oids.datoid, tag.key.oids.relnode),
+						 errdetail("http code = %ld", code)));
+				s3_header_mark_part_failed(tag, index);
+			}
+			else
+			{
+				/*
+				 * A hint for a part the store does not have (a read ahead
+				 * past the tree's last part) or refuses: give it back
+				 * rather than end the worker.  A part a query needs is
+				 * downloaded by the process that needs it, which reports a
+				 * part that is missing.
+				 */
+				s3_header_release_part_load(tag, index);
+			}
 			pfree(filename);
 			pfree(objectname);
 			goto part_done;
@@ -666,25 +688,6 @@ part_done:
 
 		pfree(filename);
 		pfree(objectname);
-	}
-	else if (task->type == S3TaskTypeWriteRootFile)
-	{
-		char	   *filename = task->typeSpecific.writeRootFile.filename;
-		long		result;
-
-		if (filename[0] == '.' && filename[1] == '/')
-			filename += 2;
-
-		objectname = psprintf("data/%s", filename);
-
-		elog(DEBUG1, "S3 put %s %s", objectname, filename);
-
-		result = s3_put_file(objectname, filename, false);
-
-		pfree(objectname);
-
-		if ((result == S3_RESPONSE_OK) && task->typeSpecific.writeRootFile.delete)
-			unlink(filename);
 	}
 	else if (task->type == S3TaskTypeDeleteWalChunks)
 	{
@@ -920,10 +923,11 @@ s3_schedule_file_part_read(uint32 chkpNum, OIndexKey key, int64 partNum,
 	if (partNum >= 0 && !claim)
 	{
 		S3HeaderTag tag = {.key = key,.segNum = partNum / S3_PARTS_PER_SEGMENT};
+		S3PartStatus status;
 
 		/* a hint: the worker claims the part when it gets to the task */
-		if (s3_header_part_status(tag, partNum % S3_PARTS_PER_SEGMENT) !=
-			S3PartStatusNotLoaded)
+		status = s3_header_part_status(tag, partNum % S3_PARTS_PER_SEGMENT);
+		if (status != S3PartStatusNotLoaded && status != S3PartStatusFailed)
 			return 0;
 	}
 	else if (partNum >= 0)
@@ -1120,34 +1124,6 @@ s3_schedule_downlink_load(BTreeDescr *desc, uint64 downlink)
 }
 
 /*
- * Schedule a synchronization of given file to S3.
- */
-S3TaskLocation
-s3_schedule_root_file_write(char *filename, bool delete)
-{
-	S3Task	   *task;
-	int			filenameLen,
-				taskLen;
-	S3TaskLocation location;
-
-	filenameLen = strlen(filename);
-	taskLen = INTALIGN(offsetof(S3Task, typeSpecific.writeRootFile.filename) + filenameLen + 1);
-	task = (S3Task *) palloc0(taskLen);
-	task->type = S3TaskTypeWriteRootFile;
-	task->typeSpecific.writeRootFile.delete = delete;
-	memcpy(task->typeSpecific.writeRootFile.filename, filename, filenameLen + 1);
-
-	location = s3_queue_put_task((Pointer) task, taskLen);
-
-	elog(DEBUG1, "S3 schedule root file write: %s %u (%llu)",
-		 filename, delete ? 1 : 0, (unsigned long long) location);
-
-	pfree(task);
-
-	return location;
-}
-
-/*
  * Schedule a synchronization of given PGDATA file to S3.
  */
 S3TaskLocation
@@ -1203,22 +1179,23 @@ s3_schedule_part_read_ahead(OIndexKey key, int64 partNum)
 }
 
 /*
- * Download a part the caller marked loading, in the calling process: false
- * when the store did not give it (the caller then leaves it to the workers).
+ * Download a part the caller marked loading, in the calling process: the HTTP
+ * status, S3_RESPONSE_OK when the part is here (the caller judges the rest:
+ * a part that is not in the bucket, one refused, or one left to the workers).
  */
-bool
+long
 s3_load_file_part_here(OIndexKey key, int32 segNum, int32 partNum)
 {
 	int64		part = (int64) segNum * S3_PARTS_PER_SEGMENT + partNum;
 	char	   *filename = btree_filename(key, segNum, 0);
 	char	   *objectname = s3_part_object_name(key, part);
-	bool		loaded;
+	long		code;
 
 	elog(DEBUG1, "S3 part get here %s %s", objectname, filename);
-	loaded = s3_try_get_file_part(objectname, filename, partNum);
+	code = s3_try_get_file_part(objectname, filename, partNum, false);
 	pfree(objectname);
 	pfree(filename);
-	return loaded;
+	return code;
 }
 
 void
@@ -1271,8 +1248,13 @@ s3worker_main(Datum main_arg)
 
 		/*
 		 * There might be task to process saved into shared memory.  If so,
-		 * pick and process it.
+		 * pick and process it.  The location is recorded before the pick
+		 * (s3_queue_try_pick_task), so one the pick did not take, or one
+		 * another worker erased since, is not a task of ours.
 		 */
+		if (workers_locations[worker_num] != InvalidS3TaskLocation &&
+			!s3_queue_task_is_live(workers_locations[worker_num]))
+			workers_locations[worker_num] = InvalidS3TaskLocation;
 		if (workers_locations[worker_num] != InvalidS3TaskLocation)
 		{
 			/*
@@ -1317,12 +1299,13 @@ s3worker_main(Datum main_arg)
 
 			/*
 			 * Task processing loop.  It might happen that error occurs and
-			 * worker restarts.  We save the task location to the shared
-			 * memory to be able to process it after restart.
+			 * worker restarts.  The task location is saved to shared memory
+			 * before the pick takes it, to be able to process it after a
+			 * restart: recorded after, a death in between left the task
+			 * picked by nobody, and the erased location never passed it.
 			 */
-			while ((taskLocation = s3_queue_try_pick_task()) != InvalidS3TaskLocation)
+			while ((taskLocation = s3_queue_try_pick_task(&workers_locations[worker_num])) != InvalidS3TaskLocation)
 			{
-				workers_locations[worker_num] = taskLocation;
 				s3process_task(taskLocation);
 				workers_locations[worker_num] = InvalidS3TaskLocation;
 			}

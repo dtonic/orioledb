@@ -2316,7 +2316,7 @@ class S3Test(S3BaseTest):
 		good = self.client.get_object(Bucket=self.bucket_name,
 		                              Key='root')['Body'].read()
 		chkp = int(self.kv('root')['checkpoint'])
-		self.wait_for_object(f'roots/{chkp}')
+		self.wait_for_object(f"roots/{self.kv('root')['token']}-{chkp}")
 		self.loader.download(None, repair_root=True)
 		self.assertEqual(good, self.client.get_object(
 		    Bucket=self.bucket_name, Key='root')['Body'].read())
@@ -2352,11 +2352,12 @@ class S3Test(S3BaseTest):
 		node.safe_psql("INSERT INTO o_test SELECT generate_series(11, 20);")
 		node.safe_psql("CHECKPOINT;")
 		newest = int(self.kv('root')['checkpoint'])
-		self.wait_for_object(f'roots/{newest}')
+		newest_copy = f"roots/{self.kv('root')['token']}-{newest}"
+		self.wait_for_object(newest_copy)
 		for i in range(21, 31):
 			node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
 		node.stop(['-m', 'immediate'])
-		self.client.delete_object(Bucket=self.bucket_name, Key=f'roots/{newest}')
+		self.client.delete_object(Bucket=self.bucket_name, Key=newest_copy)
 		self.client.put_object(Bucket=self.bucket_name, Key='root',
 		                       Body=b'\x00garbage')
 		self.loader.download(None, repair_root=True)

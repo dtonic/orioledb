@@ -278,6 +278,40 @@ class HoldFirstGet:
 		return orig_get_object(response)
 
 
+class HoldWrites:
+	"""
+	A MotoServerSSL.before_write hook: the first `count` writes (of
+	`methods`) whose request path matches `pattern` are held -- for
+	`seconds`, or until `release` is set -- before the store takes its write
+	lock, so every other write goes on meanwhile.  `entered` is set when the
+	first one is held.
+	"""
+
+	def __init__(self, pattern, count=1, seconds=None, methods=('PUT', )):
+		self.pattern = re.compile(pattern)
+		self.count = count
+		self.seconds = seconds
+		self.methods = methods
+		self.held = 0
+		self.lock = threading.Lock()
+		self.entered = threading.Event()
+		self.release = threading.Event()
+
+	def __call__(self, environ):
+		if environ.get('REQUEST_METHOD') not in self.methods or \
+		    not self.pattern.search(environ.get('PATH_INFO', '')):
+			return
+		with self.lock:
+			if self.held >= self.count:
+				return
+			self.held += 1
+		self.entered.set()
+		if self.seconds is not None:
+			time.sleep(self.seconds)
+		else:
+			self.release.wait(180)
+
+
 class FlakyPutObject:
 	"""
 	A put_object() that answers the first `failures` requests for a part
@@ -319,7 +353,6 @@ class FlakyPutObject:
 class S3BaseTest(BaseTest):
 	bucket_name = "test-bucket"
 	host = "localhost"
-	port = 5001
 	user = "ORDB_USER"
 	region = "us-east-1"
 	policy_name = "ORDB_POLICY"
@@ -358,6 +391,8 @@ class S3BaseTest(BaseTest):
 	def setUp(self):
 		super().setUp()
 
+		# a port of this process's own, so test processes run side by side
+		self.port = free_port()
 		protocol = 'https'
 		prefix = None
 		host_param = None
@@ -384,14 +419,17 @@ class S3BaseTest(BaseTest):
 		if host_param:
 			host_name = host_param
 		host_port = f"{protocol}://{host_name}:{self.port}"
-		self.ssl_key = make_ssl_devcert(f'/tmp/ordb_test_key', cn=host_name)
+		# a certificate of this process's own: two processes writing one
+		# path made each other's clients fail the verification
+		self.ssl_key = make_ssl_devcert(f'/tmp/ordb_test_key_{os.getpid()}',
+		                                cn=host_name)
 		if protocol == 'https':
 			ssl_context = self.ssl_key
 			self.s3_cainfo = self.ssl_key[0]
 		else:
 			ssl_context = None
 			self.s3_cainfo = None
-		self.s3_server = MotoServerSSL(ssl_context=ssl_context)
+		self.s3_server = MotoServerSSL(port=self.port, ssl_context=ssl_context)
 		self.s3_server.start()
 
 		self._orig_create_connection = connection.create_connection
@@ -486,6 +524,9 @@ class S3BaseTest(BaseTest):
 		self.iam_client.delete_user(UserName=self.user)
 		self.s3_server.stop()
 		connection.create_connection = self._orig_create_connection
+		for path in self.ssl_key:
+			if os.path.exists(path):
+				os.unlink(path)
 
 
 class OrioledbS3Loader:
@@ -535,11 +576,19 @@ class OrioledbS3Loader:
 		sys.argv = old_argv
 
 
+def free_port() -> int:
+	"""A TCP port nothing listens on right now."""
+	with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+		sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+		sock.bind(('', 0))
+		return sock.getsockname()[1]
+
+
 class MotoServerSSL:
 
 	def __init__(self,
 	             host: str = "localhost",
-	             port: int = 5001,
+	             port: int = 0,
 	             ssl_context=None):
 		self._host = host
 		self._port = port
@@ -547,6 +596,9 @@ class MotoServerSSL:
 		self._server: Optional[BaseWSGIServer] = None
 		self._server_ready = False
 		self._ssl_context = ssl_context
+		# called with the WSGI environ of every write before the write lock
+		# is taken (a hold there does not hold the other writes)
+		self.before_write = None
 
 	def _server_entry(self) -> None:
 		backend = DomainDispatcherApplication(create_backend_app)
@@ -567,6 +619,9 @@ class MotoServerSSL:
 				else:
 					body = b''
 				environ['wsgi.input'] = io.BytesIO(body)
+				hook = self.before_write
+				if hook is not None:
+					hook(environ)
 				with puts:
 					return list(backend(environ, start_response))
 			return backend(environ, start_response)

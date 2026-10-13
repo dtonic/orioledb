@@ -39,6 +39,7 @@ extern bool cleanup_btree_files(OIndexKey key, bool fsync);
 extern uint64 s3_part_floor(OIndexKey key);
 extern uint64 s3_bucket_next_part(OIndexKey key);
 extern uint64 s3_keep_part_floor(OIndexKey key, uint64 inMemoryNext);
+extern void s3_drop_part_floor(OIndexKey key);
 extern bool fsync_btree_files(OIndexKey key);
 extern int	OFileRead(File file, char *buffer, int amount, off_t offset,
 					  uint32 wait_event_info);

@@ -103,8 +103,9 @@ class OrioledbS3ObjectLoader:
 		    dest='repair_root',
 		    action='store_true',
 		    help="Put root back when the bucket's is missing or cannot be "
-		    "read: from the copy the latest checkpoint whose manifest is "
-		    "there left under roots/.  With the writer stopped")
+		    "read: from the copy under roots/ of the largest writer token "
+		    "(then the latest checkpoint) whose manifest is there.  With "
+		    "the writer stopped")
 		parser.add_argument(
 		    '--sweep',
 		    dest='sweep',
@@ -299,6 +300,8 @@ class OrioledbS3ObjectLoader:
 		`collected` that the manifest of `collected` does not refer to is
 		named by no retained manifest: it is garbage the GC could not see.
 		Parts are left alone: a writer puts over an uncommitted part number.
+		The dead lists of a tree the GC skipped (`skipped` lines of `gc`: its
+		state could not be read) are left for whoever repairs the state.
 		"""
 		root = self.read_root(self.bucket_name)
 		gc = self.read_object('gc')
@@ -306,8 +309,9 @@ class OrioledbS3ObjectLoader:
 			print("nothing to sweep: no root or no GC progress yet")
 			return
 		self.epochs = root['epochs']
-		fields = dict(
-		    line.split(' ', 1) for line in gc.decode().splitlines() if ' ' in line)
+		lines = [line.split(' ') for line in gc.decode().splitlines() if ' ' in line]
+		fields = dict((l[0], ' '.join(l[1:])) for l in lines)
+		skipped = {(int(l[1]), int(l[2])) for l in lines if l[0] == 'skipped' and len(l) == 3}
 		collected = int(fields.get('collected', 0))
 		folded = int(fields.get('folded', 0))
 		if collected == 0:
@@ -353,7 +357,8 @@ class OrioledbS3ObjectLoader:
 				    m['trees'].get((int(parts[1]), int(parts[2]))) != tc[1]
 			elif parts[0] == 'trees' and len(parts) == 5 and parts[3] == 'dead':
 				tc = tok_chk(parts[4])
-				garbage = tc is not None and tc[1] <= folded
+				garbage = tc is not None and tc[1] <= folded and \
+				    (int(parts[1]), int(parts[2])) not in skipped
 			if garbage:
 				if self.verbose:
 					print(f"sweep {key}", flush=True)
@@ -558,9 +563,12 @@ class OrioledbS3ObjectLoader:
 			f.write(data)
 
 	def repair_root(self):
-		"""Put root back from the newest copy under roots/ whose
-		checkpoint's manifest is in the bucket; a root that reads is left
-		alone."""
+		"""Put root back from the copy under roots/ of the largest writer
+		token, then the newest checkpoint, whose checkpoint's manifest is in
+		the bucket; a root that reads is left alone.  The token first: a
+		writer that took the bucket over leaves its copy under the same
+		checkpoint number as the writer it fenced off, and that one's would
+		let it in again."""
 		try:
 			root = self.read_root(self.bucket_name)
 			if root is not None and 'checkpoint' in root and \
@@ -572,9 +580,12 @@ class OrioledbS3ObjectLoader:
 		copies = []
 		for key in self.list_objects(self.bucket_name, 'roots/'):
 			name = key.rsplit('/', 1)[-1]
-			if name.isdigit():
-				copies.append((int(name), key))
-		for chkp, key in sorted(copies, reverse=True):
+			# roots/<token>-<checkpoint>; a copy from before the token was in
+			# the key counts as the smallest token
+			m = re.fullmatch(r'(?:(\d+)-)?(\d+)', name)
+			if m:
+				copies.append((int(m.group(1) or 0), int(m.group(2)), key))
+		for _, chkp, key in sorted(copies, reverse=True):
 			body = self.s3.get_object(Bucket=self.bucket_name,
 			                          Key=key)['Body'].read()
 			copy = parse_root_body(body.decode())
@@ -1281,7 +1292,7 @@ class ReaderPin:
 			kept = []
 			for other in body.splitlines():
 				fields = other.split()
-				if len(fields) == 3 and fields[0] != self.id and \
+				if len(fields) >= 3 and fields[0] != self.id and \
 				    int(fields[2]) >= now:
 					kept.append(other)
 			if line is not None:
@@ -1301,7 +1312,9 @@ class ReaderPin:
 		raise Exception("could not write the loader's pin to the S3 bucket")
 
 	def put(self, chkp):
-		self.edit(lambda now: f"{self.id} {chkp} {now + PIN_TTL}")
+		# the TTL too: the GC passes a pin below its floor only once a
+		# renewal interval (a third of it) has gone by
+		self.edit(lambda now: f"{self.id} {chkp} {now + PIN_TTL} {PIN_TTL}")
 
 	def remove(self):
 		self.edit(None)

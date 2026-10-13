@@ -200,7 +200,58 @@ typedef struct
 	char	   *etag;
 	char	   *date;
 	char	   *metaToken;
+	long		status;			/* the last status line's code, 0 before it */
 } S3ResponseHeaders;
+
+/*
+ * A GET is read into memory up to this much.  What a server process reads
+ * whole (control, root, maps, manifests, lists, a part) is far smaller; a WAL
+ * segment, up to 1 GB, is compared with the local bytes as it arrives instead
+ * (s3_object_holds).  Past 1 GB the StringInfo failed inside the curl
+ * callback, where an ERROR cannot safely leave the transfer.
+ */
+#define S3_MAX_BUFFERED_GET	(UINT64CONST(256) * 1024 * 1024)
+
+/*
+ * What a request does with the response body: keeps it, up to the bound, or
+ * compares a 200's body with the bytes given.
+ */
+typedef struct
+{
+	StringInfo	body;
+	S3ResponseHeaders *headers;
+	bool		overflow;		/* the body passed S3_MAX_BUFFERED_GET */
+	Pointer		compareData;	/* when set: compare, do not keep */
+	uint64		compareSize;
+	uint64		received;
+	bool		mismatch;
+} S3ResponseBody;
+
+static size_t
+write_response_body(void *buffer, size_t size, size_t nmemb, void *userp)
+{
+	size_t		segsize = size * nmemb;
+	S3ResponseBody *resp = (S3ResponseBody *) userp;
+
+	if (resp->compareData && resp->headers->status == S3_RESPONSE_OK)
+	{
+		if (!resp->mismatch &&
+			(resp->received + segsize > resp->compareSize ||
+			 memcmp(buffer, resp->compareData + resp->received, segsize) != 0))
+			resp->mismatch = true;
+		resp->received += segsize;
+		return segsize;
+	}
+
+	if ((uint64) resp->body->len + segsize > S3_MAX_BUFFERED_GET)
+	{
+		/* stop the transfer; the caller reports it once curl is done */
+		resp->overflow = true;
+		return 0;
+	}
+	appendBinaryStringInfo(resp->body, (const char *) buffer, segsize);
+	return segsize;
+}
 
 static char *
 header_value(char *buffer, size_t len, size_t namelen)
@@ -221,7 +272,14 @@ read_response_headers(char *buffer, size_t size, size_t nitems, void *userp)
 	size_t		len = size * nitems;
 	S3ResponseHeaders *headers = (S3ResponseHeaders *) userp;
 
-	if (len > 5 && pg_strncasecmp(buffer, "etag:", 5) == 0)
+	if (len > 5 && pg_strncasecmp(buffer, "HTTP/", 5) == 0)
+	{
+		char	   *space = memchr(buffer, ' ', len);
+
+		if (space && space + 1 < buffer + len)
+			headers->status = strtol(space + 1, NULL, 10);
+	}
+	else if (len > 5 && pg_strncasecmp(buffer, "etag:", 5) == 0)
 	{
 		if (headers->etag)
 			pfree(headers->etag);
@@ -285,11 +343,15 @@ s3_take_config_reload(void)
 }
 
 /*
- * Any other server process waiting to retry (the checkpointer, the archiver)
- * reads the new configuration, so new credentials reach it, but leaves the
- * reload pending: its own loop then does what it does on a reload as well
- * (the checkpointer updates shared memory from it).  Read once per reload.
- * A client backend takes reloads between commands, as always.
+ * A client backend takes a pending reload here as the bgworkers do: new
+ * credentials are what a request refused as unauthorized waits for, and the
+ * backend read them only between commands, so it sat out the whole retry
+ * time with the revoked key (ProcessConfigFile is safe inside a command, as
+ * autovacuum's delay point shows).  Any other server process waiting to retry
+ * (the checkpointer, the archiver) reads the new configuration, so new
+ * credentials reach it, but leaves the reload pending: its own loop then
+ * does what it does on a reload as well (the checkpointer updates shared
+ * memory from it).  Read once per reload.
  */
 static void
 request_wait_reload(void)
@@ -301,7 +363,7 @@ request_wait_reload(void)
 		readPending = false;
 		return;
 	}
-	if (MyBackendType == B_BG_WORKER)
+	if (MyBackendType == B_BG_WORKER || MyBackendType == B_BACKEND)
 		s3_take_config_reload();
 	else if (MyBackendType != B_BACKEND && !readPending)
 	{
@@ -392,20 +454,52 @@ request_deadline_passed(void)
 	return requestDeadline != 0 && GetCurrentTimestamp() >= requestDeadline;
 }
 
-static long
-s3_request(const char *method, char *objectname,
-		   Pointer data, uint64 dataSize, char *dataChecksum,
-		   const char *ifMatch, bool ifNoneMatch, bool retry, long timeout,
-		   StringInfo body, char **etag, char **date, int *curlCode,
-		   const char *metaToken, char **respMetaToken)
+/*
+ * What a request does beyond s3_request()'s arguments.  authRetry: a 403 is
+ * retried for orioledb.s3_auth_retry_time (off for a request nobody waits
+ * for).  compareData: a 200's body is compared with these bytes as it arrives
+ * instead of being kept; same says whether it was them.
+ */
+typedef struct
 {
-	S3ResponseHeaders headers = {NULL, NULL, NULL};
+	bool		authRetry;
+	Pointer		compareData;
+	uint64		compareSize;
+	bool		same;
+} S3RequestOpts;
+
+/*
+ * A transfer that makes no progress for this long is given up
+ * (CURLE_OPERATION_TIMEDOUT) and retried as a transport failure: a store that
+ * accepts a request and never answers, or a connection that died without a
+ * reset, held the request for ever, as nothing bounded a request without a
+ * deadline.  Keepalives tell a dead peer apart sooner.
+ */
+#define S3_LOW_SPEED_TIME	60L
+
+static long
+s3_request_ext(const char *method, char *objectname,
+			   Pointer data, uint64 dataSize, char *dataChecksum,
+			   const char *ifMatch, bool ifNoneMatch, bool retry, long timeout,
+			   StringInfo body, char **etag, char **date, int *curlCode,
+			   const char *metaToken, char **respMetaToken,
+			   S3RequestOpts *opts)
+{
+	S3ResponseHeaders headers = {NULL, NULL, NULL, 0};
+	S3ResponseBody resp = {body, &headers, false, NULL, 0, 0, false};
 	char	   *objectpath = objectname;
 	char	   *checksumstringbuf;
 	long		http_code = 0;
 	int			sc = 0;
 	int			attempt;
 	TimestampTz authSince = 0;
+
+	if (opts)
+	{
+		resp.compareData = opts->compareData;
+		resp.compareSize = opts->compareSize;
+		opts->same = false;
+	}
 
 	if (dataChecksum == NULL)
 	{
@@ -498,6 +592,10 @@ s3_request(const char *method, char *objectname,
 		if (headers.metaToken)
 			pfree(headers.metaToken);
 		headers.etag = headers.date = headers.metaToken = NULL;
+		headers.status = 0;
+		resp.overflow = false;
+		resp.received = 0;
+		resp.mismatch = false;
 
 		curl = request_handle(&slist);
 		if (strcmp(method, "HEAD") == 0)
@@ -513,10 +611,13 @@ s3_request(const char *method, char *objectname,
 			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
 			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, dataSize);
 		}
-		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_data_to_buf);
-		curl_easy_setopt(curl, CURLOPT_WRITEDATA, body);
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_response_body);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
 		curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, read_response_headers);
 		curl_easy_setopt(curl, CURLOPT_HEADERDATA, &headers);
+		curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+		curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, S3_LOW_SPEED_TIME);
+		curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
 		if (timeout > 0)
 			curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
 		if (requestDeadline != 0)
@@ -537,6 +638,14 @@ s3_request(const char *method, char *objectname,
 		pfree(datetimestring);
 		pfree(signature);
 
+		if (resp.overflow)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("S3 object \"%s\" is too large to read into memory",
+							objectname),
+					 errdetail("Its body passed %llu MB; a request reads at most that much.",
+							   (unsigned long long) (S3_MAX_BUFFERED_GET / (1024 * 1024)))));
+
 		/*
 		 * At startup (the postmaster) an unreachable store is reported at
 		 * once: it is as likely to be a wrong setting as an outage, and the
@@ -546,8 +655,9 @@ s3_request(const char *method, char *objectname,
 		 * about a minute rather than end the postmaster.
 		 */
 		/*
-		 * A body the store received cut short (BadDigest, IncompleteBody) was
-		 * damaged on the way and refused: send it again.
+		 * A body the store received cut short (BadDigest, IncompleteBody) or
+		 * not in time (RequestTimeout) was lost on the way and refused: send
+		 * it again.
 		 */
 		/*
 		 * Refused as unauthorized: the keys may be being rotated (the new
@@ -567,11 +677,13 @@ s3_request(const char *method, char *objectname,
 			request_deadline_passed() ||
 			!(s3_request_is_transient(sc, http_code) ||
 			  (authSince != 0 && s3_auth_retry_time > 0 &&
+			   (opts == NULL || opts->authRetry) &&
 			   !TimestampDifferenceExceeds(authSince, GetCurrentTimestamp(),
 										   s3_auth_retry_time * 1000)) ||
 			  (http_code == 400 && body->data &&
 			   (strstr(body->data, "<Code>BadDigest</Code>") != NULL ||
-				strstr(body->data, "<Code>IncompleteBody</Code>") != NULL))))
+				strstr(body->data, "<Code>IncompleteBody</Code>") != NULL ||
+				strstr(body->data, "<Code>RequestTimeout</Code>") != NULL))))
 			break;
 
 		if (attempt % 10 == 0)
@@ -600,8 +712,23 @@ s3_request(const char *method, char *objectname,
 		*respMetaToken = headers.metaToken;
 	else if (headers.metaToken)
 		pfree(headers.metaToken);
+	if (opts && opts->compareData)
+		opts->same = sc == 0 && http_code == S3_RESPONSE_OK &&
+			!resp.mismatch && resp.received == resp.compareSize;
 
 	return http_code;
+}
+
+static long
+s3_request(const char *method, char *objectname,
+		   Pointer data, uint64 dataSize, char *dataChecksum,
+		   const char *ifMatch, bool ifNoneMatch, bool retry, long timeout,
+		   StringInfo body, char **etag, char **date, int *curlCode,
+		   const char *metaToken, char **respMetaToken)
+{
+	return s3_request_ext(method, objectname, data, dataSize, dataChecksum,
+						  ifMatch, ifNoneMatch, retry, timeout, body, etag,
+						  date, curlCode, metaToken, respMetaToken, NULL);
 }
 
 /* URI-encode for a query string: everything but the unreserved characters */
@@ -884,15 +1011,43 @@ delete_slot_start(CURLM *multi, DeleteSlot *slot, char *objectname,
 }
 
 /*
- * Delete many objects, DELETE_CONCURRENCY requests at a time.  A request that
- * fails is done again on its own with s3_delete_object(), which retries; an
- * object already gone counts as deleted.  An interrupt stops starting new
- * requests and is served once those in flight are done; when serving it does
- * not end the call, the rest are deleted.
+ * One delete with the usual retries, nothing raised: false when the store's
+ * answer is a refusal (an object already gone counts as deleted).
  */
-void
-s3_delete_objects(char **objectnames, int count)
+static bool
+delete_object_try(char *objectname)
 {
+	StringInfoData buf;
+	long		http_code;
+	int			sc;
+	bool		ok;
+
+	initStringInfo(&buf);
+	http_code = s3_request("DELETE", objectname, NULL, 0, NULL, NULL, false, true, 0,
+						   &buf, NULL, NULL, &sc, NULL, NULL);
+	ok = sc == 0 &&
+		(http_code == 204 || http_code == 200 || http_code == S3_RESPONSE_NOT_FOUND);
+	if (!ok)
+		ereport(LOG,
+				(errmsg("S3 DELETE of \"%s\" refused", objectname),
+				 errdetail("return code = %d, http code = %ld, response = %s",
+						   sc, http_code, buf.data)));
+	pfree(buf.data);
+	return ok;
+}
+
+/*
+ * Delete many objects, DELETE_CONCURRENCY requests at a time.  A request that
+ * fails is done again on its own with the usual retries; an object already
+ * gone counts as deleted.  An interrupt stops starting new requests and is
+ * served once those in flight are done; when serving it does not end the
+ * call, the rest are deleted.  Returns the indexes of the objects the store
+ * refused for good (NIL: every one is gone), for the caller to judge.
+ */
+List *
+s3_delete_objects_try(char **objectnames, int count)
+{
+	List	   *refused = NIL;
 	CURLM	   *multi;
 	DeleteSlot	slots[DELETE_CONCURRENCY];
 	bool		busy[DELETE_CONCURRENCY] = {0};
@@ -905,7 +1060,7 @@ s3_delete_objects(char **objectnames, int count)
 	char	   *emptyChecksum;
 
 	if (count == 0)
-		return;
+		return NIL;
 	(void) SHA256((unsigned char *) "", 0, checksumbuf);
 	emptyChecksum = hex_string((Pointer) checksumbuf, sizeof(checksumbuf));
 	multi = curl_multi_init();
@@ -962,15 +1117,37 @@ s3_delete_objects(char **objectnames, int count)
 	pfree(emptyChecksum);
 
 	foreach(lc, failed)
-		s3_delete_object(objectnames[lfirst_int(lc)]);
+		if (!delete_object_try(objectnames[lfirst_int(lc)]))
+			refused = lappend_int(refused, lfirst_int(lc));
 	list_free(failed);
 
 	if (stoppedAt >= 0)
 	{
+		List	   *rest;
+
 		CHECK_FOR_INTERRUPTS();
 		/* the interrupt did not end this process: go on */
-		s3_delete_objects(objectnames + stoppedAt, count - stoppedAt);
+		rest = s3_delete_objects_try(objectnames + stoppedAt, count - stoppedAt);
+		foreach(lc, rest)
+			refused = lappend_int(refused, lfirst_int(lc) + stoppedAt);
+		list_free(rest);
 	}
+	return refused;
+}
+
+/*
+ * The same, where a refusal is fatal.
+ */
+void
+s3_delete_objects(char **objectnames, int count)
+{
+	List	   *refused = s3_delete_objects_try(objectnames, count);
+
+	if (refused != NIL)
+		ereport(FATAL, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+						errmsg("could not delete object from S3"),
+						errdetail("object \"%s\"",
+								  objectnames[linitial_int(refused)])));
 }
 
 /*
@@ -1282,12 +1459,15 @@ s3_object_holds(char *objectname, Pointer data, uint64 dataSize)
 	bool		same;
 	long		code;
 	int			sc;
+	S3RequestOpts opts = {.authRetry = true,.compareData = data,
+	.compareSize = dataSize};
 
+	/* compared as it arrives: a WAL segment does not fit a StringInfo */
 	initStringInfo(&body);
-	code = s3_request("GET", objectname, NULL, 0, NULL, NULL, false, true, 0,
-					  &body, NULL, NULL, &sc, NULL, NULL);
+	code = s3_request_ext("GET", objectname, NULL, 0, NULL, NULL, false, true,
+						  0, &body, NULL, NULL, &sc, NULL, NULL, &opts);
 	if (sc == 0 && code == S3_RESPONSE_OK)
-		same = body.len == dataSize && memcmp(body.data, data, dataSize) == 0;
+		same = opts.same;
 	else if (code == S3_RESPONSE_NOT_FOUND || request_deadline_passed())
 		same = false;
 	else
@@ -1307,7 +1487,9 @@ s3_object_holds(char *objectname, Pointer data, uint64 dataSize)
  * content committed before.  A key holding other bytes is replaced only when
  * a writer we fenced off left it (a smaller token), or when it is our own
  * token's -- an attempt cut short before a crash restart, which keeps the
- * token.  An untagged object is not ours to remove.
+ * token -- and only under If-Match on the ETag the HEAD saw: a writer with a
+ * larger token may have written the key since, and its object is not ours to
+ * remove.  An untagged object is not ours to remove either.
  */
 long
 s3_put_object_fenced(char *objectname, Pointer data, uint64 dataSize,
@@ -1356,6 +1538,7 @@ fenced_put(char *objectname, Pointer data, uint64 dataSize,
 		long		http_code;
 		int			sc;
 		char	   *author = NULL;
+		char	   *etag = NULL;
 		uint64		authorToken = 0;
 
 		if (request_deadline_passed())
@@ -1380,10 +1563,16 @@ fenced_put(char *objectname, Pointer data, uint64 dataSize,
 									  sc, http_code, buf.data)));
 
 		http_code = s3_request("HEAD", objectname, NULL, 0, NULL, NULL, false,
-							   true, 0, &buf, NULL, NULL, &sc, NULL, &author);
+							   true, 0, &buf, &etag, NULL, &sc, NULL, &author);
 		if (http_code == S3_RESPONSE_NOT_FOUND ||
 			(sc != 0 && request_deadline_passed()))
+		{
+			if (etag)
+				pfree(etag);
+			if (author)
+				pfree(author);
 			continue;
+		}
 		if (sc != 0 || http_code != S3_RESPONSE_OK)
 			ereport(FATAL, (errcode(ERRCODE_CONNECTION_EXCEPTION),
 							errmsg("could not read object metadata from S3"),
@@ -1401,18 +1590,47 @@ fenced_put(char *objectname, Pointer data, uint64 dataSize,
 								   UINT64_FORMAT ".",
 								   objectname, authorToken, mine));
 		if (s3_object_holds(objectname, data, dataSize))
+		{
+			if (etag)
+				pfree(etag);
 			break;
+		}
 		if (authorToken == 0)
 			ereport(FATAL,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("S3 object \"%s\" holds other content and no writer token",
 							objectname),
 					 errdetail("An object no writer tagged is not replaced.")));
+		if (etag == NULL)
+			ereport(FATAL, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+							errmsg("could not read object metadata from S3"),
+							errdetail("The HEAD of object \"%s\" carries no ETag to "
+									  "replace it under.", objectname)));
 
+		/*
+		 * Replace it as the HEAD saw it.  A 412 (or a 404: it went meanwhile)
+		 * means the key changed under us -- a larger token's object, which
+		 * the next round reads and stops on, or the same writer's -- so it is
+		 * read again rather than put over.
+		 */
 		ereport(LOG,
 				(errmsg("replacing \"%s\" left by writer token " UINT64_FORMAT
 						" with other content", objectname, authorToken)));
-		s3_delete_object(objectname);
+		http_code = s3_request("PUT", objectname, data, dataSize, dataChecksum,
+							   etag, false, true, 0, &buf, NULL, NULL, &sc,
+							   token, NULL);
+		pfree(etag);
+		if (sc == 0 && http_code == S3_RESPONSE_OK)
+			break;
+		if (sc != 0 && request_deadline_passed())
+			continue;
+		if (sc != 0 || (http_code != S3_RESPONSE_CONDITION_FAILED &&
+						http_code != S3_RESPONSE_CONDITION_CONFLICT &&
+						http_code != S3_RESPONSE_NOT_FOUND))
+			ereport(FATAL, (errcode(ERRCODE_CONNECTION_EXCEPTION),
+							errmsg("could not put object to S3"),
+							errdetail("return code = %d, http code = %ld, response = %s",
+									  sc, http_code, buf.data)));
 	}
 
 	pfree(buf.data);
@@ -1515,44 +1733,29 @@ s3_put_file_part(char *objectname, char *filename, int partnum)
 }
 
 /*
- * Get the file part from S3 object.
+ * Get the file part from S3 object, and answer the HTTP status (0 when no
+ * answer came) instead of ending the process where the store did not give
+ * it: the caller judges a part that is not there (404), one refused for good
+ * (403) and the rest.  Transient failures are retried as for any request.  A
+ * hint (a read ahead nobody waits for) is not retried while the store refuses
+ * the key, as a part a query waits for is.
  */
-void
-s3_get_file_part(char *objectname, char *filename, int partnum)
+long
+s3_try_get_file_part(char *objectname, char *filename, int partnum, bool hint)
 {
 	StringInfoData buf;
-
-	initStringInfo(&buf);
-	s3_get_object(objectname, &buf, false);
-
-	write_file_part(filename,
-					partnum * ORIOLEDB_S3_PART_SIZE + ORIOLEDB_BLCKSZ,
-					buf.data,
-					buf.len);
-
-	pfree(buf.data);
-}
-
-/*
- * Get the file part as s3_get_file_part() does, but answer false where the
- * store did not give it, instead of ending the process: a backend downloading
- * the part it needs leaves the part to the S3 workers then.  Transient
- * failures are retried as for any request.
- */
-bool
-s3_try_get_file_part(char *objectname, char *filename, int partnum)
-{
-	StringInfoData buf;
+	S3RequestOpts opts = {.authRetry = !hint};
 	long		http_code;
 	int			sc;
 
 	initStringInfo(&buf);
-	http_code = s3_request("GET", objectname, NULL, 0, NULL, NULL, false, true,
-						   0, &buf, NULL, NULL, &sc, NULL, NULL);
+	http_code = s3_request_ext("GET", objectname, NULL, 0, NULL, NULL, false,
+							   true, 0, &buf, NULL, NULL, &sc, NULL, NULL,
+							   &opts);
 	if (sc != 0 || http_code != S3_RESPONSE_OK)
 	{
 		pfree(buf.data);
-		return false;
+		return sc != 0 ? 0 : http_code;
 	}
 
 	write_file_part(filename,
@@ -1561,7 +1764,7 @@ s3_try_get_file_part(char *objectname, char *filename, int partnum)
 					buf.len);
 
 	pfree(buf.data);
-	return true;
+	return S3_RESPONSE_OK;
 }
 
 /*

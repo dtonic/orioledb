@@ -13,8 +13,10 @@
 #ifndef __S3_LEASE_H__
 #define __S3_LEASE_H__
 
-/* the copy of root a checkpoint's commit leaves */
-#define ROOT_COPY_FORMAT	"roots/%u"
+#include "lib/stringinfo.h"
+
+/* the copy of root a checkpoint's commit leaves: its writer's token and K */
+#define ROOT_COPY_FORMAT	"roots/" UINT64_FORMAT "-%u"
 
 #include "access/xlogdefs.h"
 #include "datatype/timestamp.h"
@@ -35,9 +37,10 @@ extern uint64 s3_lease_token(void);
 extern uint32 s3_lease_root_checkpoint(void);
 extern void s3_lease_prune_epochs(uint32 from, const uint32 *refs, int nrefs);
 extern void s3_gc_publish(uint32 retain, uint32 folded, uint32 collected,
-						  uint32 pinFloor, uint32 pinWarn);
-extern bool s3_gc_progress(uint32 *retain, uint32 *folded, uint32 *collected);
-extern uint32 s3_reader_pins_min(uint32 upper, uint32 floor);
+						  uint32 pinFloor, uint32 pinWarn, const char *skipped);
+extern bool s3_gc_progress(uint32 *retain, uint32 *folded, uint32 *collected,
+						   StringInfo skipped);
+extern uint32 s3_reader_pins_min(uint32 upper, uint32 floor, uint32 pinFloor);
 extern void s3_reader_pin_renew(void);
 extern bool s3_lease_own_token(uint64 token);
 extern void s3_lease_loaded_done(void);
