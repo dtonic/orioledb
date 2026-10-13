@@ -27,7 +27,6 @@ typedef enum
 	S3TaskTypeWriteWALFile,
 	S3TaskTypeWriteUndoFile,
 	S3TaskTypeWriteEmptyDir,
-	S3TaskTypeWriteRootFile,
 	S3TaskTypeWritePGFile,
 	S3TaskTypeWriteArchiveFile,	/* a complete WAL file: put once, fenced */
 	S3TaskTypeDeleteWalChunks	/* WAL chunks an archived segment holds */
@@ -76,11 +75,6 @@ typedef struct
 			uint32		chkpNum;
 			char		dirname[FLEXIBLE_ARRAY_MEMBER];
 		}			writeEmptyDir;
-		struct
-		{
-			bool		delete;
-			char		filename[FLEXIBLE_ARRAY_MEMBER];
-		}			writeRootFile;
 		struct
 		{
 			uint32		chkpNum;
