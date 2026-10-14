@@ -529,6 +529,16 @@ s3_queue_erase_task(S3TaskLocation taskLocation)
 						taskLen | LENGTH_ERASED_FLAG);
 
 	/*
+	 * The flag must be visible before we read the erased location.  The
+	 * eraser of the task before ours advances the location (a full barrier)
+	 * and then reads our length word; we read the location after the flag.
+	 * Without this barrier the load could pass the store (arm64): that eraser
+	 * saw no flag and stopped, we saw the old location and gave up, and the
+	 * lane stalled with erased tasks at its head (SNB SF1, S3 mode).
+	 */
+	pg_memory_barrier();
+
+	/*
 	 * Advance the erased location over this task, and over the erased tasks
 	 * after it whose erasers gave up on advancing it (they found it behind
 	 * their task; we take the lead), so somebody advances it past every
