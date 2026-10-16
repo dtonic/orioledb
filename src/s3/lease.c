@@ -147,6 +147,9 @@ typedef struct
 static S3LeaseState pm_lease;
 
 static void reader_pin_and_check(uint32 chkp);
+
+/* the checkpoint this data directory started from, at the postmaster start */
+static uint32 start_checkpoint = 0;
 static S3LeaseState *lease = NULL;
 
 typedef enum
@@ -994,6 +997,8 @@ s3_lease_acquire(void)
 		control.lastCheckpointNumber = 0;
 		control.controlIdentifier = 0;
 	}
+	start_checkpoint = control.lastCheckpointNumber;
+
 	memset(&root, 0, sizeof(root));
 	rootExists = startup_get(ROOT_KEY, &body, rootEtag, NULL);
 	if (rootExists && !parse_root(body.data, &root))
@@ -1282,6 +1287,16 @@ reader_check_restartable(uint32 lastCheckpoint)
 }
 
 /*
+ * The checkpoint the data directory held when the postmaster started: a build
+ * the writer before this run did after it named its tree's map with it.
+ */
+uint32
+s3_start_checkpoint(void)
+{
+	return start_checkpoint;
+}
+
+/*
  * A reader takes no lease and writes nothing to the bucket: it only needs
  * the epochs, to name the maps of the checkpoints it opens.
  */
@@ -1300,6 +1315,7 @@ s3_lease_reader_init(void)
 
 		if (!get_checkpoint_control_data(&control))
 			control.lastCheckpointNumber = 0;
+		start_checkpoint = control.lastCheckpointNumber;
 		reader_check_restartable(control.lastCheckpointNumber);
 		reader_pin_and_check(control.lastCheckpointNumber);
 	}

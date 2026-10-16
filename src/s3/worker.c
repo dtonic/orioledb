@@ -1209,6 +1209,47 @@ s3_load_map_file(uint32 chkpNum, OIndexKey key)
 		s3_queue_wait_for_location(location);
 }
 
+/*
+ * The map of checkpoint chkpNum, when the bucket has one: a build done after
+ * that checkpoint names its tree's map with it (s3_get_map()), while a tree
+ * created since has no map at all.  Fetched in the calling process; true when
+ * the map was found and written to the local map file.
+ */
+bool
+s3_try_load_map_file(uint32 chkpNum, OIndexKey key)
+{
+	uint64	   *tokens;
+	int			n = s3_map_tokens(chkpNum, &tokens);
+	SeqBufTag	chkp_tag;
+	char	   *filename;
+	StringInfoData buf;
+	bool		found = false;
+
+	memset(&chkp_tag, 0, sizeof(chkp_tag));
+	chkp_tag.key = key;
+	chkp_tag.num = chkpNum;
+	chkp_tag.type = 'm';
+	filename = get_seq_buf_filename(&chkp_tag);
+	initStringInfo(&buf);
+	for (int i = 0; i < n && !found; i++)
+	{
+		char	   *objectname = s3_map_object_name(key, tokens[i], chkpNum);
+
+		resetStringInfo(&buf);
+		if (s3_get_object(objectname, &buf, true) == S3_RESPONSE_OK)
+		{
+			elog(DEBUG1, "S3 map get %s %s", objectname, filename);
+			s3_write_file(filename, buf.data, buf.len);
+			found = true;
+		}
+		pfree(objectname);
+	}
+	pfree(buf.data);
+	pfree(filename);
+	pfree(tokens);
+	return found;
+}
+
 void
 s3worker_main(Datum main_arg)
 {

@@ -272,7 +272,15 @@ shipper). 한 버킷에 writer 하나와 reader 여럿이 붙는다. writer 는 
   그다음 epoch(K) 의 키를 읽는다(`s3_map_tokens`): 첫 체크포인트 전에 죽은 실행의 재구축도, 그 뒤 실행의 복구가 그 map
   위에서 이어 가므로 버킷에서 찾을 수 있어야 한다. 재구축(보조 인덱스 포함)은 map 이 버킷에 올라간 뒤에 커밋한다: 바뀌지
   않은 트리의 map 은 뒤의 체크포인트가 다시 올리지 않는다. Guard: `test_s3_build_map_is_up_before_the_build_commits`,
-  `test_s3_build_of_a_run_that_crashed_before_a_checkpoint_loads`. GC 는 `collected` 를 옮긴 뒤 보존 체크포인트와 그것이 참조하는 체크포인트(및 그다음 실행)에 필요 없는 epoch 를
+  `test_s3_build_of_a_run_that_crashed_before_a_checkpoint_loads`. 버킷에서 받은 데이터 디렉터리는 받은 체크포인트 뒤의
+  재구축 map 을 갖고 있지 않고, consistent 이전의 복구는 재구축을 다시 하지 않는다. 그래서 그 복구는 재구축이 끝난 자리
+  (`handle_o_tables_meta_unlock`)에서 어떤 체크포인트도 본 적 없는 그 테이블의 트리마다, 이 시작의 체크포인트 번호
+  (`s3_start_checkpoint`)로 올라간 map 을 받아 자기 것으로 삼는다(`s3_adopt_built_tree_map`: 로컬 map 과 트리의 최신
+  체크포인트 번호). 그 뒤의 체크포인트는 매니페스트에 그 map 을 적는다. 받지 않으면 트리를 새 빈 트리로 열어, 그 인덱스를
+  타는 질의가 행을 0개로 읽었고(데이터는 기본 트리에 그대로), 한 번도 열리지 않은 채 다음 이어받기가 오면 그 시작 번호가
+  map 의 번호를 지나쳐 영영 빈 트리였다. 어떤 체크포인트도 본 적 없는 트리를 열 때 로컬 map 이 없으면 지금 번호와 시작
+  번호의 map 을 없어도 되는 GET 으로 찾는다(`s3_try_load_map_file`; 새로 만든 트리는 GET 한 번). Guard:
+  `test_s3_takeover_reads_an_index_built_after_the_checkpoint`, `test_s3_takeover_keeps_an_index_it_did_not_read`. GC 는 `collected` 를 옮긴 뒤 보존 체크포인트와 그것이 참조하는 체크포인트(및 그다음 실행)에 필요 없는 epoch 를
   지운다(`s3_lease_prune_epochs`, `prune_epochs_for`). 표의 상한은 4096 줄이다. Guard: `test_s3_gc_prunes_writer_epochs`.
 - 저장소 요구: 키 단위 원자성, read-after-write, 커밋 잠금 안에서 판정되는 조건부 PUT. 두 writer 경쟁은
   `test_s3_second_writer_is_refused`, `test_s3_two_takeovers_one_writer`, 저장소 시계 보정은

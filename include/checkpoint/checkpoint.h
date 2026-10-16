@@ -297,6 +297,7 @@ extern uint32 o_get_latest_chkp_num(Oid datoid, Oid relnode, Oid tablespace,
 									uint32 max_chkp_num, bool *found);
 extern void o_update_latest_chkp_num(Oid datoid, Oid relnode, Oid tablespace,
 									 uint32 chkp_num);
+extern void s3_adopt_built_tree_map(ORelOids treeOids);
 extern void o_delete_chkp_num(Oid datoid, Oid relnode, Oid tablespace);
 extern void o_move_latest_chkp_num(Oid datoid, Oid relnode, Oid old_tablespace,
 								   Oid new_tablespace);

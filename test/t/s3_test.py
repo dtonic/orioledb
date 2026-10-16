@@ -1679,6 +1679,94 @@ class S3Test(S3BaseTest):
 			self.assertNotIn("took the S3 writer lease", log)
 			reader.cleanup()
 
+	def test_s3_takeover_reads_an_index_built_after_the_checkpoint(self):
+		"""A build names its tree's map with the last checkpoint done and puts
+		it in the bucket before it commits.  A data directory loaded at that
+		checkpoint has no such map, and recovery before consistency does not
+		build the index again: the tree is opened as one no checkpoint has
+		seen, and its map has to come from the bucket, or every scan of the
+		index reads it empty."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_lease_duration = 15
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, v text) USING orioledb;
+			INSERT INTO o_test SELECT g, md5(g::text) FROM generate_series(1, 2000) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		node.safe_psql("CREATE INDEX o_test_v ON o_test (v);")
+		node.stop(['-m', 'immediate'])
+
+		by_index = """
+			SET enable_seqscan = off;
+			SET enable_bitmapscan = off;
+			SELECT count(*) FROM o_test WHERE v >= '';
+		"""
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			plan = new_node.safe_psql(
+			    "SET enable_seqscan = off; SET enable_bitmapscan = off; "
+			    "EXPLAIN SELECT count(*) FROM o_test WHERE v >= '';").decode()
+			self.assertIn("o_test_v", plan)
+			self.assertEqual("2000",
+			                 new_node.safe_psql(by_index).decode().strip())
+			new_node.safe_psql("INSERT INTO o_test VALUES (2001, 'x');")
+			self.assertEqual("2001",
+			                 new_node.safe_psql(by_index).decode().strip())
+			new_node.stop()
+			new_node.cleanup()
+
+	def test_s3_takeover_keeps_an_index_it_did_not_read(self):
+		"""The writer that takes over after a build commits the index to its
+		own checkpoints even when nothing reads it: the next one loaded from
+		the bucket finds the index whole, not the map of a checkpoint its own
+		start is past."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_lease_duration = 15
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, v text) USING orioledb;
+			INSERT INTO o_test SELECT g, md5(g::text) FROM generate_series(1, 2000) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		node.safe_psql("CREATE INDEX o_test_v ON o_test (v);")
+		node.stop(['-m', 'immediate'])
+
+		by_index = """
+			SET enable_seqscan = off;
+			SET enable_bitmapscan = off;
+			SELECT count(*) FROM o_test WHERE v >= '';
+		"""
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as second:
+			self.loader.download(second.data_dir)
+			second.append_conf(port=second.port)
+			second.start()
+			# nothing reads or writes the index here
+			second.safe_psql("CHECKPOINT;")
+			second.safe_psql("CHECKPOINT;")
+			second.stop(['-m', 'immediate'])
+			second.cleanup()
+		with self.initNode(self.getBasePort() + 2, 'tgsc') as third:
+			self.loader.download(third.data_dir)
+			third.append_conf(port=third.port)
+			third.start()
+			self.assertEqual("2000",
+			                 third.safe_psql(by_index).decode().strip())
+			third.stop()
+			third.cleanup()
+
 	def test_s3_takeover_reads_what_came_after_the_load(self):
 		"""A data directory loaded while the writer still committed is behind
 		the bucket: the writer it starts as puts a terminator after the last

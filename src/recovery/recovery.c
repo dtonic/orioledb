@@ -4320,6 +4320,25 @@ handle_o_tables_meta_unlock(ORelOids oids, Oid oldRelnode)
 	if (ORelOidsIsValid(oids))
 		recreate_table_descr_by_oids(oids);
 
+	/*
+	 * Before consistency the trees a build wrote are not built again: in S3
+	 * mode a data directory loaded from the bucket has them only as the maps
+	 * the build put there.
+	 */
+	if (!reachedConsistency && orioledb_s3_mode && ORelOidsIsValid(oids))
+	{
+		OTable	   *built = o_tables_get(oids);
+
+		if (built)
+		{
+			for (int i = 0; i < built->nindices; i++)
+				s3_adopt_built_tree_map(built->indices[i].oids);
+			s3_adopt_built_tree_map(built->toast_oids);
+			s3_adopt_built_tree_map(built->bridge_oids);
+			pfree(built);
+		}
+	}
+
 	if (reachedConsistency && ORelOidsIsValid(oids))
 	{
 		OTable	   *new_o_table = NULL;

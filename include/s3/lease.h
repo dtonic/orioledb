@@ -29,6 +29,7 @@ extern void s3_lease_shmem_init(Pointer ptr, bool found);
 
 extern void s3_lease_acquire(void);
 extern void s3_lease_reader_init(void);
+extern uint32 s3_start_checkpoint(void);
 extern void s3_lease_release(void);
 extern void register_s3_lease_worker(void);
 extern PGDLLEXPORT void s3_lease_worker_main(Datum main_arg);

@@ -123,6 +123,7 @@ extern void s3_schedule_part_read_ahead(OIndexKey key, int64 partNum);
 
 extern bool s3_worker_process;
 extern void s3_load_map_file(uint32 chkpNum, OIndexKey key);
+extern bool s3_try_load_map_file(uint32 chkpNum, OIndexKey key);
 
 
 #endif							/* __S3_WORKER_H__ */
