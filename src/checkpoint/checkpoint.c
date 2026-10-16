@@ -1580,6 +1580,45 @@ o_update_latest_chkp_num(Oid datoid, Oid relnode, Oid tablespace,
 		   result == OBTreeModifyResultUpdated);
 }
 
+/*
+ * A tree a build wrote after the checkpoint this data directory started from
+ * has its map in the bucket under that checkpoint's number, and nowhere else:
+ * recovery before consistency does not build it again.  Take that map as the
+ * tree's own, so it is read whole and every checkpoint from now on names it in
+ * its manifest; left unseen, a later start from the bucket would be past the
+ * map's number and read the tree empty.  A tree any checkpoint has seen, or
+ * one with no such map (created, not built), is left as it is.
+ */
+void
+s3_adopt_built_tree_map(ORelOids treeOids)
+{
+	uint32		start = s3_start_checkpoint();
+	bool		found;
+	SeqBufTag	tag;
+	char	   *fname;
+
+	if (!orioledb_s3_mode || start == 0 || !ORelOidsIsValid(treeOids))
+		return;
+	(void) o_get_latest_chkp_num(treeOids.datoid, treeOids.relnode,
+								 treeOids.spcoid, start, &found);
+	if (found)
+		return;
+
+	memset(&tag, 0, sizeof(tag));
+	tag.key.oids = treeOids;
+	tag.num = start;
+	tag.type = 'm';
+	fname = get_seq_buf_filename(&tag);
+	if (access(fname, F_OK) == 0 || s3_try_load_map_file(start, tag.key))
+	{
+		o_update_latest_chkp_num(treeOids.datoid, treeOids.relnode,
+								 treeOids.spcoid, start);
+		elog(LOG, "took the S3 map of checkpoint %u for tree %u/%u, built before this start",
+			 start, treeOids.datoid, treeOids.relnode);
+	}
+	pfree(fname);
+}
+
 void
 o_delete_chkp_num(Oid datoid, Oid relnode, Oid tablespace)
 {
@@ -6320,12 +6359,44 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 			prev_chkp_file = PathNameOpenFile(prev_chkp_fname, O_RDONLY | PG_BINARY);
 			prev_chkp_file_exist = prev_chkp_file >= 0;
 		}
+		else if (orioledb_s3_mode &&
+				 !prev_chkp_file_exist &&
+				 !found)
+		{
+			/*
+			 * A tree no checkpoint has seen yet.  A build that ran after the
+			 * last checkpoint wrote its map under that checkpoint's number and
+			 * waited for it to reach the bucket before committing, but a data
+			 * directory the loader made from the bucket has not got it:
+			 * recovery before consistency does not build the tree again, and
+			 * the first scan after it opens the tree here.  Read as a new empty
+			 * tree, the build's rows were missing from every scan of it.  A
+			 * tree created since has no map, and stays new (one GET).
+			 */
+			uint32		nums[2] = {prev_chkp_tag.num, s3_start_checkpoint()};
+
+			for (int i = 0; i < 2; i++)
+			{
+				/* a run's own checkpoints after its start: the current one */
+				if (i == 1 && nums[1] >= nums[0])
+					break;
+				if (s3_try_load_map_file(nums[i], prev_chkp_tag.key))
+				{
+					prev_chkp_tag.num = nums[i];
+					pfree(prev_chkp_fname);
+					prev_chkp_fname = get_seq_buf_filename(&prev_chkp_tag);
+					prev_chkp_file = PathNameOpenFile(prev_chkp_fname, O_RDONLY | PG_BINARY);
+					prev_chkp_file_exist = prev_chkp_file >= 0;
+					break;
+				}
+			}
+		}
 
 		if (!IS_SYS_TREE_OIDS(desc->oids) && !found && prev_chkp_file_exist)
 			o_update_latest_chkp_num(desc->oids.datoid,
 									 desc->oids.relnode,
 									 desc->oids.spcoid,
-									 chkp_num);
+									 prev_chkp_tag.num);
 
 		if (!prev_chkp_file_exist)
 		{

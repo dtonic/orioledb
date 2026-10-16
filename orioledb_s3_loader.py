@@ -717,7 +717,16 @@ class OrioledbS3ObjectLoader:
 			latest += 1
 			self.write_wal(f"{latest:08X}.history", history)
 
-		chunks = self.chunks_of(latest)
+		# a chunk listed and gone before it was read was removed once its
+		# segment was archived, as the writer goes on: list again
+		for attempt in range(10):
+			try:
+				chunks = self.chunks_of(latest)
+				break
+			except ChunkGone:
+				if attempt == 9:
+					raise
+				self.forget_listing(latest)
 		# every key counts for where the chunks end: a terminator too; the
 		# cache holds what the bucket listed
 		seqs = sorted(int(name) for name in os.listdir(self.chunk_cache(latest))

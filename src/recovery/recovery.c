@@ -190,6 +190,8 @@ typedef struct
 	bool	   *used_by;
 } RecoveryXidState;
 
+static void check_delete_xid_state(RecoveryXidState *state, int worker_id);
+
 #define RetainUndoNodeGetRecoveryXidState(node, undoType) \
 	((RecoveryXidState *) ((Pointer) (node) - \
 		offsetof(RecoveryXidState, retain_undo_ph_nodes) - \
@@ -790,6 +792,49 @@ apply_pending_sk_fixup_run(PendingSkFixup *entry)
 }
 
 /*
+ * Close the recovery state of a transaction that had already finished as
+ * committed when the fix-up above wrote under its oxid: its new undo is
+ * settled as a commit settles it, and the state leaves the xmin queue and
+ * the retain heaps the same way, with the csn it already has.  Left open,
+ * it held the recovery xmin and the undo retain for good.
+ */
+static void
+settle_finished_oxid(CommitSeqNo csn)
+{
+	OXid		oxid = recovery_oxid;
+	int			i;
+
+	for (i = 0; i < (int) UndoLogsCount; i++)
+		precommit_undo_stack((UndoLogType) i, oxid, true);
+	for (i = 0; i < (int) UndoLogsCount; i++)
+		on_commit_undo_stack((UndoLogType) i, oxid, true);
+
+	cur_recovery_xid_state->csn = csn;
+	oxid_needs_wal_flush = false;
+	reset_cur_undo_locations();
+	recovery_oxid = InvalidOXid;
+
+	for (i = 0; i < (int) UndoLogsCount; i++)
+	{
+		if (!UndoLocationIsValid(cur_recovery_xid_state->retain_locs[i]) &&
+			UndoLocationIsValid(curRetainUndoLocations[i]))
+		{
+			cur_recovery_xid_state->retain_locs[i] = curRetainUndoLocations[i];
+			pairingheap_add(retain_undo_queues[i],
+							&cur_recovery_xid_state->retain_undo_ph_nodes[i]);
+			cur_recovery_xid_state->in_retain_undo_heaps[i] = true;
+		}
+		curRetainUndoLocations[i] = InvalidUndoLocation;
+	}
+	for (i = 0; i < (int) UndoLogsCount; i++)
+		release_undo_size((UndoLogType) i);
+
+	check_delete_xid_state(cur_recovery_xid_state, -1);
+	cur_recovery_xid_state = NULL;
+	update_proc_retain_undo_location(-1);
+}
+
+/*
  * Turn every PendingSkFixup record gathered by record_pending_sk_fixup()
  * into synthesised secondary-index modifications.  Called once, by the
  * master recovery process, at the moment WAL replay first crosses the
@@ -805,11 +850,50 @@ apply_pending_sk_fixups(void)
 	while (entry != NULL)
 	{
 		PendingSkFixup *next = entry->next;
+		RecoveryXidState *state;
+		CommitSeqNo csn;
+		bool		found;
+
+		/*
+		 * The transaction may have finished between the checkpoint and this
+		 * boundary.  An aborted one rolled back its primary-key changes, so
+		 * the secondary indexes owe nothing.  A committed one stays
+		 * committed: marked in progress again, it hid its own rows from every
+		 * snapshot, and a hot standby read them back through undo the retain
+		 * had already let go (PANIC "undo record does not exist").
+		 *
+		 * Ask recovery's own state, not the shared csn: a transaction the xid
+		 * file brought in and the WAL has not shown yet reads as aborted
+		 * there.  One recovery no longer tracks has finished, and its csn is
+		 * the shared one.
+		 */
+		state = hash_search(recovery_xid_state_hash, &entry->oxid,
+							HASH_FIND, &found);
+		if (!found)
+			csn = oxid_get_csn(entry->oxid, false);
+		else if (!state->wal_xid)
+			csn = COMMITSEQNO_INPROGRESS;
+		else
+			csn = state->csn;
+
+		if (COMMITSEQNO_IS_ABORTED(csn))
+		{
+			pfree(entry);
+			entry = next;
+			continue;
+		}
 
 		recovery_switch_to_oxid(entry->oxid, -1);
-		set_oxid_csn(entry->oxid, COMMITSEQNO_INPROGRESS);
-
-		apply_pending_sk_fixup_run(entry);
+		if (COMMITSEQNO_IS_NORMAL(csn) || COMMITSEQNO_IS_FROZEN(csn))
+		{
+			apply_pending_sk_fixup_run(entry);
+			settle_finished_oxid(csn);
+		}
+		else
+		{
+			set_oxid_csn(entry->oxid, COMMITSEQNO_INPROGRESS);
+			apply_pending_sk_fixup_run(entry);
+		}
 
 		pfree(entry);
 		entry = next;
@@ -1156,6 +1240,22 @@ read_xids(int checkpointnum, bool recovery_single, int worker_id)
 			 * We will probably need to retain this till the next checkpoint.
 			 */
 			retainUndoLocation = xidRec.retainLocation;
+
+			/*
+			 * A checkpoint written before the fix of walk_undo_stack() put
+			 * the regular log's retain location in every log's record: one
+			 * above where its log ends is not of that log, and would leave
+			 * the undo this replay writes unretained.  The checkpoint's
+			 * retain start keeps everything the transaction may need.
+			 */
+			if ((int) kind < (int) UndoLogsCount &&
+				UndoLocationIsValid(retainUndoLocation))
+			{
+				UndoMeta   *meta = get_undo_meta_by_type((UndoLogType) kind);
+
+				if (retainUndoLocation > pg_atomic_read_u64(&meta->lastUsedLocation))
+					retainUndoLocation = pg_atomic_read_u64(&meta->checkpointRetainStartLocation);
+			}
 			if ((int) kind < (int) UndoLogsCount &&
 				retainUndoLocation < state->retain_locs[(UndoLogType) kind])
 			{
@@ -4303,6 +4403,25 @@ handle_o_tables_meta_unlock(ORelOids oids, Oid oldRelnode)
 
 	if (ORelOidsIsValid(oids))
 		recreate_table_descr_by_oids(oids);
+
+	/*
+	 * Before consistency the trees a build wrote are not built again: in S3
+	 * mode a data directory loaded from the bucket has them only as the maps
+	 * the build put there.
+	 */
+	if (!reachedConsistency && orioledb_s3_mode && ORelOidsIsValid(oids))
+	{
+		OTable	   *built = o_tables_get(oids);
+
+		if (built)
+		{
+			for (int i = 0; i < built->nindices; i++)
+				s3_adopt_built_tree_map(built->indices[i].oids);
+			s3_adopt_built_tree_map(built->toast_oids);
+			s3_adopt_built_tree_map(built->bridge_oids);
+			pfree(built);
+		}
+	}
 
 	if (reachedConsistency && ORelOidsIsValid(oids))
 	{

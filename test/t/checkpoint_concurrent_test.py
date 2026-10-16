@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # coding: utf-8
 
+import os
 import random
+import struct
 
 from .base_test import BaseTest
 from .base_test import ThreadQueryExecutor
@@ -809,3 +811,185 @@ class CheckpointConcurrentTest(BaseTest):
 		con1.close()
 		con2.close()
 		con3.close()
+
+	def test_checkpoint_xid_records_retain_their_own_log(self):
+		"""A transaction that commits while a checkpoint writes its xid file
+		puts one record per undo log there.  Each carries that log's retain
+		location: a record of the system log that carried the regular log's
+		left the system undo the replay writes unretained, and a background
+		writer pass between that write and the commit's replay made recovery
+		PANIC with "read of unexisting undo record"."""
+
+		node = self.node
+		node.append_conf('postgresql.conf',
+		                 "orioledb.enable_stopevents = true\n")
+		node.start()
+		node.safe_psql(
+		    'postgres', "CREATE EXTENSION IF NOT EXISTS orioledb;\n"
+		    "CREATE TABLE o_big (id int PRIMARY KEY, v text) USING orioledb;\n"
+		    "INSERT INTO o_big SELECT g, repeat('x', 100) FROM generate_series(1, 100000) g;\n"
+		    "UPDATE o_big SET v = v || 'y';\n"
+		    "CREATE TABLE o_second (id int PRIMARY KEY) USING orioledb;\n"
+		    "INSERT INTO o_second VALUES (1);\n")
+		con1 = node.connect()
+		con2 = node.connect()
+		con3 = node.connect()
+		# regular and system undo in one transaction, committed while the
+		# checkpoint writes its xid file
+		con3.execute("UPDATE o_big SET v = v || 'z' WHERE id <= 2000;")
+		con3.execute("CREATE TABLE o_new (id int PRIMARY KEY) USING orioledb;")
+		con3.execute("INSERT INTO o_new SELECT generate_series(1, 100);")
+		con2.execute("SELECT pg_stopevent_set('checkpoint_table_start',\n"
+		             "format(E'$.table.reloid == \\045s',\n"
+		             "'o_second'::regclass::oid)::jsonpath);")
+		con2.commit()
+		t1 = ThreadQueryExecutor(con1, "CHECKPOINT;")
+		t1.start()
+		wait_checkpointer_stopevent(node)
+		con3.commit()
+		last_used = dict(
+		    con3.execute(
+		        "SELECT undo_type, lastUsedLocation FROM orioledb_get_undo_meta()"
+		    ))
+		con2.execute("SELECT pg_stopevent_reset('checkpoint_table_start')")
+		con2.commit()
+		t1.join()
+
+		xid_dir = os.path.join(node.data_dir, 'orioledb_data')
+		chkp = max(
+		    int(f[:-4]) for f in os.listdir(xid_dir)
+		    if f.endswith('.xid') and f[:-4].isdigit())
+		with open(os.path.join(xid_dir, f"{chkp}.xid"), 'rb') as f:
+			body = f.read()
+		count = struct.unpack_from('<I', body)[0]
+		names = ['row', 'page', 'system']
+		seen = set()
+		for i in range(count):
+			oxid, kind, _, _, _, _, retain = struct.unpack_from(
+			    '<QI4x4QQ', body, 4 + i * 56)
+			if kind >= len(names) or retain & (1 << 61):
+				continue
+			seen.add(names[kind])
+			self.assertLessEqual(
+			    retain, last_used[names[kind]],
+			    f"the {names[kind]} record of oxid {oxid} retains {retain}")
+		self.assertIn('system', seen)
+
+		con1.close()
+		con2.close()
+		con3.close()
+		node.stop(['-m', 'immediate'])
+		node.start()
+		self.assertEqual([(100, )],
+		                 node.execute('postgres',
+		                              "SELECT count(*) FROM o_new"))
+		node.stop()
+
+	def test_checkpoint_takes_back_a_compacted_committed_update(self):
+		"""A transaction that shrinks a row and commits while a checkpoint is
+		on its way leaves the row's item at its old size only until the page
+		is compacted: once committed, the version can never be rolled back,
+		so a compaction cuts the item to the new tuple.  The checkpoint then
+		writes that page, newer than the point replay starts from, and replay
+		of the update finds its own version there and takes it back first.
+		The previous version did not fit the cut item: recovery PANICked with
+		"corrupted undo record: tuple size N exceeds available M"."""
+
+		node = self.node
+		node.append_conf(
+		    'postgresql.conf', "checkpoint_timeout = 1d\n"
+		    "orioledb.enable_stopevents = true\n")
+		node.start()
+		node.safe_psql(
+		    'postgres', "CREATE EXTENSION IF NOT EXISTS orioledb;\n"
+		    "CREATE TABLE o_shrink (id int PRIMARY KEY, v text) USING orioledb;\n"
+		    "INSERT INTO o_shrink VALUES (1, repeat('x', 1000));\n")
+		con1 = node.connect()
+		con2 = node.connect()
+		con3 = node.connect()
+
+		con2.execute("SELECT pg_stopevent_set('checkpoint_table_start',\n"
+		             "format(E'$.table.reloid == \\045s',\n"
+		             "'o_shrink'::regclass::oid)::jsonpath);")
+		con2.commit()
+		t1 = ThreadQueryExecutor(con1, "CHECKPOINT;")
+		t1.start()
+		wait_checkpointer_stopevent(node)
+
+		# shrink the row and commit, then make its page reorganize
+		con3.execute("UPDATE o_shrink SET v = 'y' WHERE id = 1;")
+		con3.commit()
+		con3.execute("INSERT INTO o_shrink SELECT g, repeat('z', 1000) "
+		             "FROM generate_series(2, 20) g;")
+		con3.commit()
+
+		con2.execute("SELECT pg_stopevent_reset('checkpoint_table_start')")
+		con2.commit()
+		t1.join()
+		con1.close()
+		con2.close()
+		con3.close()
+		node.stop(['-m', 'immediate'])
+
+		node.start()
+		self.assertEqual([(1, 'y', 20)],
+		                 node.execute(
+		                     'postgres',
+		                     "SELECT id, v, (SELECT count(*) FROM o_shrink) "
+		                     "FROM o_shrink WHERE id = 1"))
+		node.stop()
+
+	def test_checkpoint_takes_back_a_compacted_committed_conflict(self):
+		"""As above, with the shrinking update made by a transaction the
+		checkpoint's xid file names, over a version replay writes first: the
+		replay of that version meets the newer one as a conflict of an
+		unfinished transaction, and takes it back with its whole chain."""
+
+		node = self.node
+		node.append_conf(
+		    'postgresql.conf', "checkpoint_timeout = 1d\n"
+		    "orioledb.enable_stopevents = true\n")
+		node.start()
+		node.safe_psql(
+		    'postgres', "CREATE EXTENSION IF NOT EXISTS orioledb;\n"
+		    "CREATE TABLE o_shrink (id int PRIMARY KEY, v text) USING orioledb;\n"
+		    "CREATE TABLE o_other (id int PRIMARY KEY) USING orioledb;\n"
+		    "INSERT INTO o_shrink VALUES (1, repeat('x', 1000));\n")
+		con1 = node.connect()
+		con2 = node.connect()
+		con3 = node.connect()
+		con4 = node.connect()
+
+		con4.execute("INSERT INTO o_other VALUES (1);")
+		con2.execute("SELECT pg_stopevent_set('checkpoint_table_start',\n"
+		             "format(E'$.table.reloid == \\045s',\n"
+		             "'o_shrink'::regclass::oid)::jsonpath);")
+		con2.commit()
+		t1 = ThreadQueryExecutor(con1, "CHECKPOINT;")
+		t1.start()
+		wait_checkpointer_stopevent(node)
+
+		con3.execute("UPDATE o_shrink SET v = repeat('w', 900) WHERE id = 1;")
+		con3.commit()
+		con4.execute("UPDATE o_shrink SET v = 'y' WHERE id = 1;")
+		con4.commit()
+		con3.execute("INSERT INTO o_shrink SELECT g, repeat('z', 1000) "
+		             "FROM generate_series(2, 20) g;")
+		con3.commit()
+
+		con2.execute("SELECT pg_stopevent_reset('checkpoint_table_start')")
+		con2.commit()
+		t1.join()
+		con1.close()
+		con2.close()
+		con3.close()
+		con4.close()
+		node.stop(['-m', 'immediate'])
+
+		node.start()
+		self.assertEqual([(1, 'y', 20)],
+		                 node.execute(
+		                     'postgres',
+		                     "SELECT id, v, (SELECT count(*) FROM o_shrink) "
+		                     "FROM o_shrink WHERE id = 1"))
+		node.stop()

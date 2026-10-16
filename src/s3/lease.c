@@ -147,6 +147,9 @@ typedef struct
 static S3LeaseState pm_lease;
 
 static void reader_pin_and_check(uint32 chkp);
+
+/* the checkpoint this data directory started from, at the postmaster start */
+static uint32 start_checkpoint = 0;
 static S3LeaseState *lease = NULL;
 
 typedef enum
@@ -994,6 +997,7 @@ s3_lease_acquire(void)
 		control.lastCheckpointNumber = 0;
 		control.controlIdentifier = 0;
 	}
+	start_checkpoint = control.lastCheckpointNumber;
 
 	memset(&root, 0, sizeof(root));
 	rootExists = startup_get(ROOT_KEY, &body, rootEtag, NULL);
@@ -1240,6 +1244,59 @@ s3_lease_release(void)
 }
 
 /*
+ * The checkpoint a reader was loaded at, or 0 when it is not known: the
+ * loader puts that checkpoint's manifest in the data directory, and a reader
+ * writes no manifest of its own.
+ */
+static uint32
+loaded_checkpoint(void)
+{
+	FILE	   *f = fopen(ORIOLEDB_DATA_DIR "/s3_manifest", "r");
+	char		line[256];
+	uint32		chkp = 0;
+
+	if (f == NULL)
+		return 0;
+	while (fgets(line, sizeof(line), f) != NULL)
+		if (sscanf(line, "checkpoint %u", &chkp) == 1)
+			break;
+	fclose(f);
+	return chkp;
+}
+
+/*
+ * A reader's own pages go to local parts, which a start throws away (the
+ * bucket holds other pages of the writer under their numbers).  A restartpoint
+ * past the load names those local parts, so a reader that made one cannot
+ * start again from it: recovery would read the writer's parts in their place.
+ * It starts only from the checkpoint it was loaded at.
+ */
+static void
+reader_check_restartable(uint32 lastCheckpoint)
+{
+	uint32		loaded = loaded_checkpoint();
+
+	if (loaded != 0 && lastCheckpoint > loaded)
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("this S3 reader cannot start again on its data directory"),
+				 errdetail("It was loaded at checkpoint %u and made restartpoints up to checkpoint %u; "
+						   "the pages it wrote since are local and were not kept.",
+						   loaded, lastCheckpoint),
+				 errhint("Load the data directory from the bucket again.")));
+}
+
+/*
+ * The checkpoint the data directory held when the postmaster started: a build
+ * the writer before this run did after it named its tree's map with it.
+ */
+uint32
+s3_start_checkpoint(void)
+{
+	return start_checkpoint;
+}
+
+/*
  * A reader takes no lease and writes nothing to the bucket: it only needs
  * the epochs, to name the maps of the checkpoints it opens.
  */
@@ -1258,6 +1315,8 @@ s3_lease_reader_init(void)
 
 		if (!get_checkpoint_control_data(&control))
 			control.lastCheckpointNumber = 0;
+		start_checkpoint = control.lastCheckpointNumber;
+		reader_check_restartable(control.lastCheckpointNumber);
 		reader_pin_and_check(control.lastCheckpointNumber);
 	}
 	ereport(LOG,
@@ -1288,6 +1347,14 @@ s3_lease_shmem_init(Pointer ptr, bool found)
 		s3_postmaster_retries = true;
 		s3_lease_acquire();
 		s3_postmaster_retries = false;
+	}
+	/* a reader's crash restart is a start too: its local parts were dropped */
+	if (!found && made && !IsUnderPostmaster && orioledb_s3_reader)
+	{
+		CheckpointControl control;
+
+		if (get_checkpoint_control_data(&control))
+			reader_check_restartable(control.lastCheckpointNumber);
 	}
 	made = true;
 	lease = (S3LeaseState *) ptr;
