@@ -1471,6 +1471,119 @@ class S3Test(S3BaseTest):
 			self.assertEqual({'readers'}, changed)
 			reader.cleanup()
 
+	def test_s3_reader_past_its_load_does_not_start_again(self):
+		"""A reader's own pages go to local parts, which a start drops: the
+		bucket holds the writer's other pages under the same numbers.  Once a
+		restartpoint past the load names those local parts, the reader refuses
+		to start again, by a stop and start or a crash restart, instead of
+		reading the writer's parts in their place.  Loaded again, it reads the
+		writer's data."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.main_buffers = 8MB
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, pad text) USING orioledb;
+			INSERT INTO o_test SELECT g, repeat('x', 500) FROM generate_series(1, 20000) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+
+		def wait_for(reader, want):
+			deadline = time.time() + 60
+			got = None
+			while time.time() < deadline and got != want:
+				try:
+					got = reader.execute(
+					    "SELECT count(*), count(*) FILTER (WHERE pad = 'y') FROM o_test"
+					)
+				except Exception:
+					pass
+				time.sleep(0.5)
+			self.assertEqual(want, got)
+
+		def make_reader(port):
+			reader = self.initNode(port, 'tgsb')
+			self.loader.download(reader.data_dir)
+			reader.append_conf(port=reader.port)
+			reader.append_conf("""
+				orioledb.s3_reader = on
+				hot_standby = on
+				orioledb.main_buffers = 8MB
+			""")
+			open(os.path.join(reader.data_dir, "standby.signal"), "w").close()
+			return reader
+
+		def log_of(reader):
+			with open(reader.pg_log_file) as f:
+				return f.read()
+
+		def past_the_load(reader, k):
+			# the reader replays a checkpoint record and writes its pages
+			# to local parts at a restartpoint
+			node.safe_psql(f"UPDATE o_test SET pad = 'y' WHERE id % {k} = 0;")
+			node.safe_psql("CHECKPOINT;")
+			wait_for(
+			    reader,
+			    node.execute(
+			        "SELECT count(*), count(*) FILTER (WHERE pad = 'y') FROM o_test"
+			    ))
+			reader.safe_psql("CHECKPOINT;")
+
+		with make_reader(self.getBasePort() + 1) as reader:
+			reader.start()
+			wait_for(reader, [(20000, 0)])
+			# before any restartpoint past the load it starts again
+			reader.stop(['-m', 'immediate'])
+			reader.start()
+			wait_for(reader, [(20000, 0)])
+			past_the_load(reader, 7)
+			reader.stop()
+			try:
+				reader.start()
+			except testgres.StartNodeException:
+				pass
+			self.assertIn(
+			    "this S3 reader cannot start again on its data directory",
+			    log_of(reader))
+			with self.assertRaises(Exception):
+				reader.execute("SELECT 1")
+			reader.cleanup()
+
+		# a crash restart under the same postmaster drops the local parts too
+		with make_reader(self.getBasePort() + 2) as reader:
+			reader.append_conf("restart_after_crash = on")
+			reader.start()
+			wait_for(reader, [(20000, 20000 // 7)])
+			past_the_load(reader, 5)
+			pid = reader.execute("SELECT pg_backend_pid()")[0][0]
+			os.kill(pid, signal.SIGKILL)
+			deadline = time.time() + 60
+			while time.time(
+			) < deadline and "cannot start again" not in log_of(reader):
+				time.sleep(0.5)
+			self.assertIn(
+			    "this S3 reader cannot start again on its data directory",
+			    log_of(reader))
+			try:
+				reader.stop(['-m', 'immediate'])
+			except Exception:
+				pass  # the postmaster stopped by itself
+			reader.cleanup()
+
+		# loaded again, it reads what the writer has
+		node.safe_psql("UPDATE o_test SET pad = 'y' WHERE id % 3 = 0;")
+		want = node.execute(
+		    "SELECT count(*), count(*) FILTER (WHERE pad = 'y') FROM o_test")
+		with make_reader(self.getBasePort() + 3) as reader:
+			reader.start()
+			wait_for(reader, want)
+			reader.stop()
+			reader.cleanup()
+
 	def test_s3_reader_reads_without_writing(self):
 		"""A reader opens what the bucket holds, as a hot standby on a data
 		directory the loader made, and writes nothing to the bucket while the
