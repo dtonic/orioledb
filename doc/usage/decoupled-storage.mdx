@@ -25,47 +25,107 @@ S3 mode is an experimental feature. It is available in every build of this fork,
 
 Local storage implements caching of the data most often accessed. Also, it ensures that adding and updating data will be done at the speed of writing to local storage, rather than the S3 transfer rate. Data are synced with S3 asynchronously. However, all requirements of data integrity are ensured for all the data on S3 storage as well. So you can re-connect to the S3 bucket by another empty PostgreSQL instance (initialized with the utility described below) with the OrioleDB extension configured to use S3 with this bucket and get back all the data from S3 in the state of the last PostgreSQL checkpoint.
 
-To use S3 functionality, the following parameters should be set before creating orioledb tables and materialized views:
+### Required parameters
 
-- `orioledb.s3_mode` -- whether to use S3 mode. It could be `on` and `off`. The default is `off`
-- `archive_library = 'orioledb'` -- set it to use s3 mode
-- `archive_mode = on` -- set it to use S3 mode
-- `orioledb.s3_region` -- specify S3 region, where the S3 bucket is created.
-- `orioledb.s3_host` -- access endpoint address for S3 bucket (without `https://` prefix). E.g. mybucket.s3-accelerate.amazonaws.com
-- `orioledb.s3_prefix` -- Prefix to prepend to S3 object name (may contain bucket name if it is not in endpoint)
-- `orioledb.s3_use_https` -- Use https for S3 connections (or http otherwise). The default is `on`. (Make sure that it matches server, especially for localhost connections)
-- `orioledb.s3_accesskey` -- specify AWS access key to authenticate the bucket.
-- `orioledb.s3_secretkey` -- specify AWS secret key to authenticate the bucket.
+Set the following parameters in `postgresql.conf` before creating OrioleDB tables and materialized views:
 
-Keep the keys in a file outside the data directory, readable by the server's user only, and include it from `postgresql.conf` (`include_if_exists '/etc/orioledb/s3.conf'`). Checkpoints upload `postgresql.conf` and `postgresql.auto.conf` to the bucket, so keys set there, or with `ALTER SYSTEM`, are stored in the bucket in plain text; keys passed with `-c` show in `ps`. To rotate the keys, replace the file and call `pg_reload_conf()`. `orioledb.s3_secretkey` is shown to superusers and members of `pg_read_all_settings` only. The server does not read `AWS_*` environment variables; the loader reads them when it finds no keys in the configuration files (it follows their `include` directives).
-- `orioledb.s3_num_workers` -- specify the number of AWS workers syncing data to S3 bucket. More workers could make sync faster. 20 - is a recommended value that is enough in most cases.
-- `orioledb.s3_desired_size` -- This parameter defines the total desired size of OrioleDB tables on the local storage. Once this limit is exceeded, OrioleDB's background workers will begin evicting local data to the S3 bucket. This mechanism ensures efficient use of local storage and seamless data transfer to S3. Effective support for this limit requires a filesystem that supports sparse files.
-- `max_worker_processes` -- PostgreSQL limit for maximum number of workers. Should be set to accommodate extra `orioledb.s3_num_workers` and all other Postgres workers. To start set it to `orioledb.s3_num_workers` plus the previous `max_worker_processes` value.
+- `orioledb.s3_mode` -- whether to use S3 mode: `on` or `off`. The default is `off`.
+- `archive_mode = on` -- required for S3 mode.
+- `archive_library = 'orioledb'` -- required for S3 mode.
+- `orioledb.s3_host` -- endpoint address of the S3 bucket, without the `https://` prefix. E.g. `mybucket.s3-accelerate.amazonaws.com`.
+- `orioledb.s3_region` -- region the S3 bucket is created in.
+- `orioledb.s3_prefix` -- prefix prepended to S3 object names. It may contain the bucket name if the endpoint does not.
+- `orioledb.s3_use_https` -- use https for S3 connections, or http otherwise. The default is `on`. It must match what the endpoint serves.
+- `orioledb.s3_accesskey` -- AWS access key for the bucket.
+- `orioledb.s3_secretkey` -- AWS secret key for the bucket.
+- `orioledb.s3_num_workers` -- number of workers syncing data to the S3 bucket. More workers make syncing faster; 20 is enough in most cases. The default is 3.
+- `orioledb.s3_desired_size` -- desired total size of OrioleDB tables on local storage. Once it is exceeded, background workers begin evicting local data to the S3 bucket. This limit requires a filesystem that supports sparse files.
+- `max_worker_processes` -- must accommodate `orioledb.s3_num_workers` on top of all other workers. Start with `orioledb.s3_num_workers` plus the previous value.
 
-After setting the GUC parameters above restart the postmaster. Then all tables and materialized views created `using orioledb` will be synced with the S3 bucket.
+`orioledb.s3_mode`, `orioledb.s3_host`, `orioledb.s3_region`, `orioledb.s3_prefix`, `orioledb.s3_use_https` and `orioledb.s3_num_workers` take effect on a restart only. The keys and `orioledb.s3_desired_size` take effect on `pg_reload_conf()`.
 
-```sql
-CREATE TABLE s3_test
-(
-  id int8 NOT NULL,
-  value1 float8 NOT NULL,
-  value2 text NOT NULL,
-  PRIMARY KEY(id)
-)  USING orioledb
+### Credentials
+
+Keep the keys in a file outside the data directory, readable by the server's user only, and include it from `postgresql.conf`:
+
+- Checkpoints upload `postgresql.conf` and `postgresql.auto.conf` to the bucket, so keys set there, or with `ALTER SYSTEM`, are stored in the bucket in plain text.
+- Keys passed with `-c` show in `ps`.
+- The server does not read `AWS_*` environment variables.
+
+To rotate the keys, replace the file and call `pg_reload_conf()`. `orioledb.s3_secretkey` is shown to superusers and members of `pg_read_all_settings` only.
+
+### Example configuration
+
+`postgresql.conf`:
+
+```conf
+shared_preload_libraries = 'orioledb'
+
+orioledb.s3_mode = on
+archive_mode = on
+archive_library = 'orioledb'
+
+orioledb.s3_host = 'mybucket.s3.amazonaws.com'
+orioledb.s3_region = 'us-east-1'
+orioledb.s3_prefix = 'cluster1'
+
+include_if_exists '/etc/orioledb/s3.conf'
+
+orioledb.s3_num_workers = 20
+orioledb.s3_desired_size = 10GB
+max_worker_processes = 28
 ```
 
-In S3 mode, all tables and materialized views are incrementally synchronized with S3, meaning only modified blocks are uploaded to the S3 bucket. However, for tables and materialized views not created with `using orioledb`, OrioleDB’s background workers will compute file checksums during each checkpoint. Therefore, it is recommended to use S3 mode when storing the majority of your data with the OrioleDB engine.
+`/etc/orioledb/s3.conf`, owned by the server's user, mode `0600`:
 
-For best results, it's recommended to turn on `Transfer acceleration` in **General** AWS S3 bucket settings (endpoint address will be given with `s3-accelerate.amazonaws.com` suffix) and have the bucket and compute instance within the same AWS region. Even better is to use **Directory** AWS bucket within the same AWS region and sub-region as the compute instance.
+```conf
+orioledb.s3_accesskey = 'AKIA...'
+orioledb.s3_secretkey = '...'
+```
 
-Only one database instance can connect to the same S3 bucket.  During startup a database instance checks if another instance already is connected to the S3 bucket and if the bucket is compatible.  Otherwise the instance will fail to start.
+After setting the parameters, restart the postmaster. Then all tables and materialized views created `USING orioledb` are synced with the S3 bucket:
 
-As mentioned above S3 mode is currently experimental. The major limitations of this mode are the following.
+```sql
+CREATE TABLE accounts
+(
+  id int8 NOT NULL,
+  balance float8 NOT NULL,
+  name text NOT NULL,
+  PRIMARY KEY(id)
+) USING orioledb;
+```
 
-1. While OrioleDB tables and materialized views are stored incrementally in the S3 bucket, the history is kept forever. There is currently no mechanism to safely remove the old data.
-2. In the primary/replica setup, each should have a separate S3 bucket.
+### Additional parameters
 
-All of the limitations above are temporary and will be removed in further releases.
+The defaults suit most installations.
+
+| Parameter | Default | Applies on | Description |
+|---|---|---|---|
+| `orioledb.s3_max_unsealed_size` | `1GB` | reload | Local data written since the last checkpoint at which a checkpoint is requested. Data stays local until a checkpoint seals it, so this bounds the local disk a checkpoint interval needs. |
+| `orioledb.s3_queue_size` | `1MB` | restart | Size of the shared queue of S3 tasks. |
+| `orioledb.s3_headers_buffers` | `1MB` | restart | Size of the buffers for S3 metadata. |
+| `orioledb.s3_auth_retry_time` | `300s` | reload | How long a request the bucket refuses as unauthorized is retried, so that rotating the keys does not fail requests in between. `0` fails at once. |
+| `orioledb.s3_lease_duration` | `30s` | restart | How long the writer's lease on the bucket lasts without renewal. Another instance may take the bucket over this long after the writer stops renewing it. |
+| `orioledb.s3_wal_shipping` | `on` | restart | Ships WAL to the bucket as it is written. With `synchronous_standby_names = 's3'` a commit returns once its WAL is in the bucket. |
+| `orioledb.s3_wal_conninfo` | empty | restart | How the WAL shipper connects to this server. Empty uses the first Unix socket as the bootstrap superuser. |
+| `orioledb.s3_wal_chunk_delay` | `1ms` | reload | Longest time the WAL shipper gathers WAL into one chunk while more keeps coming. Commits waiting for the bucket wait for the chunk's upload. |
+| `orioledb.s3_gc_interval` | `60s` | restart | How often the garbage collector removes objects no retained checkpoint refers to. `0` turns it off. |
+| `orioledb.s3_gc_keep_checkpoints` | `2` | restart | How many committed checkpoints stay restorable. |
+| `orioledb.s3_gc_keep_time` | `0` | restart | How long committed checkpoints stay restorable. The garbage collector keeps whichever of this and `orioledb.s3_gc_keep_checkpoints` keeps more. `0` keeps by count only. |
+| `orioledb.s3_gc_max_pin_lag` | `1000` | reload | How many checkpoints behind the committed one a reader's pin still holds the garbage collector back. `0` means pins always hold. |
+| `orioledb.s3_compact_database` | empty | restart | Database the compaction worker connects to. Empty turns periodic compaction off; `orioledb_s3_compact()` runs it by hand. |
+| `orioledb.s3_compact_interval` | `1h` | restart | How often the compaction worker moves pages out of sparse objects. `0` turns it off. |
+| `orioledb.s3_compact_threshold` | `0.3` | reload | An object with fewer live blocks than this share of it is compacted. |
+| `orioledb.s3_reader` | `off` | restart | Runs the instance as a reader, see [S3 reader](#s3-reader). |
+| `orioledb.s3_reader_pin_ttl` | `10min` | restart | How long a reader's pin keeps its checkpoint from the garbage collector without renewal. |
+
+### Notes
+
+In S3 mode, OrioleDB tables and materialized views are synchronized with S3 incrementally: only modified blocks are uploaded. For tables and materialized views not created `USING orioledb`, background workers compute file checksums at each checkpoint, so S3 mode works best when most of the data is stored with the OrioleDB engine.
+
+For best results, turn on `Transfer acceleration` in the **General** AWS S3 bucket settings (the endpoint address then has the `s3-accelerate.amazonaws.com` suffix) and keep the bucket and the compute instance in the same AWS region. Even better is a **Directory** AWS bucket in the same region and sub-region as the compute instance.
+
+Only one database instance writes to an S3 bucket. During startup an instance checks whether another instance already writes to the bucket and whether the bucket is compatible; otherwise it fails to start. Read-only instances are configured as [S3 readers](#s3-reader).
 
 ## S3 loader utility
 
@@ -80,7 +140,7 @@ Run the script with the same parameters as from your S3 Postgres cluster config:
 - `AWS_ACCESS_KEY_ID` - same as `orioledb.s3_accesskey`
 - `AWS_SECRET_ACCESS_KEY` - same as `orioledb.s3_secretkey`
 - `AWS_DEFAULT_REGION` - same as `orioledb.s3_region`
-- `--endpoint` - same as `orioledb.s3_host` (full URL with `https://` or `http://` prefix) E.g `--endpoint=https://mybucket.s3-accelerate.amazonaws.com` or `--endpoint=https://mybucket.s3.amazonaws.com` or for local instance `--endpoint=http://localhost:PORT`
+- `--endpoint` - same as `orioledb.s3_host` (full URL with `https://` or `http://` prefix) E.g `--endpoint=https://mybucket.s3-accelerate.amazonaws.com` or `--endpoint=https://mybucket.s3.amazonaws.com`
 - `--prefix` - optional prefix to prepend to object paths (May contain bucket name if it is not in endpoint)
 `--endpoint=https://mybucket.s3-accelerate.amazonaws.com` or `--endpoint=https://mybucket.s3.amazonaws.com`
 - `--bucket-name` - S3 bucket name from `orioledb.s3_host` E.g `--bucket-name=mybucket`
@@ -88,3 +148,28 @@ Run the script with the same parameters as from your S3 Postgres cluster config:
 - `--verbose` - optionally print extended info.
 
 `AWS_ACCESS_KEY_ID=<your access key> AWS_SECRET_ACCESS_KEY='<your secret key>' AWS_DEFAULT_REGION=<your region> python orioledb_s3_loader.py --endpoint=https://<your-bucket-endpoint> --data-dir='orioledb_data' --verbose`
+
+## S3 reader
+
+A reader is a read-only hot standby on the bucket of a running writer. It follows the writer's commits from the WAL shipped to the bucket, without a restart. Any number of readers can run on one bucket.
+
+1. Load the bucket into an empty data directory with the [S3 loader utility](#s3-loader-utility). The directory gets the writer's `postgresql.conf`, so the `orioledb.s3_*` settings are already there, and a `restore_command` that fetches WAL from the bucket.
+
+2. Add to `postgresql.conf` in that directory:
+
+   ```conf
+   orioledb.s3_reader = on
+   hot_standby = on
+   ```
+
+3. Create `standby.signal` in that directory.
+
+4. If the writer includes its keys from a file, such as `/etc/orioledb/s3.conf`, put that file at the same path on the reader's host.
+
+5. Start the server. `SELECT role FROM orioledb_s3_status();` returns `reader`.
+
+A reader writes nothing to the bucket but a pin that keeps the checkpoint it loaded from the garbage collector. Keep in mind:
+
+- A reader that falls more than about three quarters of the writer's `orioledb.s3_gc_max_pin_lag` checkpoints behind stops; load it again before then.
+- A reader that has made a restartpoint, by a `CHECKPOINT` or a clean shutdown, does not start again on its data directory; load it again.
+- A reader is not promoted. To make one the writer once the old writer is gone, stop it, load the bucket into the same directory with `--keep-parts`, which keeps the data files it already has, and start it.
