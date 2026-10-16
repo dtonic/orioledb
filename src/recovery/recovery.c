@@ -1156,6 +1156,22 @@ read_xids(int checkpointnum, bool recovery_single, int worker_id)
 			 * We will probably need to retain this till the next checkpoint.
 			 */
 			retainUndoLocation = xidRec.retainLocation;
+
+			/*
+			 * A checkpoint written before the fix of walk_undo_stack() put
+			 * the regular log's retain location in every log's record: one
+			 * above where its log ends is not of that log, and would leave
+			 * the undo this replay writes unretained.  The checkpoint's
+			 * retain start keeps everything the transaction may need.
+			 */
+			if ((int) kind < (int) UndoLogsCount &&
+				UndoLocationIsValid(retainUndoLocation))
+			{
+				UndoMeta   *meta = get_undo_meta_by_type((UndoLogType) kind);
+
+				if (retainUndoLocation > pg_atomic_read_u64(&meta->lastUsedLocation))
+					retainUndoLocation = pg_atomic_read_u64(&meta->checkpointRetainStartLocation);
+			}
 			if ((int) kind < (int) UndoLogsCount &&
 				retainUndoLocation < state->retain_locs[(UndoLogType) kind])
 			{
