@@ -357,6 +357,51 @@ page_add_image_to_undo(BTreeDescr *desc, Pointer p, CommitSeqNo imageCsn,
 }
 
 /*
+ * Would page_item_rollback() of the last change of this item find room for
+ * the version it puts back?  Only an update can need more than the item has:
+ * the item keeps the size of the version it replaced for as long as the
+ * update may be rolled back, and is cut to the new tuple only once the
+ * update's transaction has finished.  So an item too small for its previous
+ * version holds a version whose transaction had committed when the page was
+ * last reorganized.
+ */
+bool
+page_item_rollback_fits(BTreeDescr *desc, Page p, BTreePageItemLocator *locator,
+						BTreeLeafTuphdr *nonLockTuphdrPtr)
+{
+	BTreeLeafTuphdr *tuphdr;
+	BTreeLeafTuphdr nonLockTuphdr;
+	BTreeModifyUndoStackItem item;
+
+	tuphdr = (BTreeLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(p, locator);
+	if (tuphdr->deleted != BTreeLeafTupleNonDeleted)
+		return true;
+
+	if (nonLockTuphdrPtr)
+		nonLockTuphdr = *nonLockTuphdrPtr;
+	else
+	{
+		nonLockTuphdr = *tuphdr;
+		(void) find_non_lock_only_undo_record(desc->undoType, &nonLockTuphdr);
+	}
+
+	if (!UndoLocationIsValid(nonLockTuphdr.undoLocation) ||
+		!UNDO_REC_EXISTS(desc->undoType, nonLockTuphdr.undoLocation))
+		return true;
+
+	undo_read(desc->undoType,
+			  nonLockTuphdr.undoLocation - offsetof(BTreeModifyUndoStackItem, tuphdr),
+			  sizeof(BTreeModifyUndoStackItem),
+			  (Pointer) &item);
+	if (item.header.type != ModifyUndoItemType ||
+		item.action != BTreeOperationUpdate)
+		return true;
+
+	return validate_undo_item_size(item.header.itemSize) <=
+		BTREE_PAGE_GET_ITEM_SIZE(p, locator) - BTreeLeafTuphdrSize;
+}
+
+/*
  * Given page item modified by in-progress transaction.  Rollback changes
  * using undo chain.  Specify 'wholeChain' flag to revert all in-progress
  * changes from the chain.  Otherise, only last change item is reverted.

@@ -214,6 +214,9 @@ StaticAssertDecl(MAXALIGN(sizeof(UndoPageImageHeader)) ==
 extern bool page_item_rollback(BTreeDescr *desc, Page p, BTreePageItemLocator *locator,
 							   bool loop, BTreeLeafTuphdr *non_lock_tuphdr_ptr,
 							   UndoLocation nonLockUndoLocation);
+extern bool page_item_rollback_fits(BTreeDescr *desc, Page p,
+									BTreePageItemLocator *locator,
+									BTreeLeafTuphdr *non_lock_tuphdr_ptr);
 extern UndoLocation make_undo_record(BTreeDescr *desc, OTuple tuple,
 									 bool is_tuple,
 									 BTreeOperationType action,

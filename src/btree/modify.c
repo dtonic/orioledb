@@ -266,6 +266,19 @@ retry:
 			context.leafTuphdr.xactInfo = OXID_GET_XACT_INFO(tupleOxid, context.lockMode, false);
 		}
 
+		/*
+		 * Replay takes back a version that a checkpoint image holds ahead of
+		 * the record, to put it there again in order.  An item cut below its
+		 * previous version cannot be taken back, and need not be: it was cut
+		 * because its transaction had committed before the page was written,
+		 * so the records that follow this one bring the row to that version
+		 * again.  Apply the record over it.
+		 */
+		if (cbAction == OBTreeCallbackActionUndo && is_recovery_process() &&
+			!page_item_rollback_fits(desc, page, &loc, &context.conflictTupHdr))
+			cbAction = (action == BTreeOperationDelete) ?
+				OBTreeCallbackActionDelete : OBTreeCallbackActionUpdate;
+
 		if (cbAction == OBTreeCallbackActionUndo)
 		{
 			(void) o_btree_modify_item_rollback(&context);
@@ -602,6 +615,20 @@ o_btree_modify_handle_conflicts(BTreeModifyInternalContext *context)
 				 */
 				return ConflictResolutionRetry;
 			}
+
+			/*
+			 * A version whose item was cut below the version before it had
+			 * committed when its page was written, whatever replay reads of
+			 * its transaction so far (see page_item_rollback_fits()).  It
+			 * cannot be taken back, and need not be: replay of that
+			 * transaction's own records brings the row back to it.  Go on as
+			 * over a committed version.
+			 */
+			if (is_recovery_process() &&
+				(COMMITSEQNO_IS_ABORTED(csn) || COMMITSEQNO_IS_INPROGRESS(csn)) &&
+				!page_item_rollback_fits(desc, page, loc,
+										 &context->conflictTupHdr))
+				csn = COMMITSEQNO_FROZEN;
 
 			/*
 			 * Replay never waits for a conflicting transaction, so decide

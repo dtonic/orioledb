@@ -885,3 +885,111 @@ class CheckpointConcurrentTest(BaseTest):
 		                              "SELECT count(*) FROM o_new"))
 		node.stop()
 
+	def test_checkpoint_takes_back_a_compacted_committed_update(self):
+		"""A transaction that shrinks a row and commits while a checkpoint is
+		on its way leaves the row's item at its old size only until the page
+		is compacted: once committed, the version can never be rolled back,
+		so a compaction cuts the item to the new tuple.  The checkpoint then
+		writes that page, newer than the point replay starts from, and replay
+		of the update finds its own version there and takes it back first.
+		The previous version did not fit the cut item: recovery PANICked with
+		"corrupted undo record: tuple size N exceeds available M"."""
+
+		node = self.node
+		node.append_conf(
+		    'postgresql.conf', "checkpoint_timeout = 1d\n"
+		    "orioledb.enable_stopevents = true\n")
+		node.start()
+		node.safe_psql(
+		    'postgres', "CREATE EXTENSION IF NOT EXISTS orioledb;\n"
+		    "CREATE TABLE o_shrink (id int PRIMARY KEY, v text) USING orioledb;\n"
+		    "INSERT INTO o_shrink VALUES (1, repeat('x', 1000));\n")
+		con1 = node.connect()
+		con2 = node.connect()
+		con3 = node.connect()
+
+		con2.execute("SELECT pg_stopevent_set('checkpoint_table_start',\n"
+		             "format(E'$.table.reloid == \\045s',\n"
+		             "'o_shrink'::regclass::oid)::jsonpath);")
+		con2.commit()
+		t1 = ThreadQueryExecutor(con1, "CHECKPOINT;")
+		t1.start()
+		wait_checkpointer_stopevent(node)
+
+		# shrink the row and commit, then make its page reorganize
+		con3.execute("UPDATE o_shrink SET v = 'y' WHERE id = 1;")
+		con3.commit()
+		con3.execute("INSERT INTO o_shrink SELECT g, repeat('z', 1000) "
+		             "FROM generate_series(2, 20) g;")
+		con3.commit()
+
+		con2.execute("SELECT pg_stopevent_reset('checkpoint_table_start')")
+		con2.commit()
+		t1.join()
+		con1.close()
+		con2.close()
+		con3.close()
+		node.stop(['-m', 'immediate'])
+
+		node.start()
+		self.assertEqual([(1, 'y', 20)],
+		                 node.execute(
+		                     'postgres',
+		                     "SELECT id, v, (SELECT count(*) FROM o_shrink) "
+		                     "FROM o_shrink WHERE id = 1"))
+		node.stop()
+
+	def test_checkpoint_takes_back_a_compacted_committed_conflict(self):
+		"""As above, with the shrinking update made by a transaction the
+		checkpoint's xid file names, over a version replay writes first: the
+		replay of that version meets the newer one as a conflict of an
+		unfinished transaction, and takes it back with its whole chain."""
+
+		node = self.node
+		node.append_conf(
+		    'postgresql.conf', "checkpoint_timeout = 1d\n"
+		    "orioledb.enable_stopevents = true\n")
+		node.start()
+		node.safe_psql(
+		    'postgres', "CREATE EXTENSION IF NOT EXISTS orioledb;\n"
+		    "CREATE TABLE o_shrink (id int PRIMARY KEY, v text) USING orioledb;\n"
+		    "CREATE TABLE o_other (id int PRIMARY KEY) USING orioledb;\n"
+		    "INSERT INTO o_shrink VALUES (1, repeat('x', 1000));\n")
+		con1 = node.connect()
+		con2 = node.connect()
+		con3 = node.connect()
+		con4 = node.connect()
+
+		con4.execute("INSERT INTO o_other VALUES (1);")
+		con2.execute("SELECT pg_stopevent_set('checkpoint_table_start',\n"
+		             "format(E'$.table.reloid == \\045s',\n"
+		             "'o_shrink'::regclass::oid)::jsonpath);")
+		con2.commit()
+		t1 = ThreadQueryExecutor(con1, "CHECKPOINT;")
+		t1.start()
+		wait_checkpointer_stopevent(node)
+
+		con3.execute("UPDATE o_shrink SET v = repeat('w', 900) WHERE id = 1;")
+		con3.commit()
+		con4.execute("UPDATE o_shrink SET v = 'y' WHERE id = 1;")
+		con4.commit()
+		con3.execute("INSERT INTO o_shrink SELECT g, repeat('z', 1000) "
+		             "FROM generate_series(2, 20) g;")
+		con3.commit()
+
+		con2.execute("SELECT pg_stopevent_reset('checkpoint_table_start')")
+		con2.commit()
+		t1.join()
+		con1.close()
+		con2.close()
+		con3.close()
+		con4.close()
+		node.stop(['-m', 'immediate'])
+
+		node.start()
+		self.assertEqual([(1, 'y', 20)],
+		                 node.execute(
+		                     'postgres',
+		                     "SELECT id, v, (SELECT count(*) FROM o_shrink) "
+		                     "FROM o_shrink WHERE id = 1"))
+		node.stop()
