@@ -219,6 +219,46 @@ class S3LoaderTest(unittest.TestCase):
 		l.forget_listing(2)
 		self.assertIsNone(l.assemble_segment(2, 2))
 
+	def test_a_chunk_removed_between_list_and_get_is_listed_again(self):
+		"""A writer going on archives a segment and removes its chunks while
+		a load reads the timeline's chunks for where they end: the chunk it
+		listed is gone when it asks for it, and a new listing has it no
+		more."""
+
+		class RemovedOnGet(FakeS3):
+
+			def __init__(self, objects, key):
+				super().__init__(objects)
+				self.key = key
+
+			def get_object(self, Bucket, Key, Range=None):
+				if Key == self.key:
+					del self.objects[Key]
+					self.key = None
+				return super().get_object(Bucket, Key, Range)
+
+		lo = SEG
+		l = self.make_loader({
+		    f"wal/{self.seg_name(1, 1)}":
+		    bytes([1]) * SEG,
+		    self.chunk_key(1, 7):
+		    chunk(3, lo, lo + SEG),
+		    self.chunk_key(1, 8):
+		    chunk(3, lo + SEG, lo + SEG + 500),
+		})
+		l.s3 = RemovedOnGet(l.s3.objects, self.chunk_key(1, 7))
+		l.checkpoint_only = False
+		os.makedirs(os.path.join(self.tmp.name, 'orioledb_data'))
+		l.download_wal({
+		    "Bytes per WAL segment": str(SEG),
+		    "Latest checkpoint's REDO WAL file": self.seg_name(1, 1),
+		    "Latest checkpoint location": f"0/{lo + 100:X}",
+		    "WAL block size": "8192",
+		})
+		with open(os.path.join(self.tmp.name, 'orioledb_data',
+		                       's3_wal_seq')) as f:
+			self.assertEqual(f"1 9 {lo + SEG + 500}\n", f.read())
+
 	def test_decode_xidmap_items(self):
 		def zigzag(v):
 			zz = (v << 1) ^ (v >> 63) if v >= 0 else ((-v) << 1) - 1
