@@ -5,10 +5,12 @@ import io
 import os
 import re
 import struct
+import sys
 import tempfile
 import unittest
 
 from botocore.exceptions import ClientError
+from unittest import mock
 
 import orioledb_s3_loader as loader
 
@@ -287,6 +289,78 @@ class S3LoaderTest(unittest.TestCase):
 		with self.assertRaises(Exception):
 			loader.decode_xidmap_items(bytes(data) + b'\x00', len(items), 'long')
 		self.assertEqual(b'', loader.decode_xidmap_items(b'', 0, 'empty'))
+
+
+def head_bucket_error(code):
+	return ClientError({'Error': {'Code': code, 'Message': code}}, 'HeadBucket')
+
+
+class FakeProbeS3:
+	"""boto3.client("s3", ...) as parse_args probes with it: head_bucket
+	answers from `answers`, keyed by (endpoint_url, bucket); None is a
+	bucket there, anything absent a 404."""
+
+	def __init__(self, answers, endpoint_url):
+		self.answers = answers
+		self.endpoint_url = endpoint_url
+
+	def head_bucket(self, Bucket):
+		answer = self.answers.get((self.endpoint_url, Bucket),
+		                          head_bucket_error('404'))
+		if answer is not None:
+			raise answer
+
+
+class S3LoaderEndpointTest(unittest.TestCase):
+	"""parse_args' choice between a bucket in the endpoint's host
+	(virtual-hosted) and the prefix's first segment (path-style)."""
+
+	def resolve(self, endpoint, prefix, answers):
+
+		def client(service, endpoint_url=None, verify=None, config=None):
+			return FakeProbeS3(answers, endpoint_url)
+
+		argv = [
+		    'orioledb_s3_loader.py', '--endpoint', endpoint, '--prefix', prefix,
+		    '--data-dir', 'unused'
+		]
+		with mock.patch.object(sys, 'argv', argv), \
+		     mock.patch.object(loader.boto3, 'client', client):
+			l = loader.OrioledbS3ObjectLoader()
+			l.parse_args()
+		return l.resolved
+
+	def test_a_path_style_host_with_dots_takes_the_bucket_from_the_prefix(
+	        self):
+		# RustFS behind its Service name: the first label is no bucket, and
+		# RustFS answers that HeadBucket with 501
+		host = 'http://rustfs.rustfs.svc.cluster.local:9000'
+		answers = {
+		    ('http://rustfs.svc.cluster.local:9000', 'rustfs'):
+		    head_bucket_error('501'),
+		    (host, 'bucket'): None,
+		}
+		self.assertEqual((host, 'bucket', 'orioledb', 'path'),
+		                 self.resolve(host, 'bucket/orioledb', answers))
+
+	def test_a_virtual_hosted_endpoint_keeps_the_bucket_in_the_host(self):
+		answers = {('https://s3.ap-northeast-2.amazonaws.com', 'bucket'): None}
+		self.assertEqual(('https://s3.ap-northeast-2.amazonaws.com', 'bucket',
+		                  'orioledb', 'virtual'),
+		                 self.resolve(
+		                     'https://bucket.s3.ap-northeast-2.amazonaws.com',
+		                     'orioledb', answers))
+
+	def test_a_bucket_found_nowhere_reports_both_answers(self):
+		# a bucket in the host this client may not read: the 403 is kept
+		answers = {
+		    ('https://s3.ap-northeast-2.amazonaws.com', 'bucket'):
+		    head_bucket_error('403')
+		}
+		with self.assertRaisesRegex(Exception,
+		                            r'endpoint: .*\(403\).*prefix: .*\(404\)'):
+			self.resolve('https://bucket.s3.ap-northeast-2.amazonaws.com',
+			             'orioledb', answers)
 
 
 if __name__ == "__main__":
