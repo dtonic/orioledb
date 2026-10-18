@@ -280,6 +280,21 @@ RUN set -eux; \
 	postgres --version ; \
 	initdb --version
 
+# orioledb_s3_loader.py loads an S3 reader's data directory from the bucket,
+# and the restore_command it writes there runs the script again, so the image
+# carries it with boto3 and testgres at the versions requirements.txt pins.
+COPY orioledb_s3_loader.py /usr/local/bin/
+COPY requirements.txt /tmp/
+RUN set -eux; \
+	apt-get update; \
+	DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3-venv; \
+	rm -rf /var/lib/apt/lists/*; \
+	python3 -m venv /opt/orioledb-s3-loader; \
+	/opt/orioledb-s3-loader/bin/pip install --no-cache-dir \
+		-c /tmp/requirements.txt boto3 testgres; \
+	rm /tmp/requirements.txt
+ENV PATH=/opt/orioledb-s3-loader/bin:$PATH
+
 ENV PGDATA=/var/lib/postgresql/data
 # this 777 will be replaced by 700 at runtime (allows semi-arbitrary "--user" values)
 RUN mkdir -p "$PGDATA" && chown -R postgres:postgres "$PGDATA" && chmod 777 "$PGDATA"
