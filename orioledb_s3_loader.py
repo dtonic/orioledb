@@ -178,6 +178,7 @@ class OrioledbS3ObjectLoader:
 
 		bucket_in_endpoint = True
 		bucket_in_prefix = False
+		virtual_error = prefix_error = None
 		try:
 			config = Config(s3={'addressing_style': 'virtual'},
 			                max_pool_connections=MAX_CONCURRENCY)
@@ -187,9 +188,12 @@ class OrioledbS3ObjectLoader:
 			                         config=config)
 			s3_client.head_bucket(Bucket=bucket)
 			bucket_name = bucket
-		except ValueError:
+		except (ValueError, ClientError) as e:
+			# the host's first label is no bucket there: a path-style store
+			# whose host has dots (RustFS's 501) answers with an error
 			bucket_in_endpoint = False
 			bucket_in_prefix = True
+			virtual_error = e
 		if bucket_in_prefix:
 			config = None
 			bucket = splitted_prefix[0]
@@ -201,14 +205,16 @@ class OrioledbS3ObjectLoader:
 			    config=Config(max_pool_connections=MAX_CONCURRENCY))
 			try:
 				s3_client.head_bucket(Bucket=bucket)
-			except ParamValidationError:
+			except (ParamValidationError, ClientError) as e:
 				bucket_in_prefix = False
-			except ClientError:
-				bucket_in_prefix = False
+				prefix_error = e
 			bucket_name = bucket
 
 		if not bucket_in_endpoint and not bucket_in_prefix:
-			raise Exception("No valid bucket name in endpoint or prefix")
+			# both answers: a 403 from the host is a bucket this client may
+			# not read, a 404 for the prefix's one a bucket that is not there
+			raise Exception("No valid bucket name in endpoint or prefix "
+			                f"(endpoint: {virtual_error}; prefix: {prefix_error})")
 
 		if bucket_in_endpoint:
 			self.resolved = (raw_endpoint, bucket_name, prefix, 'virtual')
