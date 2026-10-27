@@ -508,7 +508,7 @@ dtonic/orioledb PR #1–#3 을 본다.
 
 | 파일 | 함수 | 내용 |
 | --- | --- | --- |
-| `src/recovery/logical.c`, `src/recovery/wal.c`, `src/catalog/ddl.c`, `include/recovery/{logical,wal}.h` | `decode_on_record`, `orioledb_decode`, `remove_skipped_dml`, `wal_joint_commit`, `wal_start_table_rewrite`/`wal_end_table_rewrite`, `log_logical_wal_container_with_payload`, `rewrite_table` | 논리 복제: 큰 트랜잭션, 서브트랜잭션, 크래시 뒤 디코딩, 테이블 재작성 표시(`WAL_CONTAINER_TABLE_REWRITE`), joint commit |
+| `src/recovery/logical.c`, `src/recovery/wal.c`, `src/catalog/ddl.c`, `include/recovery/{logical,wal}.h` | `decode_on_record`, `orioledb_decode`, `remove_skipped_dml`, `wal_joint_commit` | 논리 복제: 큰 트랜잭션, 서브트랜잭션, 크래시 뒤 디코딩, joint commit. 테이블 재작성 복사는 upstream의 `rewrite_copy_set`(`pg_class.relrewrite`)으로 대체했고, 디코더는 이전 빌드가 쓴 WAL을 위해 `WAL_CONTAINER_TABLE_REWRITE` 플래그만 계속 인식 |
 | `src/transam/oxid.c`, `src/transam/undo.c`, `include/transam/undo.h`, `include/orioledb.h`(`logicalWalRetainXmin`) | `oxid_subxact_callback`, `hold_released_logical_xid`, `pass_released_logical_xids`, `release_assigned_logical_xids`, `set_my_logical_wal_retain_location(xmin)`, `logical_wal_retain_xmin`, `logical_retain_ring_floor`, `undo_subxact_callback`, autonomous 트랜잭션 함수들, `o_slot_retain_location` | 서브트랜잭션의 논리 xid 와 undo 보존, `orioledb.serializable` 기본값 |
 | `src/catalog/cic_spool.c`, `src/tableam/operations.c`, `src/indexam/handler.c`, `include/tableam/{handler,operations}.h` | `stream_read_one`, `cic_spool_*`, `cic_spool_capture_needed`, `cic_spool_capture`, `o_update_secondary_index`, `o_tbl_index_delete`, `orioledb_aminsert`/`amupdate`/`amdelete` | CREATE/DROP INDEX CONCURRENTLY 아래의 동시 쓰기 |
 | `src/btree/iterator.c` | `undo_image_lokey`, `page_contains_key`, `page_contains_end` | undo 이미지의 왼쪽 경계 |

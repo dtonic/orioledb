@@ -164,6 +164,7 @@ ISOLATIONCHECKS = bitmap_hist_scan \
 				  btree_print_backend_id \
 				  btree_scan \
 				  concurrent_update_delete \
+				  descr_torn_pair \
 				  fkeys \
 				  include_pk_wait \
 				  included \
@@ -226,6 +227,7 @@ TESTGRESCHECKS_PART_1 = test/t/amcheck_test.py \
 						test/t/concurrent_index_test.py \
 						test/t/concurrent_index_stopevents_test.py \
 						test/t/replication_test.py \
+						test/t/replident_full_physical_test.py \
 						test/t/fuzzy_checkpoint_test.py \
 						test/t/types_test.py \
 						test/t/sys_cache_delete_test.py \
@@ -272,12 +274,15 @@ TESTGRESCHECKS_PART_2 = test/t/checkpoint_concurrent_test.py \
 						test/t/parallel_ordered_scan_test.py \
 						test/t/parallel_bitmap_scan_test.py \
 						test/t/parallel_scan_load_error_test.py \
+						test/t/parallel_scan_dsm_error_test.py \
+						test/t/index_scan_interrupt_test.py \
 						test/t/pending_truncates_test.py \
 						test/t/recovery_heap_verdict_test.py \
 						test/t/recovery_heap_xid_binding_test.py \
 						test/t/recovery_item_rollback_test.py \
 						test/t/recovery_livelock_test.py \
 						test/t/recovery_row_lock_test.py \
+						test/t/oxid_notify_test.py \
 						test/t/recovery_xid_range_test.py \
 						test/t/reindex_test.py \
 						test/t/reindex_concurrent_test.py \
@@ -307,7 +312,8 @@ TESTGRESCHECKS_PART_2 = test/t/checkpoint_concurrent_test.py \
 						test/t/bitmap_partition_test.py \
 						test/t/undo_image_chain_test.py \
 						test/t/evict_seq_scan_race_test.py
-TESTGRESCHECKS_PART_3 = test/t/relnode_wraparound_test.py \
+TESTGRESCHECKS_PART_3 = test/t/logical_streaming_test.py \
+						test/t/relnode_wraparound_test.py \
 						test/t/rewind_time_test.py
 
 # perf/*_perf.py -- see perf/README.md.

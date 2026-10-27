@@ -82,6 +82,8 @@ struct BTreeIterator
 	/* callback for fetching tuple version */
 	TupleFetchCallback fetchCallback;
 	void	   *fetchCallbackArg;
+	/* check for interrupts on every page step (index scans) */
+	bool		interruptible;
 
 	/*
 	 * Key of the last tuple position read from the current (FETCH-mode) leaf.
@@ -385,6 +387,7 @@ o_btree_find_tuples_start(BTreeDescr *desc, void *key,
 	it->tupleCxt = mcxt;
 	it->fetchCallback = cb;
 	it->fetchCallbackArg = arg;
+	it->interruptible = false;
 
 	/*
 	 * Initialize the iterator-reuse bookkeeping fields.  An iterator built
@@ -1010,6 +1013,7 @@ o_btree_iterator_create(BTreeDescr *desc, void *key, BTreeKeyType kind,
 	it->tupleCxt = CurrentMemoryContext;
 	it->fetchCallback = NULL;
 	it->fetchCallbackArg = NULL;
+	it->interruptible = false;
 	it->curKeySet = false;
 	it->curKeyReturned = false;
 	it->curKeyLazy = false;
@@ -1334,6 +1338,22 @@ o_btree_iterator_set_callback(BTreeIterator *it,
 {
 	it->fetchCallback = callback;
 	it->fetchCallbackArg = arg;
+}
+
+/*
+ * Make the iterator check for interrupts on every page step.
+ *
+ * An index scan sets this: it can step over many pages of rows its snapshot
+ * cannot see without returning any of them, and must stay cancellable
+ * meanwhile, as nbtree does by checking on every page step.  Other users keep
+ * the iterator uninterruptible: some walk a tree in the middle of work that
+ * must not stop halfway, e.g. add_free_extents_from_tmp() while a page is
+ * being written out.
+ */
+void
+o_btree_iterator_set_interruptible(BTreeIterator *it)
+{
+	it->interruptible = true;
 }
 
 /*
@@ -1934,6 +1954,13 @@ btree_iterator_check_load_next_page(BTreeIterator *it, BtreeIterationEnd *end)
 		bool		step_result;
 		BTreePageHeader *header;
 
+		/*
+		 * No page is locked here: the iterator only reads pages without
+		 * modification intent, into its own image or by partial reads.
+		 */
+		if (it->interruptible)
+			CHECK_FOR_INTERRUPTS();
+
 		if (IS_LAST_PAGE(img, it))
 			return false;
 
@@ -2391,7 +2418,19 @@ undo_it_next_page(BTreeDescr *desc, UndoIterator *undoIt)
 	}
 	else
 	{
-		Assert(undoIt->rightmost || undoIt->leftmost);
+		/*
+		 * Same page found again: there are no more pages in this direction,
+		 * even if neither rightmost nor leftmost is set.  The flags only say
+		 * that another page may exist.  A SplitDiff record reports the side
+		 * of the split the live page is on, which keeps the two halves' image
+		 * locations distinct, yet its image never extends beyond the live
+		 * page's key range.  So a left half clears rightmost and a right half
+		 * clears leftmost with nothing beyond them.  The other flag gets
+		 * cleared by another record down the chain: an older SplitDiff that
+		 * the page is on the other side of, or a Merge whose other half we
+		 * moved to.  The caller falls back to undo_it_switch() or the next
+		 * data page.
+		 */
 		return false;
 	}
 }
@@ -2534,6 +2573,7 @@ undo_it_find_internal(UndoIterator *undoIt, void *key, BTreeKeyType kind)
 		/* Check if we need to visit next page-level undo item */
 		if (COMMITSEQNO_IS_NORMAL(rec_csn) && rec_csn >= undoIt->it->oSnapshot.csn)
 		{
+			check_page_undo_link(undoLocation, rec_undo_loc);
 			undoLocation = rec_undo_loc;
 			continue;
 		}

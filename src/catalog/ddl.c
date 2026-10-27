@@ -153,6 +153,8 @@ static CreateStmt *create_stmt = NULL;
 static List *o_added_columns = NIL;
 static movedb_params o_movedb_data = {InvalidOid, InvalidOid, InvalidOid};
 
+static Oid	dropped_database_oid = InvalidOid;
+
 static void orioledb_utility_command(PlannedStmt *pstmt,
 									 const char *queryString,
 									 bool readOnlyTree,
@@ -2470,6 +2472,77 @@ o_drop_table(ORelOids oids)
 	o_table_free(table);
 }
 
+/*
+ * Set pg_class.relrewrite unless it is already set (e.g. by PG's own
+ * heap rewrite on the TOAST relation).  Returns true if changed.
+ */
+static bool
+o_mark_relrewrite(Oid relid, Oid rewrittenRelid)
+{
+	Relation	classRel;
+	HeapTuple	tuple;
+	Form_pg_class relform;
+	bool		changed = false;
+
+	classRel = table_open(RelationRelationId, RowExclusiveLock);
+	tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+	relform = (Form_pg_class) GETSTRUCT(tuple);
+	if (!OidIsValid(relform->relrewrite))
+	{
+		relform->relrewrite = rewrittenRelid;
+		CatalogTupleUpdate(classRel, &tuple->t_self, tuple);
+		changed = true;
+	}
+	heap_freetuple(tuple);
+	table_close(classRel, RowExclusiveLock);
+
+	return changed;
+}
+
+/*
+ * Set or clear the relrewrite mark on rel and its TOAST table.
+ *
+ * The rewrite copy goes to WAL as ordinary inserts into rel, which physical
+ * replicas and recovery need, but which logical decoding would emit as new
+ * rows.  Heap copies into a transient table with pg_class.relrewrite set,
+ * and ReorderBufferProcessTXN() skips changes of such tables.  Setting
+ * relrewrite on rel for the duration of the copy gets the same behavior.
+ *
+ * The TOAST relation's relrewrite may already be set by PG's own heap
+ * rewrite; skip it in that case and do not reset what we did not set.
+ *
+ * Flush the local WAL before toggling: when marking, prior changes must not
+ * fall under the mark; when clearing, copied rows must be flushed while the
+ * mark is still set.
+ */
+static bool
+rewrite_copy_set(Relation rel, bool mark, bool toast_marked)
+{
+	Oid			relid = RelationGetRelid(rel);
+	Oid			toastRelid = rel->rd_rel->reltoastrelid;
+
+	if (!local_wal_is_empty())
+		flush_local_wal(false, false);
+
+	if (mark)
+	{
+		o_mark_relrewrite(relid, relid);
+		toast_marked = OidIsValid(toastRelid) &&
+			o_mark_relrewrite(toastRelid, relid);
+	}
+	else
+	{
+		ResetRelRewrite(relid);
+		if (toast_marked)
+			ResetRelRewrite(toastRelid);
+	}
+	CommandCounterIncrement();
+
+	return toast_marked;
+}
+
 static void
 rewrite_matview(Relation rel, OTable *old_o_table, OTable *new_o_table)
 {
@@ -2479,6 +2552,7 @@ rewrite_matview(Relation rel, OTable *old_o_table, OTable *new_o_table)
 	QueryDesc  *queryDesc;
 	Query	   *copied_query;
 	Query	   *query;
+	bool		toast_marked;
 
 	/* Lock and rewrite, using a copy to preserve the original query. */
 	copied_query = copyObject(savedDataQuery);
@@ -2513,6 +2587,8 @@ rewrite_matview(Relation rel, OTable *old_o_table, OTable *new_o_table)
 	/* call ExecutorStart to prepare the plan for execution */
 	ExecutorStart(queryDesc, 0);
 
+	toast_marked = rewrite_copy_set(rel, true, false);
+
 	/* run the plan */
 #if PG_VERSION_NUM < 180000
 	ExecutorRun(queryDesc, ForwardScanDirection, 0, true);
@@ -2524,6 +2600,7 @@ rewrite_matview(Relation rel, OTable *old_o_table, OTable *new_o_table)
 
 	/* and clean up */
 	ExecutorFinish(queryDesc);
+	rewrite_copy_set(rel, false, toast_marked);
 	ExecutorEnd(queryDesc);
 
 	FreeQueryDesc(queryDesc);
@@ -2551,6 +2628,7 @@ rewrite_table(Relation rel, OTable *old_o_table, OTable *new_o_table)
 	EState	   *check_estate = NULL;
 	ExprState **check_exprs = NULL;
 	ExprContext *check_econtext = NULL;
+	bool		toast_marked;
 
 	if (!old_o_table->has_primary)
 		primary_init_nfields--;
@@ -2640,12 +2718,7 @@ rewrite_table(Relation rel, OTable *old_o_table, OTable *new_o_table)
 		}
 	}
 
-	/*
-	 * The copy is not a change of the table's contents: logical decoding must
-	 * not emit it.  An error on the way clears the mark at the
-	 * (sub)transaction abort.
-	 */
-	wal_start_table_rewrite();
+	toast_marked = rewrite_copy_set(rel, true, false);
 
 	while (!O_TUPLE_IS_NULL(tup = btree_seq_scan_getnext(sscan, old_slot->tts_mcxt, &tupleCsn, &hint)))
 	{
@@ -2892,8 +2965,6 @@ rewrite_table(Relation rel, OTable *old_o_table, OTable *new_o_table)
 		ExecClearTuple(new_slot);
 	}
 
-	wal_end_table_rewrite(true);
-
 	if (check_estate)
 	{
 		pfree(check_exprs);
@@ -2903,6 +2974,7 @@ rewrite_table(Relation rel, OTable *old_o_table, OTable *new_o_table)
 	ExecDropSingleTupleTableSlot(old_slot);
 	ExecDropSingleTupleTableSlot(new_slot);
 	free_btree_seq_scan(sscan);
+	rewrite_copy_set(rel, false, toast_marked);
 	ResourceOwnerForgetOTableDescr(CurrentResourceOwner, descr);
 	ResourceOwnerForgetOTableDescr(CurrentResourceOwner, old_descr);
 
@@ -3441,6 +3513,134 @@ remove_symlink:
 }
 
 
+static void
+rmdir_dropped_database_dir(const char *prefix, Oid dbOid)
+{
+	char		path[MAXPGPATH];
+	int			saved_errno;
+
+	pg_snprintf(path, MAXPGPATH, "%s/%u", prefix, dbOid);
+	if (rmdir(path) == 0)
+	{
+		fsync_fname_ext(prefix, true, false, WARNING);
+		return;
+	}
+
+	saved_errno = errno;
+	if (saved_errno != ENOENT && saved_errno != ENOTEMPTY)
+	{
+		errno = saved_errno;
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not remove orioledb database directory \"%s\": %m",
+						path)));
+	}
+}
+
+static void
+cleanup_dropped_database_dirs(void)
+{
+	Oid			dbOid = dropped_database_oid;
+	DIR		   *dir;
+	struct dirent *file;
+	char		path[MAXPGPATH];
+	char		targetpath[MAXPGPATH];
+	int			saved_errno;
+
+#define PG_TBLSPC "pg_tblspc"
+
+	if (!OidIsValid(dbOid))
+		return;
+
+	dropped_database_oid = InvalidOid;
+	rmdir_dropped_database_dir(ORIOLEDB_DATA_DIR, dbOid);
+
+	dir = opendir(PG_TBLSPC);
+	if (dir == NULL)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not open directory \"%s\": %m", PG_TBLSPC)));
+		return;
+	}
+
+	while (errno = 0, (file = readdir(dir)) != NULL)
+	{
+		struct stat st;
+		int			rllen;
+
+		if (strcmp(file->d_name, ".") == 0 ||
+			strcmp(file->d_name, "..") == 0)
+			continue;
+
+		pg_snprintf(path, MAXPGPATH,
+					PG_TBLSPC "/%s/" TABLESPACE_VERSION_DIRECTORY,
+					file->d_name);
+		if (lstat(path, &st) < 0)
+		{
+			saved_errno = errno;
+			if (saved_errno == ENOENT)
+				continue;
+			errno = saved_errno;
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("could not stat file \"%s\": %m", path)));
+			continue;
+		}
+
+		if (S_ISLNK(st.st_mode))
+		{
+			rllen = readlink(path, targetpath, sizeof(targetpath));
+			if (rllen < 0)
+			{
+				saved_errno = errno;
+				errno = saved_errno;
+				ereport(WARNING,
+						(errcode_for_file_access(),
+						 errmsg("could not read symbolic link \"%s\": %m",
+								path)));
+				continue;
+			}
+			if (rllen >= (int) sizeof(targetpath))
+			{
+				ereport(WARNING,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("symbolic link \"%s\" target is too long",
+								path)));
+				continue;
+			}
+			targetpath[rllen] = '\0';
+			pg_snprintf(path, MAXPGPATH, "%s/" ORIOLEDB_DATA_DIR,
+						targetpath);
+		}
+		else
+			strlcat(path, "/" ORIOLEDB_DATA_DIR, MAXPGPATH);
+
+		rmdir_dropped_database_dir(path, dbOid);
+	}
+	saved_errno = errno;
+	closedir(dir);
+	if (saved_errno != 0)
+	{
+		errno = saved_errno;
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not read directory \"%s\": %m", PG_TBLSPC)));
+	}
+#undef PG_TBLSPC
+}
+
+void
+orioledb_drop_database_xact_callback(XactEvent event, void *arg)
+{
+	(void) arg;
+
+	if (event == XACT_EVENT_COMMIT)
+		cleanup_dropped_database_dirs();
+	else if (event == XACT_EVENT_ABORT)
+		dropped_database_oid = InvalidOid;
+}
+
 /*
  * get_collation		- fetch qualified name of a collation
  *
@@ -3850,6 +4050,8 @@ orioledb_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
 		o_tables_table_meta_lock(NULL);
 		o_tables_drop_all(oxid, oSnapshot.csn, objectId);
 		o_tables_table_meta_unlock(NULL, InvalidOid);
+
+		dropped_database_oid = objectId;
 	}
 	else if (access == OAT_DROP && classId == TypeRelationId &&
 			 ActiveSnapshotSet())
