@@ -663,6 +663,7 @@ _PG_init(void)
 		return;
 
 	o_install_slot_retain_hook();
+	o_install_decoding_startup_hook();
 
 	o_verify_dir_exists_or_create(pstrdup(ORIOLEDB_DATA_DIR), NULL, NULL);
 	o_verify_dir_exists_or_create(pstrdup(ORIOLEDB_UNDO_DIR), NULL, NULL);
@@ -1733,6 +1734,7 @@ _PG_init(void)
 	AcceptInvalidationMessagesHook = orioledb_AcceptInvalidationMessagesHook;
 	set_rel_pathlist_hook = orioledb_set_rel_pathlist_hook;
 	set_plain_rel_pathlist_hook = orioledb_set_plain_rel_pathlist_hook;
+	RegisterXactCallback(orioledb_drop_database_xact_callback, NULL);
 	RegisterXactCallback(undo_xact_callback, NULL);
 	RegisterSubXactCallback(undo_subxact_callback, NULL);
 	get_xidless_commit_lsn_hook = orioledb_get_xidless_commit_lsn;

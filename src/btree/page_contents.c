@@ -104,6 +104,7 @@ read_page_from_undo(BTreeDescr *desc, Page img, UndoLocation undo_loc,
 		/* Continue traversing undo chain if needed */
 		if (COMMITSEQNO_IS_NORMAL(page_csn) && page_csn >= csn)
 		{
+			check_page_undo_link(undo_loc, rec_undo_location);
 			undo_loc = rec_undo_location;
 			continue;
 		}
@@ -886,7 +887,7 @@ page_fits_hikey(Page p, LocationIndex newHikeySize)
 				hikeyLocation,
 				dataLocation;
 
-	Assert(newHikeySize = MAXALIGN(newHikeySize));
+	Assert(newHikeySize == MAXALIGN(newHikeySize));
 	Assert(header->chunksCount == 1);
 
 	hikeyLocation = SHORT_GET_LOCATION(header->chunkDesc[0].hikeyShortLocation);
@@ -906,7 +907,7 @@ page_resize_hikey(Page p, LocationIndex newHikeySize)
 				hikeyLocation,
 				dataLocation;
 
-	Assert(newHikeySize = MAXALIGN(newHikeySize));
+	Assert(newHikeySize == MAXALIGN(newHikeySize));
 	Assert(header->chunksCount == 1);
 
 	hikeyLocation = SHORT_GET_LOCATION(header->chunkDesc[0].hikeyShortLocation);

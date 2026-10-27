@@ -3410,9 +3410,6 @@ undo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			break;
 
 		case SUBXACT_EVENT_ABORT_SUB:
-			/* A rewrite that failed half way leaves no mark behind */
-			wal_end_table_rewrite(false);
-
 			if (parentSubid < minParentSubId || minParentSubId == InvalidSubTransactionId)
 				parentSubid = InvalidSubTransactionId;
 
@@ -3548,9 +3545,19 @@ abort_autonomous_transaction(OAutonomousTxState *state)
 
 		if (!is_recovery_process())
 			wal_rollback(oxid, get_current_logical_xid(), true);
-		current_oxid_abort();
+
+		/*
+		 * Take our changes back before current_oxid_abort(), as the
+		 * XACT_EVENT_ABORT path does.  current_oxid_abort() clears our vxids
+		 * slot and may advance runXmin past our oxid, and an oxid below xmin
+		 * reads as COMMITSEQNO_FROZEN: a snapshot taken after that would see
+		 * the versions we have not taken back yet as committed.  Also,
+		 * lock_undo_callback() only removes the row locks of an oxid that is
+		 * not finished yet.
+		 */
 		for (i = 0; i < (int) UndoLogsCount; i++)
 			apply_undo_stack((UndoLogType) i, oxid, NULL, true);
+		current_oxid_abort();
 
 		for (i = 0; i < (int) UndoLogsCount; i++)
 			release_undo_size((UndoLogType) i);

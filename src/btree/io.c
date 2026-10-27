@@ -1961,6 +1961,8 @@ load_page(OBTreeFindPageContext *context)
 		int_hdr->downlink = downlink;
 		PAGE_INC_N_ONDISK(parent_page);
 		unlock_io(ionum);
+		/* Hand the page back, as a failed read does below */
+		ppool_free_page(desc->ppool, blkno, true);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -1969,6 +1971,15 @@ load_page(OBTreeFindPageContext *context)
 		int_hdr->downlink = downlink;
 		PAGE_INC_N_ONDISK(parent_page);
 		unlock_io(ionum);
+
+		/*
+		 * Nothing refers to the page taken for the read, so hand it back.
+		 * Error cleanup would only release its lock: the page would stay at
+		 * UCM_INVALID_LEVEL, which neither the clock sweep nor
+		 * ucm_occupy_free_page() ever picks, and be lost to the pool for
+		 * good.
+		 */
+		ppool_free_page(desc->ppool, blkno, true);
 
 		if (read_result == OReadPageResultChecksumFailed)
 			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
@@ -3973,7 +3984,7 @@ perform_writeback(IOWriteBack *writeback)
 			}
 			else
 			{
-				if (len > 0)
+				if (len > 0 && file >= 0)
 				{
 					FileWriteback(file, (off_t) offset * blcksz,
 								  (off_t) len * blcksz,
@@ -3991,8 +4002,16 @@ perform_writeback(IOWriteBack *writeback)
 			{
 				char	   *filename;
 
+				/*
+				 * DROP DATABASE may remove the parent after this extent was
+				 * queued.
+				 */
 				filename = btree_filename(cur.key, segno, chkpNum);
 				file = PathNameOpenFile(filename, O_RDWR | O_CREAT | PG_BINARY);
+				if (file < 0 && errno != ENOENT)
+					ereport(ERROR,
+							(errcode_for_file_access(),
+							 errmsg("could not open data file %s: %m", filename)));
 				pfree(filename);
 				offset = cur.fileExtent.off;
 				len = cur.fileExtent.len;
@@ -4012,7 +4031,7 @@ perform_writeback(IOWriteBack *writeback)
 			{
 				if (use_mmap)
 					msync(mmap_data + (off_t) segno * ORIOLEDB_SEGMENT_SIZE + (off_t) offset * blcksz, (off_t) len * blcksz, MS_ASYNC);
-				else
+				else if (file >= 0)
 					FileWriteback(file, (off_t) offset * blcksz,
 								  (off_t) len * blcksz,
 								  WAIT_EVENT_DATA_FILE_FLUSH);
@@ -4027,7 +4046,7 @@ perform_writeback(IOWriteBack *writeback)
 		Assert(blcksz != 0);
 		if (use_mmap)
 			msync(mmap_data + (off_t) segno * ORIOLEDB_SEGMENT_SIZE + (off_t) offset * blcksz, (off_t) len * blcksz, MS_ASYNC);
-		else
+		else if (file >= 0)
 			FileWriteback(file, (off_t) offset * blcksz,
 						  (off_t) len * blcksz,
 						  WAIT_EVENT_DATA_FILE_FLUSH);
