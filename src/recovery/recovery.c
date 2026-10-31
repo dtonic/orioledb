@@ -139,6 +139,8 @@ typedef struct
 
 	TransactionId xid;			/* builtin transaction identifier for joint
 								 * commit */
+	TransactionId logicalXid;	/* first OrioleDB logical xid seen for this
+								 * oxid */
 
 	bool		needs_wal_flush;
 	UndoLocation retain_locs[(int) UndoLogsCount];
@@ -338,6 +340,7 @@ typedef struct
 {
 	OXid		oxid;
 	TransactionId xid;
+	TransactionId logicalXid;
 } RecoveryFinishAbortedOxid;
 
 static RecoveryFinishAbortedOxid *recovery_finish_aborted_oxids = NULL;
@@ -1173,6 +1176,7 @@ read_xids(int checkpointnum, bool recovery_single, int worker_id)
 			int			j;
 
 			state->xid = InvalidTransactionId;
+			state->logicalXid = InvalidTransactionId;
 			state->needs_wal_flush = false;
 			for (j = 0; j < (int) UndoLogsCount; j++)
 				state->retain_locs[j] = InvalidUndoLocation;	/* undo locations are
@@ -1271,11 +1275,19 @@ read_xids(int checkpointnum, bool recovery_single, int worker_id)
 				if (state->retain_locs[undoType] < pg_atomic_read_u64(&curProcData->undoRetainLocations[undoType].transactionUndoRetainLocation))
 					pg_atomic_write_u64(&curProcData->undoRetainLocations[undoType].transactionUndoRetainLocation, state->retain_locs[undoType]);
 
+				/*
+				 * Keep the paired global frontiers ordered against a
+				 * concurrent update_min_undo_locations().
+				 */
+				SpinLockAcquire(&undoMeta->minUndoLocationsMutex);
 				if (state->retain_locs[undoType] < pg_atomic_read_u64(&undoMeta->minProcRetainLocation))
 					pg_atomic_write_u64(&undoMeta->minProcRetainLocation, state->retain_locs[undoType]);
 
 				if (state->retain_locs[undoType] < pg_atomic_read_u64(&undoMeta->minProcTransactionRetainLocation))
 					pg_atomic_write_u64(&undoMeta->minProcTransactionRetainLocation, state->retain_locs[undoType]);
+				Assert(pg_atomic_read_u64(&undoMeta->minProcRetainLocation) <=
+					   pg_atomic_read_u64(&undoMeta->minProcTransactionRetainLocation));
+				SpinLockRelease(&undoMeta->minUndoLocationsMutex);
 			}
 		}
 
@@ -1409,7 +1421,7 @@ o_recovery_start_hook(void)
 				ereport(WARNING,
 						(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 						 errmsg("unable to start recovery workers"),
-						 errdetail("You must increase max_worker_processes value or decrease orioledb.recovery_pool_size value.  Fallback to recovery in single-process mode.")));
+						 errdetail("You must increase max_worker_processes value or decrease orioledb.recovery_pool_size value.  Falling back to recovery in single-process mode.")));
 
 				break;
 			}
@@ -1776,7 +1788,7 @@ orioledb_recovery_stops_before_hook(XLogReaderState *record,
 		.on_record = recovery_on_record
 	};
 
-	/* Currently we consider ony recovery_target_time */
+	/* Currently we consider only recovery_target_time */
 	if (recoveryTarget != RECOVERY_TARGET_TIME)
 		return false;
 
@@ -2010,7 +2022,7 @@ recovery_init(int worker_id)
 				ereport(WARNING,
 						(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 						 errmsg("unable to start recovery workers"),
-						 errdetail("You must increase max_worker_processes value or decrease orioledb.recovery_idx_pool_size value. Fallback to index build in single-process mode.")));
+						 errdetail("You must increase max_worker_processes value or decrease orioledb.recovery_idx_pool_size value. Falling back to index build in single-process mode.")));
 			}
 			state->queue = shm_mq_attach(GET_WORKER_QUEUE(i), NULL, workers_pool[i].handle);
 			state->queue_buf_len = 0;
@@ -2288,6 +2300,8 @@ recovery_finish(int worker_id)
 							cur_state->oxid;
 						recovery_finish_aborted_oxids[recovery_finish_aborted_count].xid =
 							cur_state->xid;
+						recovery_finish_aborted_oxids[recovery_finish_aborted_count].logicalXid =
+							cur_state->logicalXid;
 						recovery_finish_aborted_count++;
 						MemoryContextSwitchTo(oldcxt);
 					}
@@ -2401,10 +2415,30 @@ o_emit_recovery_finish_rollbacks(void)
 
 	for (i = 0; i < recovery_finish_aborted_count; i++)
 	{
-		elog(LOG, "orioledb: emitting WAL_REC_ROLLBACK for in-flight oxid " UINT64_FORMAT " aborted by recovery_finish",
-			 recovery_finish_aborted_oxids[i].oxid);
-		wal_emit_recovery_finish_rollback(recovery_finish_aborted_oxids[i].oxid,
-										  recovery_finish_aborted_oxids[i].xid);
+		OXid		oxid = recovery_finish_aborted_oxids[i].oxid;
+		TransactionId xid = recovery_finish_aborted_oxids[i].xid;
+		TransactionId logicalXid = recovery_finish_aborted_oxids[i].logicalXid;
+
+		elog(LOG, "orioledb: emitting WAL_REC_ROLLBACK for in-flight oxid " UINT64_FORMAT " xid %u logicalXid %u aborted by recovery_finish",
+			 oxid, xid, logicalXid);
+
+		/*
+		 * Emit ROLLBACK for the oriole logical xid when present.  For
+		 * oriole-first mixed transactions SWITCH_LOGICAL_XID may not have
+		 * been emitted before the crash, so the reorder buffer knows the
+		 * oriole changes under this xid alone.
+		 */
+		if (TransactionIdIsValid(logicalXid))
+			wal_emit_recovery_finish_rollback(oxid, logicalXid);
+
+		/*
+		 * Also emit ROLLBACK for the heap xid when it differs.  In heap-first
+		 * mixed transactions SWITCH_LOGICAL_XID made the heap xid the parent
+		 * with RBTXN_DISTR_SKIP_CLEANUP, so it won't be cleaned by
+		 * ReorderBufferAbortOld and needs an explicit abort.
+		 */
+		if (TransactionIdIsValid(xid) && xid != logicalXid)
+			wal_emit_recovery_finish_rollback(oxid, xid);
 	}
 
 	if (recovery_finish_aborted_oxids != NULL)
@@ -2477,6 +2511,7 @@ recovery_switch_to_oxid(OXid oxid, int worker_id)
 		else
 		{
 			cur_state->xid = InvalidTransactionId;
+			cur_state->logicalXid = InvalidTransactionId;
 			for (i = 0; i < (int) UndoLogsCount; i++)
 			{
 				cur_state->retain_locs[i] = InvalidUndoLocation;
@@ -5001,6 +5036,9 @@ replay_on_record(WalReaderState *r, WalRecord *rec)
 			if (TransactionIdIsValid(rec->heapXid) &&
 				!TransactionIdIsValid(cur_recovery_xid_state->xid))
 				cur_recovery_xid_state->xid = rec->heapXid;
+			if (TransactionIdIsValid(rec->logicalXid) &&
+				!TransactionIdIsValid(cur_recovery_xid_state->logicalXid))
+				cur_recovery_xid_state->logicalXid = rec->logicalXid;
 			break;
 
 		case WAL_REC_SWITCH_LOGICAL_XID:
@@ -5985,7 +6023,7 @@ workers_send_rollback_to_savepoint(XLogRecPtr ptr,
 
 	Assert(cur_recovery_xid_state);
 
-	msg.header.type = RecoveryMsgTypeRollbackToSavepointt;
+	msg.header.type = RecoveryMsgTypeRollbackToSavepoint;
 	msg.oxid = cur_recovery_xid_state->oxid;
 	msg.ptr = ptr;
 	msg.parentSubId = parentSubId;

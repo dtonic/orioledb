@@ -1464,7 +1464,7 @@ undo_item_buf_read_item(UndoItemBuf *buf,
 		ODBProcData *curProcData = GET_CUR_PROCDATA();
 
 		elog(PANIC,
-			 "undo_item_buf_read_item(): read of unexisting undo record with "
+			 "undo_item_buf_read_item(): read of nonexistent undo record with "
 			 "undoType = %d, location = %llu, "
 			 "transactionUndoRetainLocation = %llu, "
 			 "minProcRetainLocation = %llu, "
@@ -1718,8 +1718,8 @@ walk_undo_stack(UndoLogType undoType, OXid oxid,
 	else
 	{
 		/*
-		 * Abort can relate to part of transactio chain.  "On commit" location
-		 * needs to be updated accordingly.
+		 * Abort can relate to part of transaction chain.  "On commit"
+		 * location needs to be updated accordingly.
 		 */
 		location = pg_atomic_read_u64(&sharedLocations->location);
 		newOnCommitLocation = pg_atomic_read_u64(&sharedLocations->onCommitLocation);
@@ -2504,7 +2504,7 @@ get_undo_record(UndoLogType undoType, UndoLocation *undoLocation, Size size)
 		UndoLocation location;
 
 		if (reserved_undo_sizes[(int) undoType] < size)
-			elog(PANIC, "get_undo_record(): not enough reserved undo (undoType: %d, reservedSize %u, requestedSize: %u",
+			elog(PANIC, "get_undo_record(): not enough reserved undo (undoType: %d, reservedSize: %u, requestedSize: %u)",
 				 (int) undoType,
 				 (unsigned int) reserved_undo_sizes[(int) undoType],
 				 (unsigned int) size);
@@ -3361,7 +3361,7 @@ void
 undo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					  SubTransactionId parentSubid, void *arg)
 {
-	TransactionId prentLogicalXid;
+	TransactionId parentLogicalXid;
 	int			i;
 	LogicalXidCtx logicalXidContext;
 
@@ -3384,9 +3384,9 @@ undo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				 * Name the top-level transaction without assigning it a heap
 				 * xid -- see get_savepoint_parent_xid().
 				 */
-				prentLogicalXid = get_savepoint_parent_xid();
+				parentLogicalXid = get_savepoint_parent_xid();
 				assign_subtransaction_logical_xid(mySubid);
-				add_savepoint_wal_record(parentSubid, prentLogicalXid);
+				add_savepoint_wal_record(parentSubid, parentLogicalXid);
 
 				/*
 				 * Keep the minimum.  A savepoint whose parent is below
@@ -4182,7 +4182,7 @@ o_add_rewind_relfilenode_undo_item(RelFileNode *onCommit, RelFileNode *onAbort,
 
 /*
  * Output OrioleDB undo sizes per each undo type.
- * There is a single undo dir for all tablespaces and databasess.
+ * There is a single undo dir for all tablespaces and databases.
  */
 Datum
 orioledb_undo_size(PG_FUNCTION_ARGS)

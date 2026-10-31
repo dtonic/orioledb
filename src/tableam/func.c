@@ -405,7 +405,7 @@ orioledb_tbl_structure(PG_FUNCTION_ARGS)
 	if (!rel)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("relation oid %u does not exists", relid)));
+				 errmsg("relation oid %u does not exist", relid)));
 
 	descr = relation_get_descr(rel);
 
@@ -526,7 +526,7 @@ append_bits(StringInfo str, Page p, OffsetNumber *offset,
 
 /*
  * Print contents of give B-tree page.  If non-leaf page is given, recursively
- * print childredn.
+ * print children.
  */
 static void
 print_page_bin_structure(BTreeDescr *desc, OInMemoryBlkno blkno,
@@ -924,7 +924,7 @@ orioledb_tbl_bin_structure(PG_FUNCTION_ARGS)
 	if (!rel)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("relation oid %u does not exists", relid)));
+				 errmsg("relation oid %u does not exist", relid)));
 
 	descr = relation_get_descr(rel);
 
@@ -1457,7 +1457,7 @@ orioledb_tbl_compression_check(PG_FUNCTION_ARGS)
 
 	/* checks range array arg */
 	if (PG_ARGISNULL(2))
-		elog(ERROR, "ranges array must be not NULL");
+		elog(ERROR, "ranges array must not be NULL");
 
 	array = PG_GETARG_ARRAYTYPE_P(2);
 	if (array_contains_nulls(array))

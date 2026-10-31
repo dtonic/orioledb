@@ -46,7 +46,7 @@
 #include "utils/wait_event.h"
 
 #define QUEUE_READ_USLEEP_BASE		(10)
-#define QUEUE_READ_USLEEP_MULTIPLER	(2)
+#define QUEUE_READ_USLEEP_MULTIPLIER	(2)
 #define QUEUE_READ_USLEEP_MAX		(1024 * QUEUE_READ_USLEEP_BASE)
 
 static bool detached = false;
@@ -786,7 +786,7 @@ recovery_queue_process(shm_mq_handle *queue, int id)
 				recovery_savepoint(msg->parentSubId, id);
 				data_pos += sizeof(RecoveryMsgSavepoint);
 			}
-			else if (type == RecoveryMsgTypeRollbackToSavepointt)
+			else if (type == RecoveryMsgTypeRollbackToSavepoint)
 			{
 				RecoveryMsgRollbackToSavepoint *msg;
 
@@ -869,7 +869,7 @@ apply_modify_record(OTableDescr *descr, OIndexDescr *id, uint16 type,
 		recovery_bridge_ctid_update(id, p);
 
 	/*
-	 * Don't apply changes to secondary indices before TOAST is consisntent.
+	 * Don't apply changes to secondary indices before TOAST is consistent.
 	 * Otherwise, values of secondary indices on TOASTed fields can be
 	 * invalid.
 	 */
@@ -975,7 +975,7 @@ recovery_queue_read(shm_mq_handle *queue, Size *data_size, int id)
 		}
 
 		if (usleep_time != QUEUE_READ_USLEEP_MAX)
-			usleep_time *= QUEUE_READ_USLEEP_MULTIPLER;
+			usleep_time *= QUEUE_READ_USLEEP_MULTIPLIER;
 	}
 
 	return data;

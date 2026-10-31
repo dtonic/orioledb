@@ -193,6 +193,7 @@ ISOLATIONCHECKS = bitmap_hist_scan \
 				  rll_mode_raise \
 				  rll_subtrans \
 				  rollback_lock_stale_copy \
+				  rr_committed_locker \
 				  skipundo \
 				  table_lock_test \
 				  concurrent_truncate \

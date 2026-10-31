@@ -74,7 +74,7 @@ make_preload_hash(void)
 	hash_ctl.match = preload_item_match;
 	hash_ctl.hcxt = TopMemoryContext;
 	preloadHash =
-		hash_create("WAL files to be archieved to S3",
+		hash_create("WAL files to be archived to S3",
 					32L,
 					&hash_ctl,
 					HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
@@ -116,7 +116,7 @@ s3_archive_configured(ArchiveModuleState *state)
 }
 
 /*
- * This callback archieves given WAL file into S3.  This function have to
+ * This callback archives given WAL file into S3.  This function have to
  * return the result synchronously, and it works in dedicated archiving process.
  * So, no point to schedule this for S3 worker.  Make the S3 request right-away.
  */
@@ -144,7 +144,7 @@ s3_archive_preload_file(ArchiveModuleState *state,
 }
 
 /*
- * This callback archieves given WAL file into S3.  This function have to
+ * This callback archives given WAL file into S3.  This function have to
  * return the result synchronously, and it works in dedicated archiving process.
  * So, no point to schedule this for S3 worker.  Make the S3 request right-away.
  */
