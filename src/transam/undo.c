@@ -352,6 +352,7 @@ UndoLocation curRetainUndoLocations[(int) UndoLogsCount] =
 	InvalidUndoLocation
 };
 bool		oxid_needs_wal_flush = false;
+UndoWalkFilter undo_walk_filter = UndoWalkAll;
 
 static Size reserved_undo_sizes[(int) UndoLogsCount] =
 {
@@ -1560,7 +1561,20 @@ o_add_branch_undo_item(UndoLogType undoType, UndoLocation newLocation)
 }
 
 /*
- * Walk through the undo stack calling the callbacks for each item.
+ * Is the item one of a secondary index tree?
+ */
+static inline bool
+undo_item_is_secondary(UndoStackItem *item)
+{
+	return (item->type == ModifyUndoItemType ||
+			item->type == RowLockUndoItemType ||
+			item->type == LockDispatchUndoItemType) &&
+		item->indexType >= oIndexUnique;
+}
+
+/*
+ * Walk through the undo stack calling the callbacks for each item that
+ * undo_walk_filter lets through.
  */
 static UndoLocation
 walk_undo_range(UndoLogType undoType,
@@ -1576,8 +1590,10 @@ walk_undo_range(UndoLogType undoType,
 	{
 		item = undo_item_buf_read_item(buf, undoType, location);
 		descr = item_type_get_descr(item->type);
-		descr->callback(undoType, location, item, oxid,
-						stage, changeCountsValid);
+		if (undo_walk_filter == UndoWalkAll ||
+			undo_item_is_secondary(item) == (undo_walk_filter == UndoWalkSecondary))
+			descr->callback(undoType, location, item, oxid,
+							stage, changeCountsValid);
 
 		/*
 		 * Update location of the last item, which needs an action on commit,
@@ -3151,7 +3167,7 @@ undo_xact_callback(XactEvent event, void *arg)
 }
 
 void
-add_subxact_undo_item(SubTransactionId parentSubid)
+add_subxact_undo_item(SubTransactionId parentSubid, SubTransactionId subid)
 {
 	SubXactUndoStackItem *item;
 	UndoStackSharedLocations *sharedLocations;
@@ -3174,6 +3190,7 @@ add_subxact_undo_item(SubTransactionId parentSubid)
 																   MAXALIGN(size));
 		item->prevSubLocation = pg_atomic_read_u64(&sharedLocations->subxactLocation);
 		item->parentSubid = parentSubid;
+		item->subid = subid;
 		item->header.type = SubXactUndoItemType;
 		item->header.indexType = oIndexPrimary;
 		item->header.itemSize = size;
@@ -3291,9 +3308,10 @@ update_subxact_undo_location(UndoLogType undoType, UndoLocation subxactLocation)
 	LWLockRelease(&curProcData->undoStackLocationsFlushLock);
 }
 
-void
-rollback_to_savepoint(UndoLogType undoType, UndoStackKind kind,
-					  SubTransactionId parentSubid, bool changeCountsValid)
+static void
+rollback_to_savepoint_internal(UndoLogType undoType, UndoStackKind kind,
+							   SubTransactionId parentSubid,
+							   bool changeCountsValid, bool wholeIfMissing)
 {
 	UndoStackLocations toLoc;
 	UndoLocation location;
@@ -3314,8 +3332,13 @@ rollback_to_savepoint(UndoLogType undoType, UndoStackKind kind,
 												   &toLoc.location, &toLoc.subxactLocation);
 		free_undo_item_buf(&buf);
 
-		if (!applyResult)
+		if (!applyResult && !wholeIfMissing)
 			return;
+		if (!applyResult)
+		{
+			toLoc.location = InvalidUndoLocation;
+			toLoc.subxactLocation = InvalidUndoLocation;
+		}
 	}
 	else
 	{
@@ -3328,6 +3351,122 @@ rollback_to_savepoint(UndoLogType undoType, UndoStackKind kind,
 	if (OXidIsValid(oxid))
 		walk_undo_stack(undoType, oxid, &toLoc, true, changeCountsValid);
 	update_subxact_undo_location(undoType, toLoc.subxactLocation);
+}
+
+void
+rollback_to_savepoint(UndoLogType undoType, UndoStackKind kind,
+					  SubTransactionId parentSubid, bool changeCountsValid)
+{
+	rollback_to_savepoint_internal(undoType, kind, parentSubid,
+								   changeCountsValid, false);
+}
+
+/*
+ * The same, but with no item of the savepoint in the stack, everything in it
+ * is taken back: a recovery worker gets the savepoints of a transaction from
+ * the first record of it the worker applies on, all it has applied for the
+ * transaction is past the savepoints before.
+ */
+void
+rollback_to_savepoint_or_whole(UndoLogType undoType, UndoStackKind kind,
+							   SubTransactionId parentSubid,
+							   bool changeCountsValid)
+{
+	rollback_to_savepoint_internal(undoType, kind, parentSubid,
+								   changeCountsValid, true);
+}
+
+static SubXactUndoStackItem *
+read_subxact_item(UndoLogType undoType, UndoItemBuf *buf, UndoLocation location)
+{
+	SubXactUndoStackItem *item;
+
+	item = (SubXactUndoStackItem *) undo_item_buf_read_item(buf, undoType,
+															location);
+	if (UndoLocationIsValid(item->prevSubLocation) &&
+		item->prevSubLocation >= location)
+		elog(PANIC,
+			 "corrupted undo subxact chain: location " UINT64_FORMAT " links to non-decreasing location " UINT64_FORMAT,
+			 location, item->prevSubLocation);
+	return item;
+}
+
+/*
+ * A savepoint record replayed on the undo stack a checkpoint wrote for a
+ * transaction in progress.  The checkpoint took the stack at its end, so the
+ * stack can be ahead of the record: the subtransactions with subid or a later
+ * one started after it, their records are yet to come, and replay does their
+ * changes again.  The stack goes back to before them, unless rollbackAhead is
+ * false.  Below them, the subtransactions under parentSubid or a later one
+ * ended before this one started, and the rolled back ones are off the stack
+ * already: these were released.  Recovery sees no record of a release.  Their
+ * items come off, and their changes stay with the transaction.  Rolling back
+ * to such an item instead took back the changes of the released
+ * subtransaction, in a transaction that went on to commit them.
+ *
+ * WAL from before the savepoint record carried its subid tells neither apart:
+ * the stack goes back to the savepoint, as it did.
+ */
+void
+checkpoint_stack_savepoint(UndoLogType undoType, SubTransactionId parentSubid,
+						   SubTransactionId subid, bool rollbackAhead)
+{
+	SubXactUndoStackItem *item;
+	UndoStackSharedLocations *sharedLocations;
+	UndoItemBuf buf;
+	UndoLocation location,
+				aheadLocation = InvalidUndoLocation;
+
+	if (undoType == UndoLogRegularPageLevel)
+		return;
+
+	if (subid == InvalidSubTransactionId)
+	{
+		if (rollbackAhead)
+			rollback_to_savepoint(undoType, UndoStackHead, parentSubid, false);
+		return;
+	}
+
+	sharedLocations = GET_CUR_UNDO_STACK_LOCATIONS(undoType);
+	location = pg_atomic_read_u64(&sharedLocations->subxactLocation);
+	init_undo_item_buf(&buf);
+	while (UndoLocationIsValid(location))
+	{
+		item = read_subxact_item(undoType, &buf, location);
+		if (item->subid < subid)
+			break;
+		aheadLocation = location;
+		location = item->prevSubLocation;
+	}
+
+	if (UndoLocationIsValid(aheadLocation))
+	{
+		UndoStackLocations toLoc;
+		OXid		oxid;
+
+		if (!rollbackAhead)
+		{
+			/* nothing released lies below the ones started after it */
+			free_undo_item_buf(&buf);
+			return;
+		}
+
+		toLoc.location = aheadLocation;
+		toLoc.subxactLocation = location;
+		oxid = get_current_oxid_if_any();
+		if (OXidIsValid(oxid))
+			walk_undo_stack(undoType, oxid, &toLoc, true, false);
+	}
+
+	while (UndoLocationIsValid(location))
+	{
+		item = read_subxact_item(undoType, &buf, location);
+		if (item->parentSubid < parentSubid)
+			break;
+		location = item->prevSubLocation;
+	}
+	free_undo_item_buf(&buf);
+	update_subxact_undo_location(undoType, location);
 }
 
 static void
@@ -3378,7 +3517,7 @@ undo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			if (have_retained_undo_location())
 			{
 				(void) get_current_oxid();
-				add_subxact_undo_item(parentSubid);
+				add_subxact_undo_item(parentSubid, mySubid);
 
 				/*
 				 * Name the top-level transaction without assigning it a heap
@@ -3386,7 +3525,8 @@ undo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				 */
 				parentLogicalXid = get_savepoint_parent_xid();
 				assign_subtransaction_logical_xid(mySubid);
-				add_savepoint_wal_record(parentSubid, parentLogicalXid);
+				add_savepoint_wal_record(parentSubid, mySubid,
+										 parentLogicalXid);
 
 				/*
 				 * Keep the minimum.  A savepoint whose parent is below

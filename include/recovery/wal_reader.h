@@ -78,6 +78,8 @@ typedef struct WalRecord
 		{
 			SubTransactionId parentSubid;
 			TransactionId parentLogicalXid;
+			/* invalid in WAL before ORIOLEDB_SAVEPOINT_SUBID_WAL_VERSION */
+			SubTransactionId subid;
 		}			savepoint;
 		struct
 		{

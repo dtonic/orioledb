@@ -245,6 +245,13 @@ wal_parse_rec_savepoint(WalReaderState *r, WalRecord *rec)
 	WR_PARSE(r, &rec->logicalXid);
 	WR_PARSE(r, &rec->u.savepoint.parentLogicalXid);
 
+	if (r->container.version >= ORIOLEDB_SAVEPOINT_SUBID_WAL_VERSION)
+	{
+		WR_PARSE(r, &rec->u.savepoint.subid);
+	}
+	else
+		rec->u.savepoint.subid = InvalidSubTransactionId;
+
 	return WALPARSE_OK;
 }
 

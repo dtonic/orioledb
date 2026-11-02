@@ -49,6 +49,39 @@ SELECT unnest(orioledb_test_back_refind_skip_tail('o_back_refind'::regclass, 100
 (10 rows)
 
 DROP TABLE o_back_refind;
+-- An advance past the tuple the end bound rejected.
+-- orioledb_test_advance_past_rejected() drains an iterator up to a tuple the
+-- end bound rejects, which stays its resume key not yet returned, advances
+-- it to a later key, then forces iterator_refind_partial_leaf().  The
+-- re-find resumed at the rejected tuple and handed it out again, below the
+-- range the scan had moved to: a skip scan pinned its leading value to it
+-- and went round the same range for ever.
+CREATE TABLE o_advance_past (id int4 PRIMARY KEY) USING orioledb;
+INSERT INTO o_advance_past SELECT g FROM generate_series(1, 10) g;
+SELECT unnest(orioledb_test_advance_past_rejected('o_advance_past'::regclass, 4, 7)) AS id;
+ id 
+----
+  7
+  8
+  9
+ 10
+(4 rows)
+
+DROP TABLE o_advance_past;
+-- A bound exclusive in a leading column.  The descent's fast path searched
+-- for the bound's values as if it were inclusive there, and landed inside the
+-- run of the leading value it was to pass: a skip scan got a row of the
+-- leading value it had just finished, pinned it again, and went round for
+-- ever.  Enough rows that the run spans pages.
+CREATE TABLE o_past_prefix (a int4, b int4, PRIMARY KEY (a, b)) USING orioledb;
+INSERT INTO o_past_prefix SELECT g / 1000, g % 1000 FROM generate_series(0, 9999) g;
+SELECT orioledb_test_past_exclusive_prefix('o_past_prefix'::regclass, 5);
+ orioledb_test_past_exclusive_prefix 
+-------------------------------------
+ {6,0}
+(1 row)
+
+DROP TABLE o_past_prefix;
 -- A PG18 skip array is the one case where switch_to_next_range() recomputes
 -- ostate->exact, so a single scan can hold both kinds of range: the first binds
 -- the whole key and builds the iterator through o_btree_find_tuples_start(), a

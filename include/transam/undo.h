@@ -190,6 +190,13 @@ typedef struct
 	pg_atomic_uint64 cleanedCheckpointEndLocation;
 
 	/*
+	 * The last location used when the checkpoint started from was written.
+	 * Recovery makes undo records past it: an item whose undo is before it
+	 * comes from the checkpoint images.
+	 */
+	UndoLocation checkpointLastLocation;
+
+	/*
 	 * minUndoLocationsMutex is primarily used by update_min_undo_locations()
 	 * method, also is used by evict_undo_to_disk() method to protect shared
 	 * meta' fields, but is released for eviction writes; also is used in some
@@ -318,6 +325,8 @@ typedef struct
 	UndoStackItem header;
 	UndoLocation prevSubLocation;
 	SubTransactionId parentSubid;
+	/* the subtransaction's own, see checkpoint_stack_savepoint() */
+	SubTransactionId subid;
 } SubXactUndoStackItem;
 
 typedef enum
@@ -326,6 +335,18 @@ typedef enum
 	UndoStackHead,
 	UndoStackTail
 } UndoStackKind;
+
+/*
+ * Which items of an undo stack a walk applies: all of them, all but those of
+ * secondary indexes, or only those.  Recovery splits a checkpoint undo stack
+ * this way, see CheckpointUndoStack in recovery.c.
+ */
+typedef enum
+{
+	UndoWalkAll,
+	UndoWalkNoSecondary,
+	UndoWalkSecondary
+} UndoWalkFilter;
 
 /*
  * Stage argument passed to every UndoCallback invocation.
@@ -355,6 +376,7 @@ typedef enum
 } OUndoCallbackStage;
 
 extern bool oxid_needs_wal_flush;
+extern UndoWalkFilter undo_walk_filter;
 extern UndoLocation curRetainUndoLocations[(int) UndoLogsCount];
 extern PendingTruncatesMeta *pending_truncates_meta;
 
@@ -480,11 +502,20 @@ extern bool undo_write_if_exists(UndoLogType undoType, UndoLocation location,
 extern void undo_snapshot_register_hook(Snapshot snapshot);
 extern void undo_snapshot_deregister_hook(Snapshot snapshot);
 extern void orioledb_snapshot_hook(Snapshot snapshot);
-extern void add_subxact_undo_item(SubTransactionId parentSubid);
+extern void add_subxact_undo_item(SubTransactionId parentSubid,
+								  SubTransactionId subid);
 extern void rollback_to_savepoint(UndoLogType undoType,
 								  UndoStackKind kind,
 								  SubTransactionId parentSubid,
 								  bool changeCountsValid);
+extern void rollback_to_savepoint_or_whole(UndoLogType undoType,
+										   UndoStackKind kind,
+										   SubTransactionId parentSubid,
+										   bool changeCountsValid);
+extern void checkpoint_stack_savepoint(UndoLogType undoType,
+									   SubTransactionId parentSubid,
+									   SubTransactionId subid,
+									   bool rollbackAhead);
 extern bool undo_type_has_retained_location(UndoLogType undoType);
 extern bool have_retained_undo_location(void);
 extern UndoLocation get_snapshot_retained_undo_location(UndoLogType undoType);

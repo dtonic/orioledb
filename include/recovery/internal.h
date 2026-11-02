@@ -27,7 +27,8 @@ extern void recovery_init(int worker_id);
 extern void recovery_switch_to_oxid(OXid oxid, int worker_id);
 extern void recovery_finish_current_oxid(CommitSeqNo csn, XLogRecPtr ptr,
 										 int worker_id, bool sync);
-extern void recovery_savepoint(SubTransactionId parentSubid, int worker_id);
+extern void recovery_savepoint(SubTransactionId parentSubid,
+							   SubTransactionId subid, int worker_id);
 extern void recovery_rollback_to_savepoint(SubTransactionId parentSubid, int worker_id);
 extern void recovery_finish(int worker_id);
 extern void update_recovery_undo_loc_flush(bool single, int worker_id);
@@ -128,6 +129,15 @@ typedef struct
 	uint32		completedCheckpointNumber;
 	uint32		recoveryMainCompletedCheckpointNumber;
 	slock_t		exitLock;
+
+	/*
+	 * A restartpoint asks the startup process to bring the recovery workers
+	 * up to the replay position, see recovery_sync_workers().
+	 */
+	pg_atomic_uint32 workersSyncRequest;
+	pg_atomic_uint32 workersSyncServed;
+	pg_atomic_uint64 workersSyncedPtr;
+	pid_t		startupPid;
 } RecoveryUndoLocFlush;
 
 typedef struct
@@ -143,6 +153,7 @@ typedef struct
 	RecoveryMsgHeader header;
 	OXid		oxid;
 	SubTransactionId parentSubId;
+	SubTransactionId subId;
 } RecoveryMsgSavepoint;
 
 typedef struct

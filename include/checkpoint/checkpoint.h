@@ -163,6 +163,9 @@ typedef enum
  * today being XidRecPendingSkFixup, written by the checkpointer to record
  * a transaction that had applied its primary index change but had not yet
  * updated the corresponding secondary indices at the checkpoint boundary.
+ * The two after it are the halves of a regular undo stack that recovery
+ * split (see CheckpointUndoStack in recovery.c), which only a restartpoint
+ * writes: the undo of all but the secondary indexes, and of only those.
  *
  * The numeric layout matches the pre-XidRecKind file format, so existing
  * on-disk values keep their meaning.
@@ -175,7 +178,9 @@ typedef enum
 	XidRecRewindUndoRegular = UndoLogsCount + UndoLogRegular,
 	XidRecRewindUndoRegularPageLevel = UndoLogsCount + UndoLogRegularPageLevel,
 	XidRecRewindUndoSystem = UndoLogsCount + UndoLogSystem,
-	XidRecPendingSkFixup = 2 * UndoLogsCount
+	XidRecPendingSkFixup = 2 * UndoLogsCount,
+	XidRecUndoRegularNoSecondary,
+	XidRecUndoRegularSecondary
 } XidRecKind;
 
 typedef struct

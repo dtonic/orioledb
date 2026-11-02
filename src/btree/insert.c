@@ -1149,6 +1149,7 @@ o_btree_multi_insert_item(OBTreeFindPageContext *ctx,
 	 */
 	needsUndo = desc->undoType != UndoLogNone;
 	if (!(cb && cb->needsUndoForSelfCreated) &&
+		!is_recovery_process() &&
 		OXidIsValid(desc->createOxid) &&
 		desc->createOxid == opOxid &&
 		!UndoLocationIsValid(get_subxact_undo_location(desc->undoType)))

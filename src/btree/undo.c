@@ -1642,6 +1642,20 @@ read_hikey_from_undo(UndoLogType undoType, UndoLocation location,
 }
 
 /*
+ * Report the low key of a half a differential image reconstructed.  Such an
+ * image only trims the newer page, so it never reaches further left than a
+ * low key reported earlier in the walk: keep the tighter one.
+ */
+static void
+tighten_lokey(BTreeDescr *desc, OFixedKey *lokey, OTuple key)
+{
+	if (O_TUPLE_IS_NULL(lokey->tuple) ||
+		o_btree_cmp(desc, &key, BTreeKeyNonLeafKey,
+					&lokey->tuple, BTreeKeyNonLeafKey) > 0)
+		copy_fixed_key(desc, lokey, key);
+}
+
+/*
  * Reconstruct a pre-merge half from a differential merge image.
  *
  * On entry `dest` holds the merged page (the newer page the undo chain walk
@@ -1703,6 +1717,13 @@ reconstruct_merge_diff_half(BTreeDescr *desc, UndoLocation undoLocation,
 	/*
 	 * Capture the merged page hikey before reorg overwrites it.  The right
 	 * half inherits it; the left half's hikey is the boundary key.
+	 *
+	 * `dest` need not be all of the merged page, though: a later split of it
+	 * written as a differential image keeps just its own half.  The half
+	 * reconstructed here is no wider than `dest` then, on either side.
+	 * Taking the boundary key for the hikey of a left half that `dest` ends
+	 * before made the scan step over the rest of it, rows of another current
+	 * page.
 	 */
 	if (!O_PAGE_IS(dest, RIGHTMOST))
 	{
@@ -1747,6 +1768,14 @@ reconstruct_merge_diff_half(BTreeDescr *desc, UndoLocation undoLocation,
 			hikeySize = rightHikeySize;
 		}
 	}
+	else if (!O_PAGE_IS(dest, RIGHTMOST) &&
+			 o_btree_cmp(desc, &rightHikey.tuple, BTreeKeyNonLeafKey,
+						 &boundary.tuple, BTreeKeyNonLeafKey) < 0)
+	{
+		/* `dest` ends before the boundary */
+		hikey = rightHikey.tuple;
+		hikeySize = rightHikeySize;
+	}
 	else
 	{
 		header->flags &= ~O_BTREE_FLAG_RIGHTMOST;
@@ -1765,7 +1794,7 @@ reconstruct_merge_diff_half(BTreeDescr *desc, UndoLocation undoLocation,
 	if (is_right)
 		*is_right = wantRight;
 	if (wantRight && lokey)
-		copy_fixed_key(desc, lokey, boundary.tuple);
+		tighten_lokey(desc, lokey, boundary.tuple);
 }
 
 /*
@@ -1849,7 +1878,7 @@ reconstruct_split_diff(BTreeDescr *desc, UndoLocation undoLocation,
 	if (rightHalf)
 	{
 		if (lokey != NULL)
-			copy_fixed_key(desc, lokey, splitKey.tuple);
+			tighten_lokey(desc, lokey, splitKey.tuple);
 		if (page_lokey != NULL)
 			copy_fixed_key(desc, page_lokey, splitKey.tuple);
 	}

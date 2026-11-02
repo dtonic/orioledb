@@ -198,7 +198,14 @@ retry:
 	CHECK_FOR_INTERRUPTS();
 
 	context.needsUndo = desc->undoType != UndoLogNone;
+
+	/*
+	 * Not in replay: there is no savepoint it knows of either when the
+	 * transaction has one from before its checkpoint, or from before the
+	 * worker's first record of it.
+	 */
 	if (!(callbackInfo && callbackInfo->needsUndoForSelfCreated) &&
+		!is_recovery_process() &&
 		OXidIsValid(desc->createOxid) &&
 		desc->createOxid == opOxid &&
 		!UndoLocationIsValid(context.savepointUndoLocation))
@@ -560,7 +567,14 @@ o_btree_modify_handle_conflicts(BTreeModifyInternalContext *context)
 
 		if (oxid == context->opOxid)
 		{
+			/*
+			 * Replay does not know the savepoints of a transaction from
+			 * before its checkpoint, nor does a worker those from before its
+			 * first record of the transaction: a version of our own may be
+			 * from before a savepoint replay has no item of.
+			 */
 			if (context->action == BTreeOperationLock ||
+				is_recovery_process() ||
 				(UndoLocationIsValid(context->savepointUndoLocation) &&
 				 (!UndoLocationIsValid(context->conflictTupHdr.undoLocation) ||
 				  context->conflictTupHdr.undoLocation < context->savepointUndoLocation)) ||

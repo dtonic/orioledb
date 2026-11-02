@@ -392,7 +392,7 @@ recovery_queue_process(shm_mq_handle *queue, int id)
 	while (!finished)
 	{
 		data = recovery_queue_read(queue, &data_size, id);
-		if (detached || ShutdownRequestPending)
+		if (detached)
 			break;
 
 		Assert(data != NULL);
@@ -762,7 +762,13 @@ recovery_queue_process(shm_mq_handle *queue, int id)
 			else if (type == RecoveryMsgTypeSynchronize)
 			{
 				csn_record = (RecoveryMsgPtr *) (data + data_pos);
-				update_worker_ptr(id, csn_record->ptr);
+
+				/*
+				 * One for a restartpoint can come in the middle of a record,
+				 * behind a finish the worker already went past: the ptr never
+				 * moves back.
+				 */
+				update_worker_ptr(id, Max(my_ptr, csn_record->ptr));
 				data_pos += sizeof(RecoveryMsgPtr);
 			}
 			else if (type == RecoveryMsgTypeFinished)
@@ -783,7 +789,7 @@ recovery_queue_process(shm_mq_handle *queue, int id)
 
 				msg = (RecoveryMsgSavepoint *) (data + data_pos);
 				recovery_switch_to_oxid(msg->oxid, id);
-				recovery_savepoint(msg->parentSubId, id);
+				recovery_savepoint(msg->parentSubId, msg->subId, id);
 				data_pos += sizeof(RecoveryMsgSavepoint);
 			}
 			else if (type == RecoveryMsgTypeRollbackToSavepoint)
@@ -905,7 +911,7 @@ recovery_queue_read(shm_mq_handle *queue, Size *data_size, int id)
 		{
 			break;
 		}
-		else if (read_result == SHM_MQ_DETACHED || ShutdownRequestPending)
+		else if (read_result == SHM_MQ_DETACHED)
 		{
 			detached = true;
 			data = NULL;
@@ -967,7 +973,13 @@ recovery_queue_read(shm_mq_handle *queue, Size *data_size, int id)
 			update_recovery_undo_loc_flush(false, id);
 		}
 
-		if (!PostmasterIsAlive() || ShutdownRequestPending)
+		/*
+		 * At a shutdown request, go on with what the startup process still
+		 * sends -- it detaches the queue when it leaves -- or it is lost to
+		 * the shutdown restartpoint (see send_workers_rest_on_exit()).
+		 */
+		if (!PostmasterIsAlive() ||
+			(ShutdownRequestPending && !recovery_startup_running()))
 		{
 			detached = true;
 			data = NULL;

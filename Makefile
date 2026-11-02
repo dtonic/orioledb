@@ -312,7 +312,16 @@ TESTGRESCHECKS_PART_2 = test/t/checkpoint_concurrent_test.py \
 						test/t/page_pool_test.py \
 						test/t/bitmap_partition_test.py \
 						test/t/undo_image_chain_test.py \
-						test/t/evict_seq_scan_race_test.py
+						test/t/evict_seq_scan_race_test.py \
+						test/t/iterator_old_snapshot_test.py \
+						test/t/recovery_released_savepoint_rollback_test.py \
+						test/t/snapshot_race_test.py \
+						test/t/toast_replace_value_test.py \
+						test/t/checkpoint_rollback_to_savepoint_test.py \
+						test/t/pending_sk_fixup_absent_row_test.py \
+						test/t/restartpoint_split_stack_test.py \
+						test/t/restartpoint_workers_applied_test.py \
+						test/t/recovery_sk_rollback_to_savepoint_test.py
 TESTGRESCHECKS_PART_3 = test/t/logical_streaming_test.py \
 						test/t/relnode_wraparound_test.py \
 						test/t/rewind_time_test.py

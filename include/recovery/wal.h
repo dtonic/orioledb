@@ -41,7 +41,7 @@
  * ORIOLEDB_COMPRESS_VERSION (see big comment on versioning
  * in include/orioledb.h)
  */
-#define ORIOLEDB_WAL_VERSION (20)
+#define ORIOLEDB_WAL_VERSION (21)
 
 /*
  * Value has been fixed at the moment of introducing WAL versioning.
@@ -92,6 +92,15 @@
  * We should never change this value.
  */
 #define ORIOLEDB_FLAT_OLD_TUPLE_WAL_VERSION (20)
+
+/*
+ * WAL version that made WAL_REC_SAVEPOINT carry the subtransaction id of the
+ * savepoint, which recovery matches against the items of the undo stacks a
+ * checkpoint wrote.
+ *
+ * We should never change this value.
+ */
+#define ORIOLEDB_SAVEPOINT_SUBID_WAL_VERSION (21)
 
 /* Constants for commitInProgressXlogLocation */
 #define OWalTmpCommitPos			(0)
@@ -188,6 +197,8 @@ typedef struct
 	uint8		parentSubid[sizeof(SubTransactionId)];
 	uint8		logicalXid[sizeof(TransactionId)];
 	uint8		parentLogicalXid[sizeof(TransactionId)];
+	/* Since ORIOLEDB_SAVEPOINT_SUBID_WAL_VERSION */
+	uint8		subid[sizeof(SubTransactionId)];
 } WALRecSavepoint;
 
 typedef struct
@@ -285,6 +296,7 @@ extern void add_o_tables_meta_lock_wal_record(void);
 extern void add_o_tables_meta_unlock_wal_record(ORelOids oids, Oid oldRelnode);
 extern void add_switch_logical_xid_wal_record(TransactionId logicalXid_top, TransactionId logicalXid_sub);
 extern void add_savepoint_wal_record(SubTransactionId parentSubid,
+									 SubTransactionId subid,
 									 TransactionId parentLogicalXid);
 extern void add_rollback_to_savepoint_wal_record(SubTransactionId parentSubid);
 extern void add_database_copy_wal_record(Oid dboid, Oid src_tblspc, Oid dst_tblspc);
