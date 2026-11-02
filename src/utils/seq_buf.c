@@ -281,7 +281,7 @@ seq_buf_finish_prev_page(SeqBufDescPrivate *seqBufPrivate)
 		{
 			SpinLockRelease(&shared->lock);
 			ereport(PANIC, (errcode_for_file_access(),
-							errmsg("Error write seq buf %s at offset %u: %m",
+							errmsg("Error writing seq buf %s at offset %u: %m",
 								   FilePathName(seqBufPrivate->file),
 								   (uint32) offset)));
 			return false;
@@ -307,7 +307,7 @@ seq_buf_finish_prev_page(SeqBufDescPrivate *seqBufPrivate)
 			{
 				SpinLockRelease(&shared->lock);
 				ereport(PANIC, (errcode_for_file_access(),
-								errmsg("Error read seq buf %s at offset %u: %m",
+								errmsg("Error reading seq buf %s at offset %u: %m",
 									   FilePathName(seqBufPrivate->file),
 									   (uint32) offset)));
 				return false;
@@ -318,7 +318,7 @@ seq_buf_finish_prev_page(SeqBufDescPrivate *seqBufPrivate)
 			{
 				SpinLockRelease(&shared->lock);
 				Assert(nbytes < SEQBUF_CHUNK_SIZE);
-				elog(PANIC, "Error read sequence buffer file %s at offset %u."
+				elog(PANIC, "Error reading sequence buffer file %s at offset %u. "
 					 "Bytes read = %d is less than expected = %ld.",
 					 get_seq_buf_filename(&seqBufPrivate->tag), (uint32) offset,
 					 nbytes, SEQBUF_CHUNK_SIZE);
@@ -328,8 +328,8 @@ seq_buf_finish_prev_page(SeqBufDescPrivate *seqBufPrivate)
 					 shared->freeBytesNum != nbytes)
 			{
 				SpinLockRelease(&shared->lock);
-				elog(PANIC, "Error read sequence buffer file %s at offset %u. "
-					 "Bytes read = %d is not equal than expected = " UINT64_FORMAT,
+				elog(PANIC, "Error reading sequence buffer file %s at offset %u. "
+					 "Bytes read = %d is not equal to expected = " UINT64_FORMAT,
 					 get_seq_buf_filename(&seqBufPrivate->tag), (uint32) offset,
 					 nbytes, (uint64) shared->freeBytesNum);
 				return false;
@@ -739,7 +739,7 @@ seq_buf_read_pages(SeqBufDescPrivate *seqBufPrivate, SeqBufDescShared *shared,
 	{
 		SpinLockRelease(&shared->lock);
 		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not to read first page from file %s, read = %d, expected = %d: %m",
+						errmsg("could not read first page from file %s, read = %d, expected = %d: %m",
 							   FilePathName(seqBufPrivate->file), nbytes, should_read)));
 		return false;
 	}
@@ -756,7 +756,7 @@ seq_buf_read_pages(SeqBufDescPrivate *seqBufPrivate, SeqBufDescShared *shared,
 		{
 			SpinLockRelease(&shared->lock);
 			ereport(PANIC, (errcode_for_file_access(),
-							errmsg("could not to read second page from file %s, read = %d, expected = %d: %m",
+							errmsg("could not read second page from file %s, read = %d, expected = %d: %m",
 								   FilePathName(seqBufPrivate->file), nbytes, should_read)));
 			return false;
 		}

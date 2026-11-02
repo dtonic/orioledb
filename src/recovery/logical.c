@@ -266,7 +266,7 @@ set_snapshot(LogicalDecodingContext *ctx,
  * anymore.
  *
  * If store to slot is not requested, HeapTuple is freed inside o_convert_non_toast_tuple() and this
- * function only returns reodrer buffer tuple without any side effects.
+ * function only returns reorder buffer tuple without any side effects.
  */
 static REORDER_BUFFER_TUPLE_TYPE
 o_convert_non_toast_tuple(ReorderBuffer *reorderbuf, OTableDescr *descr, OIndexDescr *indexDescr, OTuple tuple, bool force_store_to_slot, TupleTableSlot *store_slot, HeapTuple *heaptuple, bool leafTuple)
@@ -352,8 +352,24 @@ o_convert_toast_chunk(ReorderBuffer *reorderbuf, OIndexDescr *indexDescr,
 	Assert((!attnum_isnull) && (!chunk_seq_isnull));
 	Assert(attnum > 0);
 
-	/* Toast chunk in VARATT_4B uncompressed format */
 	old_chunk = o_fastgetattr_ptr(tuple, pk_natts + DATA_POS, o_toast_tupDesc, &indexDescr->leafSpec);
+
+	/*
+	 * OrioleDB may store small chunks in short-header varlena (1-byte header)
+	 * internally, but ReorderBufferToastReplace() requires 4-byte headers.
+	 * Expand to 4B format before any size arithmetic.
+	 */
+	if (VARATT_IS_SHORT(old_chunk))
+	{
+		Size		short_data_len = VARSIZE_SHORT(old_chunk) - VARHDRSZ_SHORT;
+		Pointer		expanded = palloc(short_data_len + VARHDRSZ);
+
+		SET_VARSIZE(expanded, short_data_len + VARHDRSZ);
+		memcpy(VARDATA(expanded), VARDATA_SHORT(old_chunk), short_data_len);
+		old_chunk = expanded;
+		need_to_free = true;
+	}
+
 	old_chunk_size = VARSIZE(old_chunk) - VARHDRSZ;
 
 	/*
@@ -364,15 +380,18 @@ o_convert_toast_chunk(ReorderBuffer *reorderbuf, OIndexDescr *indexDescr,
 	if (chunk_seq == 0)
 	{
 		int			extra_header_size;
+		Pointer		trimmed;
 
 		Assert(VARATT_IS_4B(VARDATA(old_chunk)));
 		extra_header_size = VARHDRSZ;
 		new_chunk_size = old_chunk_size - extra_header_size;
+		trimmed = palloc0(new_chunk_size + VARHDRSZ);
+		SET_VARSIZE(trimmed, new_chunk_size + VARHDRSZ);
+		memcpy(VARDATA(trimmed), VARDATA(old_chunk) + extra_header_size, new_chunk_size);
+		if (need_to_free)
+			pfree(old_chunk);
+		new_chunk = trimmed;
 		need_to_free = true;
-		new_chunk = palloc0(new_chunk_size + VARHDRSZ);
-		memcpy(new_chunk, old_chunk, VARHDRSZ);
-		SET_VARSIZE(new_chunk, new_chunk_size + VARHDRSZ);
-		memcpy(VARDATA(new_chunk), VARDATA(old_chunk) + extra_header_size, new_chunk_size);
 	}
 	else
 	{
@@ -885,6 +904,15 @@ oriole_assign_child(ReorderBuffer *rb, TransactionId xid,
 	}
 
 	ReorderBufferAssignChild(rb, xid, subxid, lsn);
+
+	/*
+	 * The parent may be a logical xid or a heap xid with no changes of its
+	 * own yet.  Keep ReorderBufferAbortOld() from cleaning it up between
+	 * containers while its OrioleDB child is still running.
+	 */
+	txn = get_reorder_buffer_txn(rb, xid);
+	if (txn != NULL)
+		txn->txn_flags |= RBTXN_DISTR_SKIP_CLEANUP;
 }
 
 /*
@@ -1172,7 +1200,7 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 					/*
 					 * Oriole logical xid stays invalid for an autonomous
 					 * transactions (internal Oriole's mechanism intended for
-					 * independed commit of Oriole system catalog changes)
+					 * independent commit of Oriole system catalog changes)
 					 */
 					elog(DEBUG4, "IGNORED record type %d (%s) invalid logicalXid for oxid " UINT64_FORMAT,
 						 rec->type, recname, rec->oxid);

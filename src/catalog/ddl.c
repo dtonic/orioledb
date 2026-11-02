@@ -1314,8 +1314,8 @@ orioledb_utility_command(PlannedStmt *pstmt,
 			if (orioledb)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("orioledb tables does not support CLUSTER")),
-						errdetail("CLUSTER makes no much sense for index-organized tables."));
+						 errmsg("orioledb tables do not support CLUSTER")),
+						errdetail("CLUSTER makes little sense for index-organized tables."));
 		}
 	}
 	else if (IsA(pstmt->utilityStmt, VacuumStmt))
@@ -2296,7 +2296,7 @@ set_toast_oids_and_options(Relation rel, Relation toast_rel, bool only_fillfacto
 			o_table_free(o_table);
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("temp and unlogged orioledb tables does not "
+					 errmsg("temp and unlogged orioledb tables do not "
 							"support compression options")));
 		}
 
@@ -3816,12 +3816,12 @@ orioledb_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
 				{
 					o_field = &o_table->fields[subId - 1];
 
-					if (o_field && !o_field->droped)
+					if (o_field && !o_field->dropped)
 					{
 						OSnapshot	oSnapshot;
 						OXid		oxid;
 
-						o_field->droped = true;
+						o_field->dropped = true;
 
 						fill_current_oxid_osnapshot(&oxid, &oSnapshot);
 						o_tables_rel_meta_lock(rel);
@@ -4773,7 +4773,7 @@ orioledb_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
 					tbl = relation_open(o_saved_relrewrite, AccessShareLock);
 
 					/*
-					 * Redefinig primary key here to not do rebuild after
+					 * Redefining primary key here to not do rebuild after
 					 * rewrite_table
 					 */
 					redefine_indices(tbl, new_o_table, true, InvalidOid);
@@ -4857,7 +4857,7 @@ orioledb_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
 						tbl = relation_open(tbl_oid, AccessShareLock);
 
 						/*
-						 * Redefinig primary key here to not do rebuild after
+						 * Redefining primary key here to not do rebuild after
 						 * rewrite_table
 						 */
 						redefine_indices(tbl, new_o_table, true, old_o_table->oids.relnode);
@@ -5051,8 +5051,8 @@ orioledb_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
 						   "that is different from cluster encoding \"%s\"",
 						   pg_encoding_to_char(dbform->encoding),
 						   pg_encoding_to_char(cluster_encoding)),
-					errdetail("OrioleDB now only supports single encoding for all databases. "
-							  "It is easier to use single one during checkpoint."));
+					errdetail("OrioleDB now only supports a single encoding for all databases. "
+							  "It is easier to use a single one during checkpoint."));
 		ReleaseSysCache(dbTuple);
 	}
 	else if (access == OAT_POST_ALTER && classId == DatabaseRelationId)
@@ -5326,7 +5326,7 @@ orioledb_object_access_hook(ObjectAccessType access, Oid classId, Oid objectId,
 					{
 						int			attnum = attnums[i];
 
-						if (attnum > 0 && attnum <= o_table->nfields && !o_table->fields[attnum - 1].droped)
+						if (attnum > 0 && attnum <= o_table->nfields && !o_table->fields[attnum - 1].dropped)
 						{
 							if (o_table->fields[attnum - 1].notnull != is_add)
 							{
@@ -5590,7 +5590,7 @@ o_check_movedb(const AlterDatabaseStmt *stmt, movedb_params *movedb)
 	if (!get_db_info(stmt->dbname, NoLock, &db_id))
 
 		/*
-		 * Lets standard processing of moving datatabase generates an error.
+		 * Lets standard processing of moving database generates an error.
 		 */
 		return;
 

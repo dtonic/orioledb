@@ -197,7 +197,7 @@ lane_put_task(S3TaskQueueLane *lane, Pointer data, uint32 len)
 	/* Put the task into a circular buffer */
 	if (insertLocation / size == (insertLocation + totallen - 1) / size)
 	{
-		/* Easy case: we can put the task a as continuous chunk of memory */
+		/* Easy case: we can put the task as a continuous chunk of memory */
 		memcpy(buffer + insertLocation % size + sizeof(uint32),
 			   data,
 			   len);

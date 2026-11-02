@@ -2516,7 +2516,7 @@ after_checkpoint_sync_wal(void)
 		if (!IsXLogFileName(xlde->d_name))
 			continue;
 
-		/* Ignore already arhieved files */
+		/* Ignore already archived files */
 		if (check_archive_done(xlde->d_name))
 			continue;
 
@@ -3608,7 +3608,7 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 						  WAIT_EVENT_DATA_FILE_READ) != map_extents_bytes)
 			{
 				ereport(FATAL, (errcode_for_file_access(),
-								errmsg("could not to read extents from file %s: %m",
+								errmsg("could not read extents from file %s: %m",
 									   filename)));
 			}
 
@@ -3621,7 +3621,7 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 							 WAIT_EVENT_DATA_FILE_TRUNCATE) < 0)
 			{
 				ereport(FATAL, (errcode_for_file_access(),
-								errmsg("could not to truncate file %s: %m",
+								errmsg("could not truncate file %s: %m",
 									   filename)));
 			}
 		}
@@ -3636,7 +3636,7 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 						   write_bytes, write_offset, WAIT_EVENT_SLRU_WRITE) != write_bytes)
 			{
 				ereport(FATAL, (errcode_for_file_access(),
-								errmsg("could not to write extents to file %s: %m",
+								errmsg("could not write extents to file %s: %m",
 									   filename)));
 			}
 			header.numFreeBlocks = free_extents->size;
@@ -3683,7 +3683,7 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 								   WAIT_EVENT_SLRU_WRITE) != write_buf_len)
 					{
 						ereport(FATAL, (errcode_for_file_access(),
-										errmsg("could not to write extents to file %s: %m",
+										errmsg("could not write extents to file %s: %m",
 											   filename)));
 					}
 					write_offset += write_buf_len;
@@ -3701,7 +3701,7 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 							   WAIT_EVENT_SLRU_WRITE) != write_buf_len)
 				{
 					ereport(FATAL, (errcode_for_file_access(),
-									errmsg("could not to write extents to file %s: %m",
+									errmsg("could not write extents to file %s: %m",
 										   filename)));
 				}
 			}
@@ -4143,7 +4143,7 @@ checkpoint_try_merge_page(BTreeDescr *descr, CheckpointState *state,
 	rpage_desc = O_GET_IN_MEMORY_PAGEDESC(rightBlkno);
 
 	/*
-	 * Сheck there is no IO in progress for the right page.
+	 * Check there is no IO in progress for the right page.
 	 */
 	if (rpage_desc->ionum >= 0)
 	{
@@ -6083,8 +6083,8 @@ can_use_checkpoint_extents(BTreeDescr *desc, uint32 chkp_num)
 		return false;
 
 	/*
-	 * Prevent situtation when checkpoint was finished and new sequential scan
-	 * started between out checks for numSeqScans and lastCheckpointNumber.
+	 * Prevent situation when checkpoint was finished and new sequential scan
+	 * started between our checks for numSeqScans and lastCheckpointNumber.
 	 */
 	pg_read_barrier();
 
@@ -6429,7 +6429,7 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 			if (ferror)
 			{
 				ereport(FATAL, (errcode_for_file_access(),
-								errmsg("could not to read header of map file %s: %m",
+								errmsg("could not read header of map file %s: %m",
 									   prev_chkp_fname)));
 			}
 			FileClose(prev_chkp_file);

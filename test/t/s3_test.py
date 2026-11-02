@@ -25,7 +25,7 @@ from testgres.exceptions import StartNodeException, QueryException
 from .base_test import wait_checkpointer_stopevent
 from .s3_base_test import S3BaseTest, s3_test_attrs, mock_put_object, \
  orig_put_object, \
- mock_put_object_conflict, mock_moto_unkown_error, FlakyPutObject, \
+ mock_put_object_conflict, mock_moto_unknown_error, FlakyPutObject, \
  RevokedKeyPut, AmbiguousPut, HoldChunksOf, HoldFirstGet, ConflictingPut, \
  FailingGet, RevokedKey, orig_get_object, orig_list_objects_v2, FailingDelete, \
  orig_delete_object, TransientServerError
@@ -6356,9 +6356,9 @@ class S3Test(S3BaseTest):
 				    'FATAL:  another writer replaced "writer" in the S3 bucket while this instance was starting',
 				    f.read())
 
-		# Test unkown error handling
+		# Test unknown error handling
 		with patch("moto.s3.responses.S3Response.put_object",
-		           new=mock_moto_unkown_error):
+		           new=mock_moto_unknown_error):
 			with self.assertRaises(StartNodeException) as e:
 				new_node.start()
 
