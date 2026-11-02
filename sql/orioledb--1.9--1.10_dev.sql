@@ -40,3 +40,15 @@ CREATE FUNCTION orioledb_slot_retain_undo_location()
 RETURNS int8
 AS 'MODULE_PATHNAME'
 VOLATILE LANGUAGE C;
+
+CREATE FUNCTION orioledb_test_advance_past_rejected(relid oid,
+													reject_at int4,
+													advance_to int4)
+RETURNS int4[]
+AS 'MODULE_PATHNAME'
+VOLATILE LANGUAGE C;
+
+CREATE FUNCTION orioledb_test_past_exclusive_prefix(relid oid, past_a int4)
+RETURNS int4[]
+AS 'MODULE_PATHNAME'
+VOLATILE LANGUAGE C;

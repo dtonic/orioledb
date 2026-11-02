@@ -285,6 +285,23 @@ find_downlink_get_keys(BTreeDescr *desc, void *key, BTreeKeyType keyType,
 			{
 				flags[i] = 0;
 				values[i] = bound->keys[i].value;
+
+				/*
+				 * An exclusive bound on this column fences the whole run of
+				 * entries sharing the prefix up to it, whatever the bound
+				 * says of the columns after: "i > v" is past every (v, *).
+				 * The columns after are the fence below, as for a bound that
+				 * leaves them out.  Searched for as values, they put the
+				 * descent inside the run, which is what a scan that had moved
+				 * past the run (a skip scan's next leading value) got back,
+				 * and went round for ever.
+				 */
+				if (!(f & O_VALUE_BOUND_INCLUSIVE) &&
+					(f & O_VALUE_BOUND_DIRECTIONS))
+				{
+					num = i + 1;
+					break;
+				}
 			}
 		}
 

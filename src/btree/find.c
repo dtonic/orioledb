@@ -1914,20 +1914,21 @@ find_left_page(OBTreeFindPageContext *context, OFixedKey *hikey)
 										prevHikey.tuple))
 			continue;
 
-		if (COMMITSEQNO_IS_INPROGRESS(context->csn) &&
-			!O_PAGE_IS(context->img, RIGHTMOST))
+		if (!O_PAGE_IS(context->img, RIGHTMOST))
 			BTREE_PAGE_GET_HIKEY(imgHikey, context->img);
 
-		if (COMMITSEQNO_IS_INPROGRESS(context->csn) &&
-			(O_PAGE_IS(context->img, RIGHTMOST)
-			 || o_btree_cmp(desc, &imgHikey, BTreeKeyNonLeafKey, hikey, BTreeKeyNonLeafKey) != 0))
+		if (O_PAGE_IS(context->img, RIGHTMOST) ||
+			o_btree_cmp(desc, &imgHikey, BTreeKeyNonLeafKey, hikey, BTreeKeyNonLeafKey) != 0)
 		{
 			/*
 			 * The BTree may be changed in progress, but find_page() function
 			 * setup leaf offset always as BTREE_PAGE_ITEMS_COUNT(page) - 1
 			 * for the BTreeHiKey search case.
 			 *
-			 * We must refind the leaf offset in this case.
+			 * We must refind the leaf offset in this case.  Under an older
+			 * snapshot too: the page found can be a historical image wider
+			 * than the left sibling, from before a split, with the rows the
+			 * scan has just returned at its end.
 			 */
 			btree_page_search(desc,
 							  context->img,

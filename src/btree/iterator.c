@@ -795,6 +795,7 @@ o_find_tuple_version(BTreeDescr *desc, Page p, BTreePageItemLocator *loc,
 	bool		curTupleAllocated = false;
 	MemoryContext prevMctx;
 	bool		txIsFinished = false;
+	bool		cbMatched = false;
 
 	prevMctx = MemoryContextSwitchTo(mcxt);
 
@@ -839,7 +840,10 @@ o_find_tuple_version(BTreeDescr *desc, Page p, BTreePageItemLocator *loc,
 			cbResult = cb(curTuple, tupOxid, oSnapshot, arg, txIsFinished);
 
 			if (cbResult == OTupleFetchMatch)
+			{
+				cbMatched = true;
 				break;
+			}
 			if (cbResult == OTupleFetchNotMatch)
 			{
 				if (curTupleAllocated)
@@ -950,8 +954,14 @@ o_find_tuple_version(BTreeDescr *desc, Page p, BTreePageItemLocator *loc,
 			return result;
 		}
 	}
-	else if (tupHdr.deleted != BTreeLeafTupleNonDeleted && !cb)
+	else if (tupHdr.deleted != BTreeLeafTupleNonDeleted && !cbMatched)
 	{
+		/*
+		 * A deleted version is the callback's to take, the sys trees look
+		 * versions up that way.  One the snapshot picked is not there:
+		 * handing it back gave a TOAST value the chunks a longer value before
+		 * it had past its end, deleted.
+		 */
 		if (curTupleAllocated)
 			pfree(curTuple.data);
 		O_TUPLE_SET_NULL(result);
@@ -1243,6 +1253,29 @@ o_btree_iterator_advance(BTreeIterator *it, void *key, BTreeKeyType kind)
 	 * it was recorded for.  Build it now, while the image still holds it.
 	 */
 	iterator_materialize_cur_key(it);
+
+	/*
+	 * The scan goes on from key: a re-find has to start there too.  The
+	 * resume key is the last tuple read, which a rejected one left not yet
+	 * returned (see o_btree_iterator_fetch()); when key is past it, a re-find
+	 * resuming at it handed that tuple out again, below the range the scan
+	 * had moved to.  A skip scan pinned its leading value to the tuple, and
+	 * went round the same range for ever.
+	 */
+	it->startKey = key;
+	it->startKind = kind;
+	if (it->curKeySet)
+	{
+		int			cmp = o_btree_cmp(it->context.desc, key, kind,
+									  &it->curKey.tuple, BTreeKeyNonLeafKey);
+
+		if ((IT_IS_FORWARD(it) && cmp > 0) || (IT_IS_BACKWARD(it) && cmp < 0))
+		{
+			it->curKeySet = false;
+			it->curKeyLazy = false;
+			it->curKeyReturned = false;
+		}
+	}
 
 #ifdef USE_ASSERT_CHECKING
 
@@ -2570,6 +2603,8 @@ undo_it_find_internal(UndoIterator *undoIt, void *key, BTreeKeyType kind)
 	undoLocation = undoIt->baseLoc;
 	undoIt->leftmost = true;
 	undoIt->rightmost = true;
+	/* only this walk's images bound it, see undo_image_lokey() */
+	clear_fixed_key(&undoIt->lokey);
 
 	/*
 	 * Seed the working image with the live data leaf before walking the
@@ -2739,6 +2774,191 @@ orioledb_test_endkey_returned_skip(PG_FUNCTION_ARGS)
 	relation_close(rel, AccessShareLock);
 
 	dims[0] = nelems;
+	lbs[0] = 1;
+	PG_RETURN_ARRAYTYPE_P(construct_md_array(elems, NULL, 1, dims, lbs,
+											 INT4OID, sizeof(int32), true,
+											 TYPALIGN_INT));
+}
+
+/*
+ * Whitebox test: an advance past the tuple the end bound rejected.
+ *
+ * 1. Open a forward iterator at 1 and drain it up to reject_at, exclusive:
+ *    the tuple at reject_at is read, rejected by the end bound, and left as
+ *    the resume key, not yet returned.
+ * 2. Advance the iterator to advance_to (> reject_at), as the scan of the
+ *    next "col = ANY" element or the next skip-scan range does.
+ * 3. Force iterator_refind_partial_leaf(), the path a partial read that
+ *    found its page changed takes.
+ * 4. Drain with a wide end and return the PKs as int4[].
+ *
+ * Expected: the rows from advance_to on.  Bug: the re-find resumed at the
+ * rejected tuple and handed it out again, below the range the scan had moved
+ * to; a skip scan pinned its leading value to it and went round the same
+ * range for ever.
+ *
+ * Assumes the relation's primary index has a single int4 key column.
+ */
+PG_FUNCTION_INFO_V1(orioledb_test_advance_past_rejected);
+Datum
+orioledb_test_advance_past_rejected(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		reject_at = PG_GETARG_INT32(1);
+	int32		advance_to = PG_GETARG_INT32(2);
+	Relation	rel;
+	OTableDescr *descr;
+	OIndexDescr *primary;
+	OBTreeKeyBound startBound,
+				rejectEnd,
+				advanceBound,
+				wideEnd;
+	BTreeIterator *it;
+	OTuple		result;
+	bool		isnull;
+	Datum	   *elems;
+	int			nelems = 0;
+	int			alloc = 16;
+	int			dims[1],
+				lbs[1];
+
+	rel = relation_open(relid, AccessShareLock);
+	descr = relation_get_descr(rel);
+	if (!descr)
+		elog(ERROR, "relation is not an orioledb table");
+	primary = GET_PRIMARY(descr);
+	if (primary->nKeyFields < 1 || primary->fields[0].inputtype != INT4OID)
+		elog(ERROR, "test requires a single int4 primary key column");
+
+	startBound.nkeys = 1;
+	startBound.n_row_keys = 0;
+	startBound.row_keys = NULL;
+	startBound.keys[0].type = INT4OID;
+	startBound.keys[0].flags = O_VALUE_BOUND_PLAIN_VALUE;
+	startBound.keys[0].comparator = primary->fields[0].comparator;
+	startBound.keys[0].exclusion_fn = NULL;
+	startBound.keys[0].value = Int32GetDatum(1);
+	rejectEnd = startBound;
+	rejectEnd.keys[0].value = Int32GetDatum(reject_at);
+	advanceBound = startBound;
+	advanceBound.keys[0].value = Int32GetDatum(advance_to);
+	wideEnd = startBound;
+	wideEnd.keys[0].value = Int32GetDatum(PG_INT32_MAX);
+
+	it = o_btree_iterator_create(&primary->desc, (Pointer) &startBound,
+								 BTreeKeyBound, &o_in_progress_snapshot,
+								 ForwardScanDirection);
+
+	/* up to reject_at: the tuple there is read and rejected */
+	for (;;)
+	{
+		result = o_btree_iterator_fetch(it, NULL, (Pointer) &rejectEnd,
+										BTreeKeyBound, false, NULL);
+		if (O_TUPLE_IS_NULL(result))
+			break;
+		pfree(result.data);
+	}
+
+	o_btree_iterator_advance(it, (Pointer) &advanceBound, BTreeKeyBound);
+
+	/* Simulate the partial-read failure that forces a refind. */
+	iterator_refind_partial_leaf(it);
+
+	elems = (Datum *) palloc(alloc * sizeof(Datum));
+	for (;;)
+	{
+		result = o_btree_iterator_fetch(it, NULL, (Pointer) &wideEnd,
+										BTreeKeyBound, true, NULL);
+		if (O_TUPLE_IS_NULL(result))
+			break;
+		if (nelems == alloc)
+		{
+			alloc *= 2;
+			elems = (Datum *) repalloc(elems, alloc * sizeof(Datum));
+		}
+		elems[nelems++] = o_fastgetattr(result, 1, primary->leafTupdesc,
+										&primary->leafSpec, &isnull);
+		if (isnull)
+			elog(ERROR, "PK column unexpectedly NULL");
+		pfree(result.data);
+	}
+
+	btree_iterator_free(it);
+	relation_close(rel, AccessShareLock);
+
+	dims[0] = nelems;
+	lbs[0] = 1;
+	PG_RETURN_ARRAYTYPE_P(construct_md_array(elems, NULL, 1, dims, lbs,
+											 INT4OID, sizeof(int32), true,
+											 TYPALIGN_INT));
+}
+
+/*
+ * Whitebox test: a bound exclusive in a leading column.
+ *
+ * Open a forward iterator at (a > past_a, b >= 0) on a (a, b) key and return
+ * the first tuple it gives, as int4[2].  Expected: the first row with a >
+ * past_a.  Bug: the descent searched for the values (past_a, 0), as if the
+ * bound were inclusive in a, and the iterator gave a row with a = past_a.
+ *
+ * Assumes the relation's primary index is (int4, int4).
+ */
+PG_FUNCTION_INFO_V1(orioledb_test_past_exclusive_prefix);
+Datum
+orioledb_test_past_exclusive_prefix(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int32		past_a = PG_GETARG_INT32(1);
+	Relation	rel;
+	OTableDescr *descr;
+	OIndexDescr *primary;
+	OBTreeKeyBound bound;
+	BTreeIterator *it;
+	OTuple		result;
+	bool		isnull;
+	Datum		elems[2];
+	int			dims[1],
+				lbs[1];
+
+	rel = relation_open(relid, AccessShareLock);
+	descr = relation_get_descr(rel);
+	if (!descr)
+		elog(ERROR, "relation is not an orioledb table");
+	primary = GET_PRIMARY(descr);
+	if (primary->nKeyFields != 2 ||
+		primary->fields[0].inputtype != INT4OID ||
+		primary->fields[1].inputtype != INT4OID)
+		elog(ERROR, "test requires an (int4, int4) primary key");
+
+	bound.nkeys = 2;
+	bound.n_row_keys = 0;
+	bound.row_keys = NULL;
+	bound.keys[0].type = INT4OID;
+	bound.keys[0].flags = O_VALUE_BOUND_LOWER | O_VALUE_BOUND_COERCIBLE;
+	bound.keys[0].comparator = primary->fields[0].comparator;
+	bound.keys[0].exclusion_fn = NULL;
+	bound.keys[0].value = Int32GetDatum(past_a);
+	bound.keys[1].type = INT4OID;
+	bound.keys[1].flags = O_VALUE_BOUND_PLAIN_VALUE;
+	bound.keys[1].comparator = primary->fields[1].comparator;
+	bound.keys[1].exclusion_fn = NULL;
+	bound.keys[1].value = Int32GetDatum(0);
+
+	it = o_btree_iterator_create(&primary->desc, (Pointer) &bound,
+								 BTreeKeyBound, &o_in_progress_snapshot,
+								 ForwardScanDirection);
+	result = o_btree_iterator_fetch(it, NULL, NULL, BTreeKeyNone, true, NULL);
+	if (O_TUPLE_IS_NULL(result))
+		elog(ERROR, "no tuple past the bound");
+	elems[0] = o_fastgetattr(result, 1, primary->leafTupdesc,
+							 &primary->leafSpec, &isnull);
+	elems[1] = o_fastgetattr(result, 2, primary->leafTupdesc,
+							 &primary->leafSpec, &isnull);
+	pfree(result.data);
+	btree_iterator_free(it);
+	relation_close(rel, AccessShareLock);
+
+	dims[0] = 2;
 	lbs[0] = 1;
 	PG_RETURN_ARRAYTYPE_P(construct_md_array(elems, NULL, 1, dims, lbs,
 											 INT4OID, sizeof(int32), true,

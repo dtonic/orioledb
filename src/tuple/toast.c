@@ -985,7 +985,8 @@ generic_toast_get(ToastAPI *api, void *key, Size data_size,
 
 		actual_size += iter_data_size;
 
-		if (iter_data_size < max_length)
+		/* the value is complete, whether its last chunk is short or not */
+		if (iter_data_size < max_length || actual_size == data_size)
 			break;
 
 		Assert(actual_size <= data_size);

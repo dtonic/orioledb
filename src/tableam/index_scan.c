@@ -866,6 +866,15 @@ o_iterate_index(OIndexDescr *indexDescr, OScanState *ostate,
 					}
 					if (tup_is_valid)
 						tup_fetched = true;
+					else
+					{
+						/*
+						 * the slot owns a tuple handed out; a rejected one is
+						 * ours
+						 */
+						pfree(tup.data);
+						O_TUPLE_SET_NULL(tup);
+					}
 				}
 			} while (!tup_is_valid);
 		}
@@ -950,6 +959,7 @@ o_iterate_index(OIndexDescr *indexDescr, OScanState *ostate,
 				MemoryContextSwitchTo(oldcontext);
 
 				tup_fetched = false;
+				pfree(tup.data);
 				O_TUPLE_SET_NULL(tup);
 				continue;
 			}
