@@ -43,6 +43,8 @@ is_recovery_in_progress(void)
 }
 
 extern XLogRecPtr recovery_get_effective_replay_ptr(void);
+extern XLogRecPtr recovery_sync_workers(void);
+extern bool recovery_startup_running(void);
 
 extern bool orioledb_recovery_stops_before_hook(XLogReaderState *record,
 												TransactionId *recordXid,

@@ -71,6 +71,8 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "storage/proc.h"
+#include "utils/wait_event.h"
 
 static pg_atomic_uint64 *recovery_main_retain_ptr;
 static pg_atomic_uint64 *recovery_index_next_pos;
@@ -112,6 +114,8 @@ typedef struct
 	shm_mq_handle *queue;
 	char		queue_buf[RECOVERY_QUEUE_BUF_SIZE];
 	int			queue_buf_len;
+	/* The record the first message in queue_buf is for */
+	XLogRecPtr	queue_buf_ptr;
 	/* Current oids */
 	ORelOids	oids;
 	/* Current oxid */
@@ -199,9 +203,24 @@ static void check_delete_xid_state(RecoveryXidState *state, int worker_id);
 		offsetof(RecoveryXidState, retain_undo_ph_nodes) - \
 		sizeof(pairingheap_node) * (int) (undoType)))
 
-typedef struct
+/*
+ * An undo stack of a transaction that was in progress at the checkpoint.
+ *
+ * Recovery replays the secondary indexes only from the toast-consistent
+ * point on; up to it, their checkpoint images hold every change the WAL has
+ * there.  A rollback to a savepoint replayed before it must leave the
+ * secondary indexes as they are: the changes it takes back from the primary
+ * key get replayed there again, but not in the secondary indexes.  So the
+ * regular log's stack is split at the first such rollback, filter telling
+ * which items each half applies.  The secondary half sits the rollbacks
+ * before toast-consistency out and takes the rest, as the other half takes
+ * all from the replay start on.  What a savepoint takes off the stack as
+ * released goes for both halves.
+ */
+typedef struct CheckpointUndoStack
 {
 	XidRecKind	kind;
+	UndoWalkFilter filter;
 	UndoStackLocations undoStack;
 	dlist_node	node;
 } CheckpointUndoStack;
@@ -226,9 +245,36 @@ typedef struct WorkerUndoTempEntry
 
 typedef struct WorkerUndoTempCheckpointStack
 {
-	XidRecKind	kind;
+	XidRecKind	kind;			/* as in the xids file */
 	UndoStackLocations undoStack;
 } WorkerUndoTempCheckpointStack;
+
+/*
+ * The kind of xids file record for a checkpoint undo stack, and back.
+ */
+static XidRecKind
+checkpoint_stack_rec_kind(XidRecKind kind, UndoWalkFilter filter)
+{
+	Assert(filter == UndoWalkAll || kind == XidRecUndoRegular);
+	if (filter == UndoWalkNoSecondary)
+		return XidRecUndoRegularNoSecondary;
+	if (filter == UndoWalkSecondary)
+		return XidRecUndoRegularSecondary;
+	return kind;
+}
+
+static XidRecKind
+checkpoint_stack_kind(XidRecKind recKind, UndoWalkFilter *filter)
+{
+	*filter = UndoWalkAll;
+	if (recKind == XidRecUndoRegularNoSecondary)
+		*filter = UndoWalkNoSecondary;
+	else if (recKind == XidRecUndoRegularSecondary)
+		*filter = UndoWalkSecondary;
+	else
+		return recKind;
+	return XidRecUndoRegular;
+}
 
 PG_FUNCTION_INFO_V1(orioledb_recovery_synchronized);
 
@@ -310,6 +356,13 @@ static uint32 startup_chkp_num;
 /* is recovery main process has error */
 static bool unexpected_worker_detach = false;
 
+/* A message to a worker is half sent, see serve_workers_sync_request() */
+static bool queue_flush_in_progress = false;
+
+/* The record being replayed, and the recovery_ptr asked for */
+static XLogRecPtr redo_record_ptr = InvalidXLogRecPtr;
+static XLogRecPtr recovery_ptr_target = InvalidXLogRecPtr;
+
 /*
  * How long worker_queue_flush() sleeps between asking whether the worker it
  * is waiting for is still alive.  Short enough that a shutdown is not
@@ -383,8 +436,7 @@ bool		toast_consistent = false;
  * stage-0 window [sysTreesStartPtr, replayStartPtr).
  *
  * A checkpoint xid (one read out of the xids file into checkpoint_undo_stacks)
- * can finish -- commit, abort, or roll back to a savepoint -- while recovery
- * is still inside stage 0.  Applying its captured data-log
+ * can finish -- commit or abort -- while recovery is still inside stage 0.  Applying its captured data-log
  * (UndoLogRegular/UndoLogRegularPageLevel) undo right there would fetch a data
  * tree descriptor (O_TABLES/O_INDICES) before the sys trees are consistent,
  * which is not allowed.  walk_checkpoint_stacks() therefore parks such an
@@ -395,16 +447,29 @@ bool		toast_consistent = false;
  * orioledb_redo()).  UndoLogSystem entries are always applied in place:
  * sys-tree undo is exactly what stage 0 is bringing to consistency.
  *
+ * A savepoint, or a rollback to one, inside stage 0 has nothing to do to the
+ * data-log stacks, see walk_checkpoint_stacks().
+ *
  * Leader only: checkpoint_undo_stacks are populated only for worker_id < 0.
  */
+typedef enum CheckpointStacksAction
+{
+	/* commit or roll back the whole stack, which goes away */
+	CheckpointStacksFinish,
+	/* roll back to the savepoint, the stack stays */
+	CheckpointStacksRollbackTo,
+	/* a savepoint started, see checkpoint_stack_savepoint() */
+	CheckpointStacksSavepoint
+} CheckpointStacksAction;
+
 typedef struct DeferredCheckpointUndo
 {
 	OXid		oxid;
 	bool		needs_wal_flush;
 	XidRecKind	kind;
+	UndoWalkFilter filter;
 	UndoStackLocations undoStack;
 	CommitSeqNo csn;
-	SubTransactionId parentSubid;
 	bool		flush_undo_pos;
 	dlist_node	node;
 } DeferredCheckpointUndo;
@@ -597,6 +662,25 @@ apply_one_pending_sk_fixup(OXid entryOxid, UndoLocation itemLoc,
 	}
 
 	BTREE_PAGE_READ_TUPLE(pkOnPage, pkPage, &pageLoc);
+
+	/*
+	 * The row may not be on the page yet: the checkpoint can have written the
+	 * page before the change, and recovery replays the change only after
+	 * this.  The locator is at the next key then, or at the deleted row the
+	 * key had before, and neither is the post-image: taking it for one gave a
+	 * deleted row its secondary index entries back.  The replay brings the
+	 * row's own.
+	 */
+	if (o_btree_cmp(&primary->desc, (Pointer) &pkKey, BTreeKeyBound,
+					(Pointer) &pkOnPage, BTreeKeyLeafTuple) != 0 ||
+		(item.action != BTreeOperationDelete &&
+		 ((BTreeLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(pkPage, &pageLoc))->deleted !=
+		 BTreeLeafTupleNonDeleted))
+	{
+		unlock_page(context.items[context.index].blkno);
+		pfree(oldTuple.data);
+		return true;
+	}
 
 	/* Materialise a private copy before releasing the page lock. */
 	newTupleLen = o_btree_len(&primary->desc, pkOnPage, OTupleLength);
@@ -948,6 +1032,10 @@ static bool need_flush_undo_pos(int worker_id);
 static void flush_current_undo_stack(void);
 static void apply_deferred_checkpoint_undo(void);
 static void o_handle_startup_proc_interrupts_hook(void);
+static void serve_workers_sync_request(void);
+static void send_workers_rest_on_exit(void);
+static void publish_recovery_ptr(XLogRecPtr ptr);
+static bool is_process_running(pid_t pid);
 static void abort_recovery(RecoveryWorkerState *workers_pool, bool send_to_idx_pool);
 
 static bool replay_container(Pointer startPtr, Pointer endPtr,
@@ -959,7 +1047,8 @@ static void worker_send_modify(int worker_id, BTreeDescr *desc,
 							   OTuple tuple, int tuple_len);
 static void workers_send_oxid_finish(XLogRecPtr ptr, bool needsFeedback,
 									 bool commit);
-static void workers_send_savepoint(SubTransactionId parentSubId);
+static void workers_send_savepoint(SubTransactionId parentSubId,
+								   SubTransactionId subId);
 static void workers_send_rollback_to_savepoint(XLogRecPtr ptr,
 											   SubTransactionId parentSubId);
 static void workers_synchronize(XLogRecPtr ptr, bool send_synchronize);
@@ -1066,6 +1155,11 @@ recovery_shmem_init(Pointer ptr, bool found)
 		recovery_undo_loc_flush->completedCheckpointNumber = UINT32_MAX;
 		recovery_undo_loc_flush->recoveryMainCompletedCheckpointNumber = 0;
 		SpinLockInit(&recovery_undo_loc_flush->exitLock);
+		pg_atomic_init_u32(&recovery_undo_loc_flush->workersSyncRequest, 0);
+		pg_atomic_init_u32(&recovery_undo_loc_flush->workersSyncServed, 0);
+		pg_atomic_init_u64(&recovery_undo_loc_flush->workersSyncedPtr,
+						   InvalidXLogRecPtr);
+		recovery_undo_loc_flush->startupPid = 0;
 
 		pg_atomic_init_u32(worker_finish_count, 0);
 		pg_atomic_init_u32(idx_worker_finish_count, 0);
@@ -1211,7 +1305,8 @@ read_xids(int checkpointnum, bool recovery_single, int worker_id)
 			ODBProcData *curProcData = GET_CUR_PROCDATA();
 			CheckpointUndoStack *stack;
 			UndoLocation retainUndoLocation;
-			XidRecKind	kind = xidRec.kind;
+			UndoWalkFilter filter;
+			XidRecKind	kind = checkpoint_stack_kind(xidRec.kind, &filter);
 
 			if ((int) kind < 0 || (int) kind > (int) XidRecPendingSkFixup)
 				ereport(FATAL,
@@ -1236,6 +1331,7 @@ read_xids(int checkpointnum, bool recovery_single, int worker_id)
 			stack = (CheckpointUndoStack *) MemoryContextAlloc(TopMemoryContext,
 															   sizeof(CheckpointUndoStack));
 			stack->kind = kind;
+			stack->filter = filter;
 			stack->undoStack = xidRec.undoLocation;
 			dlist_push_tail(&state->checkpoint_undo_stacks, &stack->node);
 			set_oxid_csn(xidRec.oxid, COMMITSEQNO_INPROGRESS);
@@ -1331,7 +1427,9 @@ apply_xids_branches(void)
 				UndoLogType undoType = (UndoLogType) stack->kind;
 
 				set_cur_undo_locations(undoType, stack->undoStack);
+				undo_walk_filter = stack->filter;
 				apply_undo_branches(undoType, recovery_oxid);
+				undo_walk_filter = UndoWalkAll;
 			}
 			else
 			{
@@ -1575,6 +1673,7 @@ orioledb_redo(XLogReaderState *record)
 			workers_notify_toast_consistent();
 	}
 
+	redo_record_ptr = record->ReadRecPtr;
 	if (record->ReadRecPtr >= checkpoint_state->controlSysTreesStartPtr)
 	{
 		if (!replay_container(msg_start, msg_start + msg_len, recovery_single,
@@ -1622,6 +1721,7 @@ o_recovery_finish_hook(bool cleanup)
 			shm_mq_detach(state->queue);
 		}
 		pfree(workers_pool);
+		workers_pool = NULL;
 	}
 
 	/* Release all the locks.  All of them are acquired at statement-level. */
@@ -2037,11 +2137,41 @@ recovery_init(int worker_id)
 	}
 
 	HandleStartupProcInterrupts_hook = o_handle_startup_proc_interrupts_hook;
+
+	/* the workers run recovery_init() as well */
+	if (worker_id < 0)
+		recovery_undo_loc_flush->startupPid = MyProcPid;
 }
 
+/*
+ * Finish the checkpoint undo stacks of a transaction, or roll them back to a
+ * savepoint when parentSubid is given.
+ *
+ * A rollback to a savepoint finishes nothing: the undo below the savepoint
+ * still belongs to the transaction, and its commit or rollback has to find
+ * it.  So the stacks stay, moved to where the rollback ended.  Removing them
+ * here left a transaction that was running at the checkpoint, and that
+ * started a savepoint after it, with no undo for the changes it made before
+ * the checkpoint: rolling it back kept them.
+ *
+ * That holds for a rollback to a savepoint with no parentSubid too: one taken
+ * before the transaction changed anything in OrioleDB rolls back all of it,
+ * and the transaction goes on.
+ *
+ * Before toast-consistency, a rollback to a savepoint leaves the secondary
+ * indexes alone: the regular log's stack is split for it, see
+ * CheckpointUndoStack.
+ *
+ * Inside stage 0, the data records are not replayed: the checkpoint images
+ * have their changes, and the stacks, which the checkpoint took at its end,
+ * have the savepoints started and rolled back there.  So a savepoint, or a
+ * rollback to one, leaves the data-log stacks as they are.  Rolling them back
+ * there took back changes of the transaction that no record put back.
+ */
 static void
 walk_checkpoint_stacks(RecoveryXidState *recovery_xid_state, CommitSeqNo csn,
-					   SubTransactionId parentSubid,
+					   CheckpointStacksAction action,
+					   SubTransactionId parentSubid, SubTransactionId subid,
 					   bool flushUndoPos)
 {
 	dlist_mutable_iter miter;
@@ -2054,6 +2184,41 @@ walk_checkpoint_stacks(RecoveryXidState *recovery_xid_state, CommitSeqNo csn,
 		CheckpointUndoStack *stack = dlist_container(CheckpointUndoStack,
 													 node,
 													 miter.cur);
+		bool		rollbackAhead = true;
+
+		Assert(action == CheckpointStacksFinish || COMMITSEQNO_IS_ABORTED(csn));
+
+		if (action != CheckpointStacksFinish && !replay_start_reached &&
+			stack->kind != XidRecUndoSystem)
+			continue;
+
+		/*
+		 * The secondary half sits the rollbacks out, but a savepoint takes
+		 * the released subtransactions off it too.
+		 */
+		if (action != CheckpointStacksFinish && !toast_consistent &&
+			stack->kind == XidRecUndoRegular)
+		{
+			if (stack->filter == UndoWalkSecondary)
+			{
+				if (action == CheckpointStacksRollbackTo)
+					continue;
+				rollbackAhead = false;
+			}
+			if (stack->filter == UndoWalkAll)
+			{
+				CheckpointUndoStack *secondary;
+
+				/* inserted behind the loop's next: this walk passes it by */
+				secondary = (CheckpointUndoStack *)
+					MemoryContextAlloc(TopMemoryContext,
+									   sizeof(CheckpointUndoStack));
+				*secondary = *stack;
+				secondary->filter = UndoWalkSecondary;
+				dlist_insert_after(&stack->node, &secondary->node);
+				stack->filter = UndoWalkNoSecondary;
+			}
+		}
 
 		if ((int) stack->kind < (int) UndoLogsCount)
 		{
@@ -2076,33 +2241,48 @@ walk_checkpoint_stacks(RecoveryXidState *recovery_xid_state, CommitSeqNo csn,
 				d->oxid = recovery_oxid;
 				d->needs_wal_flush = oxid_needs_wal_flush;
 				d->kind = stack->kind;
+				d->filter = stack->filter;
 				d->undoStack = stack->undoStack;
+				Assert(action == CheckpointStacksFinish);
 				d->csn = csn;
-				d->parentSubid = parentSubid;
 				d->flush_undo_pos = flushUndoPos;
 				dlist_push_tail(&deferred_checkpoint_undo, &d->node);
 			}
 			else
 			{
 				set_cur_undo_locations(undoType, stack->undoStack);
+				undo_walk_filter = stack->filter;
 				if (flushUndoPos)
 					flush_current_undo_stack();
-				if (COMMITSEQNO_IS_ABORTED(csn))
+				if (action == CheckpointStacksSavepoint)
 				{
-					if (parentSubid == InvalidSubTransactionId)
+					checkpoint_stack_savepoint(undoType, parentSubid, subid,
+											   rollbackAhead);
+					get_cur_undo_locations(&stack->undoStack, undoType);
+				}
+				else if (COMMITSEQNO_IS_ABORTED(csn))
+				{
+					if (action == CheckpointStacksFinish)
 						apply_undo_stack(undoType, recovery_oxid,
 										 NULL, false);
 					else
+					{
 						rollback_to_savepoint(undoType, UndoStackHead,
 											  parentSubid, false);
+						get_cur_undo_locations(&stack->undoStack, undoType);
+					}
 				}
 				else
 				{
 					precommit_undo_stack(undoType, recovery_oxid, false);
 					on_commit_undo_stack(undoType, recovery_oxid, false);
 				}
+				undo_walk_filter = UndoWalkAll;
 			}
 		}
+		if (action != CheckpointStacksFinish)
+			continue;
+
 		dlist_delete(miter.cur);
 		pfree(stack);
 	}
@@ -2143,21 +2323,17 @@ apply_deferred_checkpoint_undo(void)
 		recovery_oxid = d->oxid;
 		oxid_needs_wal_flush = d->needs_wal_flush;
 		set_cur_undo_locations(undoType, d->undoStack);
+		undo_walk_filter = d->filter;
 		if (d->flush_undo_pos)
 			flush_current_undo_stack();
 		if (COMMITSEQNO_IS_ABORTED(d->csn))
-		{
-			if (d->parentSubid == InvalidSubTransactionId)
-				apply_undo_stack(undoType, recovery_oxid, NULL, false);
-			else
-				rollback_to_savepoint(undoType, UndoStackHead,
-									  d->parentSubid, false);
-		}
+			apply_undo_stack(undoType, recovery_oxid, NULL, false);
 		else
 		{
 			precommit_undo_stack(undoType, recovery_oxid, false);
 			on_commit_undo_stack(undoType, recovery_oxid, false);
 		}
+		undo_walk_filter = UndoWalkAll;
 		dlist_delete(miter.cur);
 		pfree(d);
 	}
@@ -2253,8 +2429,8 @@ recovery_finish(int worker_id)
 				csn = pg_atomic_fetch_add_u64(&TRANSAM_VARIABLES->nextCommitSeqNo, 1);
 				set_oxid_csn(recovery_oxid, csn);
 				walk_checkpoint_stacks(cur_state, csn,
-									   InvalidSubTransactionId,
-									   flush_undo_pos);
+									   CheckpointStacksFinish, InvalidSubTransactionId,
+									   InvalidSubTransactionId, flush_undo_pos);
 				cur_state->csn = csn;
 				heap_committed = true;
 				elog(LOG, "OrioleDB recovery committed oxid " UINT64_FORMAT
@@ -2267,8 +2443,8 @@ recovery_finish(int worker_id)
 				for (i = 0; i < (int) UndoLogsCount; i++)
 					apply_undo_stack((UndoLogType) i, recovery_oxid, NULL, true);
 				walk_checkpoint_stacks(cur_state, COMMITSEQNO_ABORTED,
-									   InvalidSubTransactionId,
-									   flush_undo_pos);
+									   CheckpointStacksFinish, InvalidSubTransactionId,
+									   InvalidSubTransactionId, flush_undo_pos);
 
 				/*
 				 * Remember this oxid so the after-checkpoint hook can emit a
@@ -2613,7 +2789,10 @@ flush_current_undo_stack(void)
 	rec.oxid = recovery_oxid;
 	for (i = 0; i < (int) UndoLogsCount; i++)
 	{
+		/* a half of a split checkpoint stack, see CheckpointUndoStack */
 		rec.kind = (XidRecKind) i;
+		if (i == (int) UndoLogRegular)
+			rec.kind = checkpoint_stack_rec_kind(rec.kind, undo_walk_filter);
 		get_cur_undo_locations(&rec.undoLocation, (UndoLogType) i);
 		rec.retainLocation = curRetainUndoLocations[i];
 		write_to_xids_queue(&rec);
@@ -2658,6 +2837,7 @@ recovery_finish_current_oxid(CommitSeqNo csn, XLogRecPtr ptr,
 		for (i = 0; i < (int) UndoLogsCount; i++)
 			on_commit_undo_stack((UndoLogType) i, oxid, true);
 		walk_checkpoint_stacks(cur_recovery_xid_state, csn,
+							   CheckpointStacksFinish, InvalidSubTransactionId,
 							   InvalidSubTransactionId, flush_undo_pos);
 		set_oxid_csn(oxid, COMMITSEQNO_COMMITTING);
 		csn = pg_atomic_fetch_add_u64(&TRANSAM_VARIABLES->nextCommitSeqNo, 1);
@@ -2673,6 +2853,7 @@ recovery_finish_current_oxid(CommitSeqNo csn, XLogRecPtr ptr,
 		for (i = 0; i < (int) UndoLogsCount; i++)
 			on_commit_undo_stack((UndoLogType) i, oxid, true);
 		walk_checkpoint_stacks(cur_recovery_xid_state, csn,
+							   CheckpointStacksFinish, InvalidSubTransactionId,
 							   InvalidSubTransactionId, flush_undo_pos);
 		cur_recovery_xid_state->in_finished_list = true;
 		dlist_push_tail(&finished_list,
@@ -2685,6 +2866,7 @@ recovery_finish_current_oxid(CommitSeqNo csn, XLogRecPtr ptr,
 		for (i = 0; i < (int) UndoLogsCount; i++)
 			apply_undo_stack((UndoLogType) i, oxid, NULL, true);
 		walk_checkpoint_stacks(cur_recovery_xid_state, csn,
+							   CheckpointStacksFinish, InvalidSubTransactionId,
 							   InvalidSubTransactionId, flush_undo_pos);
 		if (worker_id < 0)
 		{
@@ -2758,7 +2940,9 @@ recovery_finish_current_oxid(CommitSeqNo csn, XLogRecPtr ptr,
 }
 
 static void
-checkpoint_rollback_to_savepoint(SubTransactionId parentSubid)
+checkpoint_stacks_to_savepoint(CheckpointStacksAction action,
+							   SubTransactionId parentSubid,
+							   SubTransactionId subid)
 {
 	int			i;
 
@@ -2766,19 +2950,21 @@ checkpoint_rollback_to_savepoint(SubTransactionId parentSubid)
 		get_cur_undo_locations(&cur_recovery_xid_state->undo_stacks[i],
 							   (UndoLogType) i);
 	walk_checkpoint_stacks(cur_recovery_xid_state, COMMITSEQNO_ABORTED,
-						   parentSubid, false);
+						   action, parentSubid, subid, false);
 	for (i = 0; i < (int) UndoLogsCount; i++)
 		set_cur_undo_locations((UndoLogType) i,
 							   cur_recovery_xid_state->undo_stacks[i]);
 }
 
 void
-recovery_savepoint(SubTransactionId parentSubid, int worker_id)
+recovery_savepoint(SubTransactionId parentSubid, SubTransactionId subid,
+				   int worker_id)
 {
 	if (worker_id == -1)
-		checkpoint_rollback_to_savepoint(parentSubid);
+		checkpoint_stacks_to_savepoint(CheckpointStacksSavepoint, parentSubid,
+									   subid);
 
-	add_subxact_undo_item(parentSubid);
+	add_subxact_undo_item(parentSubid, subid);
 }
 
 void
@@ -2786,12 +2972,24 @@ recovery_rollback_to_savepoint(SubTransactionId parentSubid, int worker_id)
 {
 	int			i;
 
+	/*
+	 * The startup process gets every savepoint record.  A worker only gets
+	 * those after its first record of the transaction (see
+	 * workers_send_savepoint()): the one it lacks is before all it applied.
+	 */
 	for (i = 0; i < (int) UndoLogsCount; i++)
-		rollback_to_savepoint((UndoLogType) i, UndoStackTail,
-							  parentSubid, true);
+	{
+		if (worker_id < 0)
+			rollback_to_savepoint((UndoLogType) i, UndoStackTail,
+								  parentSubid, true);
+		else
+			rollback_to_savepoint_or_whole((UndoLogType) i, UndoStackTail,
+										   parentSubid, true);
+	}
 
 	if (worker_id == -1)
-		checkpoint_rollback_to_savepoint(parentSubid);
+		checkpoint_stacks_to_savepoint(CheckpointStacksRollbackTo,
+									   parentSubid, InvalidSubTransactionId);
 }
 
 OBTreeModifyCallbackAction
@@ -2824,6 +3022,22 @@ recovery_delete_primary_callback(BTreeDescr *descr,
 	return OBTreeCallbackActionDelete;
 }
 
+/*
+ * Does the item come from the checkpoint images, which can be ahead of the
+ * records replayed?  The items replay writes have their undo past the last
+ * location the checkpoint used.  A new item has no undo location: one an
+ * image holds ahead of a delete is the same as the delete applied, as an
+ * item put back over a deleted one has the deleted one for its undo.
+ */
+static bool
+item_from_checkpoint_image(BTreeDescr *descr, UndoLocation location)
+{
+	if (!UndoLocationIsValid(location) || descr->undoType == UndoLogNone)
+		return false;
+	return UndoLocationGetValue(location) <
+		get_undo_meta_by_type(descr->undoType)->checkpointLastLocation;
+}
+
 OBTreeModifyCallbackAction
 recovery_insert_overwrite_callback(BTreeDescr *descr,
 								   OTuple tup, OTuple *newtup, OXid oxid,
@@ -2846,7 +3060,12 @@ recovery_delete_overwrite_callback(BTreeDescr *descr,
 								   RowLockMode *lock_mode,
 								   BTreeLocationHint *hint, void *arg)
 {
-	if (XACT_INFO_WRITTEN_BY(xactInfo, oxid))
+	/*
+	 * Not an item of the transaction replay has written: taking it back
+	 * leaves nothing for a rollback to savepoint to put back.
+	 */
+	if (XACT_INFO_WRITTEN_BY(xactInfo, oxid) &&
+		item_from_checkpoint_image(descr, location))
 		return OBTreeCallbackActionUndo;
 
 	return OBTreeCallbackActionDelete;
@@ -2903,7 +3122,9 @@ recovery_insert_deleted_overwrite_callback(BTreeDescr *descr,
 										   RowLockMode *lock_mode,
 										   BTreeLocationHint *hint, void *arg)
 {
-	if (XACT_INFO_WRITTEN_BY(xactInfo, oxid))
+	/* see recovery_delete_overwrite_callback() */
+	if (XACT_INFO_WRITTEN_BY(xactInfo, oxid) &&
+		item_from_checkpoint_image(descr, location))
 		return OBTreeCallbackActionUndo;
 
 	return OBTreeCallbackActionUpdate;
@@ -3236,6 +3457,7 @@ update_run_xmin(void)
 									   (UndoLogType) j);
 
 			walk_checkpoint_stacks(state, COMMITSEQNO_ABORTED,
+								   CheckpointStacksFinish, InvalidSubTransactionId,
 								   InvalidSubTransactionId, false);
 
 			for (j = 0; j < (int) UndoLogsCount; j++)
@@ -3548,7 +3770,7 @@ recovery_write_to_xids_queue(int worker_id, uint32 requestNumber)
 														 node,
 														 iter.cur);
 
-			rec.kind = stack->kind;
+			rec.kind = checkpoint_stack_rec_kind(stack->kind, stack->filter);
 			rec.undoLocation = stack->undoStack;
 			rec.retainLocation = ((int) stack->kind < (int) UndoLogsCount)
 				? state->retain_locs[(UndoLogType) stack->kind]
@@ -3695,7 +3917,8 @@ save_state_to_file(int worker_id)
 			WorkerUndoTempCheckpointStack tempStack;
 
 			memset(&tempStack, 0, sizeof(tempStack));
-			tempStack.kind = stack->kind;
+			tempStack.kind = checkpoint_stack_rec_kind(stack->kind,
+													   stack->filter);
 			tempStack.undoStack = stack->undoStack;
 
 			if (OFileWrite(tempFile, (char *) &tempStack, sizeof(tempStack),
@@ -3765,7 +3988,8 @@ recovery_load_state_from_file(int worker_id, uint32 chkpnum, bool shutdown)
 		if (!COMMITSEQNO_IS_INPROGRESS(entry.csn))
 		{
 			/* Still need to skip checkpoint stack entries */
-			offset += entry.numCheckpointStacks * sizeof(CheckpointUndoStack);
+			offset += entry.numCheckpointStacks *
+				sizeof(WorkerUndoTempCheckpointStack);
 			continue;
 		}
 
@@ -3786,6 +4010,8 @@ recovery_load_state_from_file(int worker_id, uint32 chkpnum, bool shutdown)
 		{
 			XidFileRec	rec;
 			WorkerUndoTempCheckpointStack stack;
+			UndoWalkFilter filter;
+			XidRecKind	kind;
 
 			if (OFileRead(tempFile, (char *) &stack, sizeof(stack), offset,
 						  WAIT_EVENT_DATA_FILE_READ) != sizeof(stack))
@@ -3796,11 +4022,12 @@ recovery_load_state_from_file(int worker_id, uint32 chkpnum, bool shutdown)
 			offset += sizeof(stack);
 
 			/* Write checkpoint stack to XID queue */
+			kind = checkpoint_stack_kind(stack.kind, &filter);
 			rec.oxid = entry.oxid;
 			rec.kind = stack.kind;
 			rec.undoLocation = stack.undoStack;
-			rec.retainLocation = ((int) stack.kind < (int) UndoLogsCount)
-				? entry.undoRetainLocs[(UndoLogType) stack.kind]
+			rec.retainLocation = ((int) kind < (int) UndoLogsCount)
+				? entry.undoRetainLocs[(UndoLogType) kind]
 				: InvalidUndoLocation;
 			write_to_xids_queue(&rec);
 		}
@@ -3817,6 +4044,73 @@ recovery_load_state_from_file(int worker_id, uint32 chkpnum, bool shutdown)
 	pfree(filename);
 }
 
+/*
+ * The startup process leaves with recovery not over, at a shutdown say.  Send
+ * the workers what it holds for them and let them go: they apply all of it
+ * before they exit (see recovery_queue_process()), and the shutdown
+ * restartpoint, written once they are gone, has it in its images.  Leaving it
+ * in the buffers, or the workers leaving at the shutdown request with it still
+ * in their queues, lost it: the restartpoint replays from where the startup
+ * process had got to.
+ *
+ * No interrupts here: the process is on its way out.  A send cut short keeps
+ * its buffer as it was, and finishing it is sending the same buffer again.
+ */
+static void
+send_workers_rest_on_exit(void)
+{
+	int			i;
+	int			finish;
+
+	if (*recovery_single_process || workers_pool == NULL)
+		return;
+
+	/* the index build workers are the leader's to send to */
+	finish = recovery_idx_pool_size_guc ? index_build_leader : recovery_last_worker;
+	for (i = 0; i <= finish; i++)
+	{
+		RecoveryWorkerState *state = &workers_pool[i];
+
+		if (state->queue == NULL)
+			continue;
+
+		while (state->queue_buf_len > 0)
+		{
+			shm_mq_result result;
+			BgwHandleStatus status;
+			pid_t		pid;
+
+			result = shm_mq_send(state->queue, state->queue_buf_len,
+								 state->queue_buf, true, true);
+			if (result != SHM_MQ_WOULD_BLOCK)
+				break;
+
+			status = GetBackgroundWorkerPid(state->handle, &pid);
+			if (status != BGWH_STARTED && status != BGWH_NOT_YET_STARTED)
+				break;
+			(void) WaitLatch(MyLatch,
+							 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							 RECOVERY_QUEUE_FLUSH_WAIT_MS,
+							 O_WAIT_EVENT_MQ_SEND);
+			ResetLatch(MyLatch);
+		}
+		state->queue_buf_len = 0;
+		shm_mq_detach(state->queue);
+		state->queue = NULL;
+	}
+}
+
+/*
+ * Is the startup process still there?  The recovery workers wait for what it
+ * sends them until it is gone.
+ */
+bool
+recovery_startup_running(void)
+{
+	return recovery_undo_loc_flush->startupPid > 0 &&
+		is_process_running(recovery_undo_loc_flush->startupPid);
+}
+
 void
 recovery_on_proc_exit(int code, Datum arg)
 {
@@ -3829,7 +4123,10 @@ recovery_on_proc_exit(int code, Datum arg)
 	 * picked up by the checkpointer.
 	 */
 	if (worker_id < 0)
+	{
+		send_workers_rest_on_exit();
 		return;
+	}
 
 	elog(LOG, "recovery on exit: %d", worker_id);
 
@@ -3857,6 +4154,138 @@ o_handle_startup_proc_interrupts_hook(void)
 		update_proc_retain_undo_location(-1);
 
 	update_recovery_undo_loc_flush(*recovery_single_process, -1);
+	serve_workers_sync_request();
+}
+
+/*
+ * Bring the recovery workers up to the replay position for a restartpoint
+ * that asked for it, see recovery_sync_workers().
+ *
+ * Not while a message to a worker is half sent: the queue buffer has to stay
+ * as it is until the send is done.  The position is that of the last record
+ * replayed in full, so the request can be served in the middle of a record as
+ * well.
+ */
+static void
+serve_workers_sync_request(void)
+{
+	static bool serving = false;
+	uint32		request;
+	XLogRecPtr	ptr;
+
+	request = pg_atomic_read_u32(&recovery_undo_loc_flush->workersSyncRequest);
+	if (request == pg_atomic_read_u32(&recovery_undo_loc_flush->workersSyncServed) ||
+		serving || queue_flush_in_progress)
+		return;
+
+	serving = true;
+	ptr = GetXLogReplayRecPtr(NULL);
+	/* nothing went to the workers before their queues are there */
+	if (!*recovery_single_process && workers_pool != NULL &&
+		workers_pool[0].queue != NULL && !unexpected_worker_detach)
+		workers_synchronize(ptr, true);
+	pg_atomic_write_u64(&recovery_undo_loc_flush->workersSyncedPtr, ptr);
+	pg_write_barrier();
+	pg_atomic_write_u32(&recovery_undo_loc_flush->workersSyncServed, request);
+	serving = false;
+}
+
+/*
+ * Wait until the recovery workers have applied everything the startup process
+ * has replayed, and return how far that is.
+ *
+ * A restartpoint pins its replay positions to what the startup process has
+ * replayed, but the workers apply it later.  A change the workers had not
+ * applied yet when the trees were written is in no image, and below the
+ * replay start: a restart from the restartpoint lost it.  The position
+ * returned here is at least the restartpoint's redo, so the WAL from it on is
+ * kept.
+ *
+ * Called by the checkpointer holding no lock: the startup process can wait
+ * for the checkpointer to absorb a barrier (see
+ * wait_recovery_undo_loc_flushed()).  InvalidXLogRecPtr when there is nothing
+ * to wait for: OrioleDB recovery is not running, or it is over -- the startup
+ * process then waits for the end-of-recovery checkpoint, behind this
+ * restartpoint -- or the startup process is gone.  It serves the request
+ * between records and while it waits for WAL.
+ *
+ * It does not serve while it waits for a checkpoint itself: the replay of
+ * CREATE DATABASE asks for one and waits for it (dbase_redo()), and this is
+ * the restartpoint it waits for.  Waiting for it then stopped replay for
+ * good.  The workers get there on their own instead: what the startup process
+ * has sent them they apply, and recovery_ptr stops short of what it has not
+ * sent yet (publish_recovery_ptr()).  The position is what they had applied
+ * when they were done with that, which is as far as the restartpoint can pin
+ * its positions anyway.
+ */
+/*
+ * Is the startup process waiting for the checkpointer to do a checkpoint?
+ */
+static bool
+startup_waits_for_checkpoint(void)
+{
+	PGPROC	   *proc = AuxiliaryPidGetProc(recovery_undo_loc_flush->startupPid);
+	uint32		waitInfo;
+
+	if (proc == NULL)
+		return false;
+	waitInfo = proc->wait_event_info;
+	return waitInfo == WAIT_EVENT_CHECKPOINT_START ||
+		waitInfo == WAIT_EVENT_CHECKPOINT_DONE;
+}
+
+/*
+ * The position the recovery workers have applied up to once they are done
+ * with what the startup process sent them, for a startup process that cannot
+ * bring them further (see recovery_sync_workers()).
+ */
+static XLogRecPtr
+wait_workers_applied(void)
+{
+	XLogRecPtr	ptr;
+
+	if (*recovery_single_process)
+		return GetXLogReplayRecPtr(NULL);
+
+	ptr = pg_atomic_read_u64(recovery_ptr);
+	while (get_workers_commit_ptr() < ptr)
+	{
+		if (!is_recovery_in_progress() ||
+			recovery_undo_loc_flush->completedCheckpointNumber == UINT32_MAX)
+			return InvalidXLogRecPtr;
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 10, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+	return ptr;
+}
+
+XLogRecPtr
+recovery_sync_workers(void)
+{
+	uint32		request;
+
+	request = pg_atomic_add_fetch_u32(&recovery_undo_loc_flush->workersSyncRequest, 1);
+	while ((int32) (pg_atomic_read_u32(&recovery_undo_loc_flush->workersSyncServed) - request) < 0)
+	{
+		if (!is_recovery_in_progress() ||
+			recovery_undo_loc_flush->completedCheckpointNumber == UINT32_MAX ||
+			recovery_undo_loc_flush->startupPid <= 0 ||
+			!is_process_running(recovery_undo_loc_flush->startupPid))
+			return InvalidXLogRecPtr;
+		if (startup_waits_for_checkpoint())
+			return wait_workers_applied();
+		WakeupRecovery();
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 10, PG_WAIT_EXTENSION);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+	}
+	pg_read_barrier();
+	return pg_atomic_read_u64(&recovery_undo_loc_flush->workersSyncedPtr);
 }
 
 static void
@@ -3881,7 +4310,10 @@ abort_recovery(RecoveryWorkerState *workers_pool, bool send_to_idx_pool)
 	for (i = start; i <= finish; i++)
 	{
 		if (workers_pool[i].queue != NULL)
+		{
 			shm_mq_detach(workers_pool[i].queue);
+			workers_pool[i].queue = NULL;
+		}
 
 		if (workers_pool[i].handle != NULL)
 		{
@@ -5352,9 +5784,11 @@ replay_on_record(WalReaderState *r, WalRecord *rec)
 				elog(LOG, "WAL record %s lacks XID state", wal_type_name(rec->type));
 				return WALPARSE_BAD_TYPE;
 			}
-			recovery_savepoint(rec->u.savepoint.parentSubid, -1);
+			recovery_savepoint(rec->u.savepoint.parentSubid,
+							   rec->u.savepoint.subid, -1);
 			if (!ctx->single)
-				workers_send_savepoint(rec->u.savepoint.parentSubid);
+				workers_send_savepoint(rec->u.savepoint.parentSubid,
+									   rec->u.savepoint.subid);
 			break;
 
 		case WAL_REC_ROLLBACK_TO_SAVEPOINT:
@@ -5707,6 +6141,8 @@ worker_send_msg(int worker_id, Pointer msg, uint64 msg_size)
 	if ((RECOVERY_QUEUE_BUF_SIZE - state->queue_buf_len) < msg_size)
 		worker_queue_flush(worker_id);
 
+	if (state->queue_buf_len == 0)
+		state->queue_buf_ptr = redo_record_ptr;
 	memcpy(state->queue_buf + state->queue_buf_len, msg, msg_size);
 	state->queue_buf_len += msg_size;
 }
@@ -5980,7 +6416,7 @@ workers_send_finish(bool send_to_idx_pool)
  * Sends savepoint message to workers with active the oxid in the pool.
  */
 static void
-workers_send_savepoint(SubTransactionId parentSubId)
+workers_send_savepoint(SubTransactionId parentSubId, SubTransactionId subId)
 {
 	RecoveryWorkerState *state;
 	RecoveryMsgSavepoint msg;
@@ -5991,6 +6427,7 @@ workers_send_savepoint(SubTransactionId parentSubId)
 	msg.header.type = RecoveryMsgTypeSavepoint;
 	msg.oxid = cur_recovery_xid_state->oxid;
 	msg.parentSubId = parentSubId;
+	msg.subId = subId;
 
 	for (i = 0; i < recovery_pool_size_guc; i++)
 	{
@@ -6044,7 +6481,7 @@ workers_send_rollback_to_savepoint(XLogRecPtr ptr,
 			}
 		}
 	}
-	pg_atomic_write_u64(recovery_ptr, ptr);
+	publish_recovery_ptr(ptr);
 }
 
 /*
@@ -6093,7 +6530,7 @@ workers_send_oxid_finish(XLogRecPtr ptr, bool needsFeedback, bool commit)
 			}
 		}
 	}
-	pg_atomic_write_u64(recovery_ptr, ptr);
+	publish_recovery_ptr(ptr);
 }
 
 /*
@@ -6119,7 +6556,21 @@ workers_synchronize(XLogRecPtr ptr, bool send_synchronize)
 			worker_send_msg(i, (Pointer) &sync_msg, sizeof(sync_msg));
 			worker_queue_flush(i);
 		}
-		pg_atomic_write_u64(recovery_ptr, ptr);
+		publish_recovery_ptr(ptr);
+	}
+	else
+	{
+		/*
+		 * A worker with messages in its queue_buf gets no further than them
+		 * until they are sent, nor do the others, see publish_recovery_ptr().
+		 */
+		int			finish = recovery_idx_pool_size_guc ? index_build_leader : recovery_last_worker;
+
+		for (i = 0; i <= finish; i++)
+		{
+			if (workers_pool[i].queue_buf_len > 0)
+				worker_queue_flush(i);
+		}
 	}
 
 	for (i = 0; i < recovery_pool_size_guc && !unexpected_worker_detach; i++)
@@ -6215,7 +6666,9 @@ worker_queue_flush(int worker_id)
 					   RECOVERY_QUEUE_FLUSH_WAIT_MS,
 					   O_WAIT_EVENT_MQ_SEND);
 		ResetLatch(MyLatch);
+		queue_flush_in_progress = true;
 		o_worker_handle_interrupts();
+		queue_flush_in_progress = false;
 
 		if (!(rc & WL_TIMEOUT))
 			continue;
@@ -6235,6 +6688,45 @@ worker_queue_flush(int worker_id)
 		return;
 	}
 	Assert(result == SHM_MQ_SUCCESS);
+	publish_recovery_ptr(InvalidXLogRecPtr);
+}
+
+/*
+ * Moves recovery_ptr up to ptr, but not past a record whose messages to a
+ * worker are still in its queue_buf.  A worker that finds its queue empty
+ * takes recovery_ptr for its own position (see recovery_queue_read()): one
+ * past messages it has not got yet made workers_synchronize() go on before
+ * they were applied.
+ *
+ * A hot standby sends them instead: the workers' positions are the replay
+ * position it reports, which is not to wait for a transaction that goes on.
+ */
+static void
+publish_recovery_ptr(XLogRecPtr ptr)
+{
+	static bool publishing = false;
+	XLogRecPtr	value;
+	int			i;
+	int			finish;
+
+	if (!AmStartupProcess() || workers_pool == NULL || publishing)
+		return;
+
+	publishing = true;
+	recovery_ptr_target = Max(recovery_ptr_target, ptr);
+	value = recovery_ptr_target;
+	finish = recovery_idx_pool_size_guc ? index_build_leader : recovery_last_worker;
+	for (i = 0; i <= finish; i++)
+	{
+		if (workers_pool[i].queue_buf_len > 0 && EnableHotStandby &&
+			workers_pool[i].queue != NULL)
+			worker_queue_flush(i);
+		if (workers_pool[i].queue_buf_len > 0)
+			value = Min(value, workers_pool[i].queue_buf_ptr);
+	}
+	if (value > pg_atomic_read_u64(recovery_ptr))
+		pg_atomic_write_u64(recovery_ptr, value);
+	publishing = false;
 }
 
 /*

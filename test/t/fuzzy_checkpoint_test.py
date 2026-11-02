@@ -237,6 +237,90 @@ class SysTreeStageTest(BaseTest):
 		self.assertEqual(
 		    node.execute("SELECT count(*) FROM t WHERE v <> id;")[0][0], 0)
 
+	def savepoints_in_window(self, before, in_window, after, want):
+		"""`before` runs before the checkpoint, `in_window` while it is
+		parked -- its WAL in the stage-0 window -- and `after` once it is
+		done; then commit and crash.  Recovery replays no data record of
+		the window, so the savepoints there have nothing to roll back."""
+		node = self.node
+		node.append_conf("orioledb.enable_stopevents = on\n")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE t (id int PRIMARY KEY, v int NOT NULL) USING orioledb;
+			CREATE INDEX t_v ON t (v, id);
+			INSERT INTO t SELECT i, i FROM generate_series(1, 100) i;
+			CREATE TABLE o_pad (id int PRIMARY KEY, v text) USING orioledb;
+			CHECKPOINT;
+		""")
+		con = node.connect()
+		con.begin()
+		for q in before:
+			con.execute(q)
+		t, err = self._park_checkpoint(node)
+		for q in in_window:
+			con.execute(q)
+		# more than the local WAL buffer holds: the window's records go out
+		con.execute("INSERT INTO o_pad SELECT g, repeat(md5(g::text), 10) "
+		            "FROM generate_series(1, 100) g")
+		node.safe_psql(
+		    "SELECT pg_stopevent_reset('checkpoint_before_replay_start');")
+		t.join()
+		if err:
+			raise err[0]
+		for q in after:
+			con.execute(q)
+		con.commit()
+		con.close()
+		node.stop(['-m', 'immediate'])
+		node.start()
+		for q in ("""SET enable_indexscan = off; SET enable_bitmapscan = off;
+				SET enable_indexonlyscan = off;
+				SELECT id, v FROM t ORDER BY id""",
+		          """SET enable_seqscan = off; SET enable_bitmapscan = off;
+				SELECT id, v FROM t WHERE v >= 0 ORDER BY id"""):
+			self.assertEqual(sorted(want.items()), node.execute(q))
+
+	def test_stage0_rollback_to_savepoint_then_changes(self):
+		"""The changes made after a rollback to a savepoint in the window
+		go with the next rollback to it, after the window, only."""
+		want = {i: i for i in range(1, 101)}
+		want[7] = 70
+		self.savepoints_in_window(["UPDATE t SET v = 70 WHERE id = 7"], [
+		    "SAVEPOINT s", "UPDATE t SET v = 60 WHERE id = 6",
+		    "INSERT INTO t VALUES (300, 3)", "ROLLBACK TO SAVEPOINT s",
+		    "UPDATE t SET v = 80 WHERE id = 8",
+		    "INSERT INTO t VALUES (200, 2)", "DELETE FROM t WHERE id = 5"
+		], ["UPDATE t SET v = 90 WHERE id = 9", "ROLLBACK TO SAVEPOINT s"],
+		                          want)
+
+	def test_stage0_rollback_to_savepoint_then_commit(self):
+		"""The changes made after a rollback to a savepoint in the window
+		stay."""
+		want = {i: i for i in range(1, 101)}
+		del want[5]
+		want.update({7: 70, 8: 80, 200: 2})
+		self.savepoints_in_window(["UPDATE t SET v = 70 WHERE id = 7"], [
+		    "SAVEPOINT s", "UPDATE t SET v = 60 WHERE id = 6",
+		    "INSERT INTO t VALUES (300, 3)", "ROLLBACK TO SAVEPOINT s",
+		    "UPDATE t SET v = 80 WHERE id = 8",
+		    "INSERT INTO t VALUES (200, 2)", "DELETE FROM t WHERE id = 5"
+		], [], want)
+
+	def test_stage0_savepoint_after_release(self):
+		"""A savepoint released, another started in the window."""
+		want = {i: i for i in range(1, 101)}
+		want.update({6: 60, 7: 70, 200: 2})
+		self.savepoints_in_window([
+		    "SAVEPOINT s", "UPDATE t SET v = 60 WHERE id = 6"
+		], [
+		    "RELEASE SAVEPOINT s", "SAVEPOINT s",
+		    "UPDATE t SET v = 70 WHERE id = 7", "INSERT INTO t VALUES (200, 2)"
+		], [
+		    "UPDATE t SET v = 90 WHERE id = 9", "ROLLBACK TO SAVEPOINT s",
+		    "UPDATE t SET v = 70 WHERE id = 7", "INSERT INTO t VALUES (200, 2)"
+		], want)
+
 
 class SysTreeXidsGapTest(BaseTest):
 	"""

@@ -301,6 +301,7 @@ checkpoint_shmem_init(Pointer ptr, bool found)
 			pg_atomic_init_u64(&undo_meta->checkpointRetainEndLocation, 0);
 			pg_atomic_init_u64(&undo_meta->cleanedCheckpointStartLocation, 0);
 			pg_atomic_init_u64(&undo_meta->cleanedCheckpointEndLocation, 0);
+			undo_meta->checkpointLastLocation = 0;
 		}
 
 		pg_atomic_init_u64(&xid_meta->nextXid, FirstNormalTransactionId);
@@ -386,6 +387,7 @@ checkpoint_shmem_init(Pointer ptr, bool found)
 			pg_atomic_write_u64(&undo_meta->checkpointRetainEndLocation, undo_info->checkpointRetainEndLocation);
 			pg_atomic_write_u64(&undo_meta->cleanedCheckpointStartLocation, undo_info->checkpointRetainStartLocation);
 			pg_atomic_write_u64(&undo_meta->cleanedCheckpointEndLocation, undo_info->checkpointRetainEndLocation);
+			undo_meta->checkpointLastLocation = undo_info->lastUndoLocation;
 		}
 
 		/*
@@ -1717,6 +1719,12 @@ o_move_latest_chkp_num(Oid datoid, Oid relnode, Oid old_tablespace,
 }
 
 /*
+ * How far the recovery workers had applied the WAL when a restartpoint
+ * started, see recovery_sync_workers().
+ */
+static XLogRecPtr checkpoint_workers_applied_ptr = InvalidXLogRecPtr;
+
+/*
  * Get appropriate xlog position to use in checkpoint control file.
  */
 static XLogRecPtr
@@ -1724,8 +1732,12 @@ get_checkpoint_xlog_ptr(void)
 {
 	if (is_recovery_in_progress())
 	{
-		/* FIXME: synchronize recovery workers */
-		return GetCurrentReplayRecPtr(NULL);
+		XLogRecPtr	ptr = GetCurrentReplayRecPtr(NULL);
+
+		/* no further than the recovery workers had got to */
+		if (!XLogRecPtrIsInvalid(checkpoint_workers_applied_ptr))
+			ptr = Min(ptr, checkpoint_workers_applied_ptr);
+		return ptr;
 	}
 	else
 		return GetXLogInsertRecPtr();
@@ -1840,6 +1852,15 @@ o_perform_checkpoint_guts(int flags)
 
 	elog(LOG, "orioledb checkpoint %u started",
 		 checkpoint_state->lastCheckpointNumber + 1);
+
+	/*
+	 * A restartpoint pins its replay positions no further than the recovery
+	 * workers have applied the WAL.  At shutdown the startup process is gone,
+	 * and with it whoever could bring them there.
+	 */
+	checkpoint_workers_applied_ptr = InvalidXLogRecPtr;
+	if (is_recovery_in_progress() && !(flags & CHECKPOINT_IS_SHUTDOWN))
+		checkpoint_workers_applied_ptr = recovery_sync_workers();
 
 	o_set_syscache_hooks();
 	if (!OidIsValid(MyDatabaseId))
