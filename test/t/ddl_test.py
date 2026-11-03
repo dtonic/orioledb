@@ -278,3 +278,25 @@ class DDLTest(BaseTest):
 			dropper.close()
 
 		node.stop()
+
+	def test_create_matview_row_count(self):
+		node = self.node
+		node.start()
+		node.safe_psql("CREATE EXTENSION orioledb;")
+		with node.connect() as con:
+			cur = con.connection.cursor()
+			cur.execute("""
+				CREATE MATERIALIZED VIEW o_test_mv USING orioledb
+					AS SELECT g FROM generate_series(1, 3) g;
+			""")
+			self.assertEqual("SELECT 3", cur.statusmessage)
+			self.assertEqual(3, cur.rowcount)
+			cur.execute("""
+				CREATE MATERIALIZED VIEW IF NOT EXISTS o_test_mv USING orioledb
+					AS SELECT 1;
+			""")
+			self.assertEqual("CREATE MATERIALIZED VIEW", cur.statusmessage)
+			cur.execute("SELECT count(*) FROM o_test_mv;")
+			self.assertEqual((3, ), cur.fetchone())
+			con.commit()
+		node.stop()
