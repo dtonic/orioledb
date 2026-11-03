@@ -467,6 +467,34 @@ SELECT * FROM o_test_matview;
       100 |       3 | b         |     8
 (2 rows)
 
+-- IF NOT EXISTS skips an existing populated orioledb matview
+CREATE MATERIALIZED VIEW IF NOT EXISTS o_test_matview USING orioledb
+	AS SELECT 1;
+NOTICE:  relation "o_test_matview" already exists, skipping
+CREATE MATERIALIZED VIEW o_test_matview USING orioledb AS SELECT 1;
+ERROR:  relation "o_test_matview" already exists
+BEGIN;
+CREATE MATERIALIZED VIEW IF NOT EXISTS o_test_matview USING orioledb
+	AS SELECT 1;
+NOTICE:  relation "o_test_matview" already exists, skipping
+SELECT count(*) FROM o_test_matview;
+ count 
+-------
+     2
+(1 row)
+
+COMMIT;
+CREATE MATERIALIZED VIEW IF NOT EXISTS o_test_matview_ine USING orioledb
+	AS SELECT g FROM generate_series(1, 3) g;
+SELECT * FROM o_test_matview_ine;
+ g 
+---
+ 1
+ 2
+ 3
+(3 rows)
+
+DROP MATERIALIZED VIEW o_test_matview_ine;
 CREATE MATERIALIZED VIEW o_test_matview_no_data
 	(order_id, item_id, quantity, price) USING orioledb
 	AS (VALUES (100, 1, 4, nextval('o_matview_seq'::regclass)),

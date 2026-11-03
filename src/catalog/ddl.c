@@ -147,6 +147,7 @@ static bool in_rewrite = false;
 static bool in_cluster_rebuild = false;
 List	   *reindex_list = NIL;
 static Query *savedDataQuery = NULL;
+static uint64 savedDataProcessed = 0;
 static IndexBuildResult o_pkey_result = {0};
 bool		o_in_add_column = false;
 static CreateStmt *create_stmt = NULL;
@@ -1026,6 +1027,7 @@ orioledb_utility_command(PlannedStmt *pstmt,
 		o_saved_reltablespace = InvalidOid;
 		ORelOidsSetInvalid(saved_oids);
 		savedDataQuery = NULL;
+		savedDataProcessed = 0;
 		in_nontransactional_truncate = false;
 		in_cluster_rebuild = false;
 	}
@@ -1624,29 +1626,47 @@ orioledb_utility_command(PlannedStmt *pstmt,
 				 (!into->accessMethod && strcmp(default_table_access_method, "orioledb") == 0)))
 			{
 				Query	   *query = castNode(Query, stmt->query);
-				ObjectAddress address;
 
 				Assert(query->commandType == CMD_SELECT);
 
-				address = create_ctas_nodata(query->targetList, into);
-
 				/*
-				 * We cannot just use rel->rd_rules in access hook, because it
-				 * recalculates expression two times if it executes postgreses
-				 * code, even if it skips insertion to table
+				 * Like ExecCreateTableAs(): with IF NOT EXISTS and an
+				 * existing relation, CreateTableAsRelExists() emits a NOTICE
+				 * and we leave qc alone, so the default command tag is
+				 * reported.
 				 */
-				savedDataQuery = (Query *) copyObject(into->viewQuery);
-#if PG_VERSION_NUM >= 180000
-				RefreshMatViewByOid(address.objectId, true, true, false,
-									queryString, qc);
-#else
-				RefreshMatViewByOid(address.objectId, true, false,
-									queryString, NULL, qc);
-#endif
-				savedDataQuery = NULL;
+				if (!CreateTableAsRelExists(stmt))
+				{
+					ObjectAddress address;
 
-				if (qc)
-					qc->commandTag = CMDTAG_SELECT;
+					address = create_ctas_nodata(query->targetList, into);
+
+					/*
+					 * We cannot just use rel->rd_rules in access hook,
+					 * because it recalculates expression two times if it
+					 * executes postgreses code, even if it skips insertion to
+					 * table
+					 */
+					savedDataQuery = (Query *) copyObject(into->viewQuery);
+					savedDataProcessed = 0;
+#if PG_VERSION_NUM >= 180000
+					RefreshMatViewByOid(address.objectId, true, true, false,
+										queryString, qc);
+#else
+					RefreshMatViewByOid(address.objectId, true, false,
+										queryString, NULL, qc);
+#endif
+					savedDataQuery = NULL;
+
+					/*
+					 * The rows are inserted by rewrite_matview(), not by the
+					 * refresh itself (it runs with skipData), so report its
+					 * count.
+					 */
+					if (qc)
+						SetQueryCompletion(qc, CMDTAG_SELECT,
+										   savedDataProcessed);
+				}
 
 				call_next = false;
 			}
@@ -2597,6 +2617,7 @@ rewrite_matview(Relation rel, OTable *old_o_table, OTable *new_o_table)
 #endif
 
 	pgstat_count_heap_insert(rel, queryDesc->estate->es_processed);
+	savedDataProcessed = queryDesc->estate->es_processed;
 
 	/* and clean up */
 	ExecutorFinish(queryDesc);
