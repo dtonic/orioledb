@@ -221,6 +221,71 @@ class S3LoaderTest(unittest.TestCase):
 		l.forget_listing(2)
 		self.assertIsNone(l.assemble_segment(2, 2))
 
+	def test_chunks_the_gc_keeps_removing_do_not_refuse_a_later_segment(self):
+		"""A writer that goes on archiving segments has its GC remove their
+		chunks in the background while a load lists the timeline: on a busy
+		writer some chunk it listed is gone by the time it asks for it, on
+		every listing.  Such a chunk holds archived WAL only, so a segment
+		not archived yet is assembled without it (it was refused after ten
+		listings: "the WAL chunks of segment ... keep going")."""
+
+		class GoneOnGet(FakeS3):
+			"""Lists the chunks of the archived segment 1 but has them gone
+			when they are asked for, as a GC deleting them at that pace."""
+
+			def __init__(self, objects, gone):
+				super().__init__(objects)
+				self.gone = set(gone)
+
+			def get_object(self, Bucket, Key, Range=None):
+				if Key in self.gone:
+					raise ClientError({'Error': {'Code': 'NoSuchKey', 'Message': Key}},
+					                  'GetObject')
+				return super().get_object(Bucket, Key, Range)
+
+		lo = 2 * SEG
+		objects = {f"wal/{self.seg_name(1, 1)}": bytes([1]) * SEG}
+		for seq in range(5):
+			objects[self.chunk_key(1, seq)] = chunk(
+			    3, SEG + seq * 1000, SEG + (seq + 1) * 1000)
+		objects[self.chunk_key(1, 5)] = chunk(3, SEG + 5000, lo + 1000)
+		objects[self.chunk_key(1, 6)] = chunk(3, lo + 1000, lo + 2000,
+		                                      body=b'S' * 1000)
+		l = self.make_loader(objects)
+		l.s3 = GoneOnGet(l.s3.objects, [self.chunk_key(1, seq) for seq in range(5)])
+		seg = l.restore_segment(1, 2)
+		self.assertEqual(bytes([3]) * 1000, bytes(seg[0:1000]))
+		self.assertEqual(b'S' * 1000, bytes(seg[1000:2000]))
+		self.assertEqual(bytes(SEG - 2000), bytes(seg[2000:]))
+
+	def test_a_chunk_gone_with_its_segment_archived_meanwhile_takes_the_archive(self):
+		"""The segment being assembled is archived while its chunks are read,
+		and the GC removes the last of them: assembled from the ones left it
+		would end early without a gap to tell, so the archived segment is
+		read instead."""
+		lo = 2 * SEG
+		archived = bytes([7]) * SEG
+
+		class ArchivedOnGet(FakeS3):
+
+			def __init__(self, objects, key, segment):
+				super().__init__(objects)
+				self.key, self.segment = key, segment
+
+			def get_object(self, Bucket, Key, Range=None):
+				if Key == self.key:
+					self.objects[self.segment] = archived
+					del self.objects[Key]
+				return super().get_object(Bucket, Key, Range)
+
+		l = self.make_loader({
+		    self.chunk_key(1, 0): chunk(3, lo, lo + 1000),
+		    self.chunk_key(1, 1): chunk(3, lo + 1000, lo + 2000),
+		})
+		l.s3 = ArchivedOnGet(l.s3.objects, self.chunk_key(1, 1),
+		                     f"wal/{self.seg_name(1, 2)}")
+		self.assertEqual(archived, bytes(l.restore_segment(1, 2)))
+
 	def test_a_chunk_removed_between_list_and_get_is_listed_again(self):
 		"""A writer going on archives a segment and removes its chunks while
 		a load reads the timeline's chunks for where they end: the chunk it

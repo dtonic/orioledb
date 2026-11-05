@@ -724,15 +724,9 @@ class OrioledbS3ObjectLoader:
 			self.write_wal(f"{latest:08X}.history", history)
 
 		# a chunk listed and gone before it was read was removed once its
-		# segment was archived, as the writer goes on: list again
-		for attempt in range(10):
-			try:
-				chunks = self.chunks_of(latest)
-				break
-			except ChunkGone:
-				if attempt == 9:
-					raise
-				self.forget_listing(latest)
+		# segment was archived, as the writer goes on: chunks_of leaves it
+		# out, and the newest chunk, which tells where they end, stays
+		chunks = self.chunks_of(latest)
 		# every key counts for where the chunks end: a terminator too; the
 		# cache holds what the bucket listed
 		seqs = sorted(int(name) for name in os.listdir(self.chunk_cache(latest))
@@ -902,10 +896,13 @@ class OrioledbS3ObjectLoader:
 				result = seq
 		return result
 
-	def chunks_of(self, tli, lo=None):
+	def chunks_of(self, tli, lo=None, gone=None):
 		"""(seq, magic, start, end) of a timeline's chunks in order; the ones
 		not cached yet are fetched in parallel, and cached ones the bucket no
-		longer has are dropped.  For a segment starting at lo, the chunks
+		longer has are dropped.  A chunk listed and gone before it is fetched
+		was removed by the GC, which removes only chunks whose WAL is in
+		archived segments: it is left out, and its number added to gone
+		when given.  For a segment starting at lo, the chunks
 		from the last cached one that ends at or before lo on: the ones
 		after it that are cached, and the ones the bucket lists after the
 		last cached.  A chunk never changes once put, so a cached one stands
@@ -958,13 +955,15 @@ class OrioledbS3ObjectLoader:
 				    Key=self.chunk_key(tli, seq))['Body'].read()
 			except ClientError as e:
 				if e.response['Error']['Code'] in ("404", "NoSuchKey"):
-					raise ChunkGone(tli, seq)
+					missing.add(seq)
+					return
 				raise
 			tmp = f"{path}.tmp{os.getpid()}"
 			with open(tmp, 'wb') as f:
 				f.write(body)
 			os.replace(tmp, path)
 
+		missing = set()
 		with ThreadPoolExecutor(MAX_CONCURRENCY) as executor:
 			list(executor.map(fetch, seqs))
 		if seqs:
@@ -975,7 +974,11 @@ class OrioledbS3ObjectLoader:
 		result = []
 		fence = self.fence_through(terminators, after) \
 		    if after is not None else 0
+		if gone is not None:
+			gone.update(missing)
 		for seq in seqs:
+			if seq in missing:
+				continue
 			with open(os.path.join(cache, str(seq)), 'rb') as f:
 				magic, _, token, start, end = struct.unpack('<IIQQQ', f.read(32))
 			if magic == TERMINATOR_MAGIC:
@@ -1002,14 +1005,10 @@ class OrioledbS3ObjectLoader:
 		chunks of the writer it fenced off.  None when the bucket has nothing
 		of the segment.
 		"""
-		# a chunk listed and gone before it was read was removed once its
-		# segment was archived: ask for the segment again
 		relists = 0
 		for _ in range(10):
 			try:
 				seg = self.assemble_segment(tli, segno)
-			except ChunkGone:
-				continue
 			except ChunkGap:
 				# a store whose listing lags its writes (RustFS) can list a
 				# chunk and not the one put just before it, for a second or
@@ -1078,7 +1077,8 @@ class OrioledbS3ObjectLoader:
 			seg[0:switch - lo] = parent[0:switch - lo]
 			pos = switch
 		first = None
-		for seq, magic, start, end in self.chunks_of(tli, lo):
+		gone = set()
+		for seq, magic, start, end in self.chunks_of(tli, lo, gone):
 			if magic == TERMINATOR_MAGIC:
 				continue
 			if magic != CHUNK_MAGIC:
@@ -1112,6 +1112,14 @@ class OrioledbS3ObjectLoader:
 			a, b = max(start, lo), min(end, hi)
 			seg[a - lo:b - lo] = body[a - start:b - start]
 			pos = end
+		if gone:
+			# the GC removed a chunk listed above: its WAL is in archived
+			# segments.  This one archived meanwhile may have lost chunks of
+			# its own, the last ones without a gap to tell: take the archive.
+			# Not archived, it had none of them.
+			data = self.read_object(f"wal/{name}")
+			if data is not None:
+				return bytearray(data)
 		if pos is None and partial is None:
 			return None
 		return seg
@@ -1244,10 +1252,6 @@ class OrioledbS3ObjectLoader:
 
 CHUNK_MAGIC = 0x3143574f
 TERMINATOR_MAGIC = 0x3154574f
-
-
-class ChunkGone(Exception):
-	"""A chunk listed and gone before it was read."""
 
 
 class RestoreRefused(Exception):
