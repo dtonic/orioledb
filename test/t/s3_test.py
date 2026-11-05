@@ -937,6 +937,108 @@ class S3Test(S3BaseTest):
 				release.set()
 		node.stop()
 
+	def s3_archive_chunks(self, node, commits):
+		"""Ship a chunk a commit, then archive their segment: the GC's
+		deletes of them follow the next chunk."""
+		with node.connect(autocommit=True) as con:
+			for i in range(commits):
+				con.execute(f"INSERT INTO o_test VALUES ({i}) "
+				            "ON CONFLICT (id) DO UPDATE SET id = excluded.id")
+		wal_file = node.execute(
+		    "SELECT pg_walfile_name(pg_current_wal_lsn());")[0][0]
+		node.safe_psql("SELECT pg_switch_wal()")
+		self.wait_for_object(f'wal/{wal_file}')
+		node.safe_psql("INSERT INTO o_test VALUES (-1) ON CONFLICT DO NOTHING")
+
+	def test_s3_shutdown_leaves_chunk_deletes(self):
+		"""
+		A worker took tasks until the queue was empty before it looked at a
+		shutdown request, the background lane's too: a backlog of chunk
+		deletes held a fast shutdown until it was done (past a minute on AWS
+		after a busy hour, so Kubernetes killed the postmaster and its lease
+		was left to run out).  A shutdown now takes no more of them; the next
+		start deletes them again.
+		"""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION IF NOT EXISTS orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+		""")
+
+		started = threading.Event()
+
+		# 0.3 s a DELETE: a task of 1000 takes about 19 s at 16 at a time
+		def slow_delete(response):
+			if '/chunks/' in response.parse_key_name():
+				started.set()
+				time.sleep(0.3)
+			return orig_delete_object(response)
+
+		with patch('moto.s3.responses.S3Response.delete_object',
+		           new=slow_delete):
+			# six tasks, two workers on them: three rounds taken to the end
+			self.s3_archive_chunks(node, 6000)
+			self.assertTrue(started.wait(60), "no chunk delete came")
+			begin = time.time()
+			node.stop()
+			self.assertLess(time.time() - begin, 40,
+			                "the shutdown waited for the chunk deletes")
+		left = len(self.chunk_keys())
+		self.assertGreater(left, 1000)
+
+		node.start()
+		node.safe_psql("INSERT INTO o_test VALUES (-2)")
+		deadline = time.time() + 120
+		while time.time() < deadline and len(self.chunk_keys()) >= left:
+			time.sleep(1)
+		self.assertLess(len(self.chunk_keys()), left,
+		                "the next start did not delete the chunks left")
+		node.stop()
+
+	def test_s3_start_deletes_only_the_chunks_listed(self):
+		"""
+		Every start puts a terminator, and it stays, so the chunks a previous
+		run left span the timeline back to its first start.  The start asked
+		for every sequence number in it, a DELETE each, the ones the GC had
+		removed long ago too: a minute of the workers at every start of a
+		timeline some weeks old.  It deletes the chunks its listing has.
+		"""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION IF NOT EXISTS orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+		""")
+		self.s3_archive_chunks(node, 2000)
+		deadline = time.time() + 120
+		while time.time() < deadline and len(self.chunk_keys()) > 100:
+			time.sleep(1)
+		self.assertLessEqual(len(self.chunk_keys()), 100)
+		node.stop()
+		listed = len(self.chunk_keys(terminators=True))
+
+		deletes = []
+
+		def counted_delete(response):
+			if '/chunks/' in response.parse_key_name():
+				deletes.append(response.parse_key_name())
+			return orig_delete_object(response)
+
+		with patch('moto.s3.responses.S3Response.delete_object',
+		           new=counted_delete):
+			node.start()
+			# the next segment archived brings the GC over the recovered ones
+			self.s3_archive_chunks(node, 10)
+			time.sleep(10)
+			node.stop()
+		self.assertLessEqual(len(deletes), listed + 50,
+		                     f"{len(deletes)} chunk DELETEs for {listed} listed")
+
 	def test_s3_secret_key_is_shown_to_superusers_only(self):
 		"""orioledb.s3_secretkey was shown to every user (SHOW, pg_settings),
 		where PostgreSQL keeps its own credentials, such as

@@ -380,17 +380,17 @@ lane_try_pick_task(S3TaskQueueLane *lane, S3TaskLocation laneBits,
 /*
  * Try to pick the task for processing.  Returns the task location on success,
  * and InvalidS3TaskLocation on failure.  The first lane goes first; a
- * background task is taken in a free slot.
+ * background task is taken in a free slot, and only when background is true.
  */
 S3TaskLocation
-s3_queue_try_pick_task(volatile S3TaskLocation *record)
+s3_queue_try_pick_task(volatile S3TaskLocation *record, bool background)
 {
 	S3TaskLocation location;
 	pg_atomic_uint32 *running = &FOREGROUND_LANE->meta->backgroundRunning;
 	uint32		n;
 
 	location = lane_try_pick_task(FOREGROUND_LANE, 0, record);
-	if (location != InvalidS3TaskLocation)
+	if (location != InvalidS3TaskLocation || !background)
 		return location;
 
 	/* take a slot, then a task; give the slot back if there is none */

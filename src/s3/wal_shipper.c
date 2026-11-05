@@ -132,11 +132,15 @@ static ShippedChunk *shipped = NULL;
 /*
  * The chunks a previous run left, [recoveredFrom, recoveredTo): their ends
  * are not known without reading them, so the archived prefix is found by
- * bisection when the GC comes round.
+ * bisection when the GC comes round.  The range spans every start since the
+ * timeline's first, as the terminators stay; recoveredPresent holds the
+ * seqs the listing had, so only those are deleted.
  */
 static uint64 recoveredFrom = 0,
 			recoveredTo = 0;
 static List *recoveredTerminators = NIL;	/* their seqs, ascending */
+static uint64 *recoveredPresent = NULL; /* listed seqs, ascending */
+static int	recoveredPresentLen = 0;
 static int	shippedHead = 0,
 			shippedTail = 0,
 			shippedCap = 0;
@@ -1136,6 +1140,15 @@ chunks_gc(TimeLineID tli)
 	}
 }
 
+static int
+cmp_uint64(const void *a, const void *b)
+{
+	uint64		x = *(const uint64 *) a,
+				y = *(const uint64 *) b;
+
+	return (x > y) - (x < y);
+}
+
 /*
  * The chunks a previous run left: from the first one listed (those before it
  * are gone) up to where this run starts.
@@ -1147,14 +1160,23 @@ chunks_gc_recover(TimeLineID tli, uint64 nextSeq)
 	List	   *keys = s3_list_objects(prefix, NULL);
 	uint64		first = nextSeq;
 	ListCell   *lc;
+	int			n = 0;
 
+	if (recoveredPresent != NULL)
+		pfree(recoveredPresent);
+	recoveredPresent = MemoryContextAlloc(TopMemoryContext,
+										  sizeof(uint64) * Max(list_length(keys), 1));
 	foreach(lc, keys)
 	{
 		uint64		seq = strtou64((char *) lfirst(lc) + strlen(prefix), NULL, 10);
 
 		first = Min(first, seq);
+		if (seq < nextSeq)
+			recoveredPresent[n++] = seq;
 	}
 	list_free_deep(keys);
+	qsort(recoveredPresent, n, sizeof(uint64), cmp_uint64);
+	recoveredPresentLen = n;
 	pfree(prefix);
 	recoveredFrom = first;
 	recoveredTo = nextSeq;
@@ -1172,24 +1194,60 @@ chunks_gc_recover(TimeLineID tli, uint64 nextSeq)
 	pfree(prefix);
 }
 
-/* schedule [from, to) but the terminators in it */
-static void
-recovered_delete(TimeLineID tli, uint64 from, uint64 to)
+static bool
+recovered_terminator(uint64 seq)
 {
 	ListCell   *lc;
 
 	foreach(lc, recoveredTerminators)
 	{
-		uint64		t = *(uint64 *) lfirst(lc);
-
-		if (t < from || t >= to)
-			continue;
-		if (from < t)
-			(void) s3_schedule_wal_chunks_delete(tli, from, t);
-		from = t + 1;
+		if (*(uint64 *) lfirst(lc) == seq)
+			return true;
 	}
-	if (from < to)
-		(void) s3_schedule_wal_chunks_delete(tli, from, to);
+	return false;
+}
+
+/*
+ * Schedule the listed chunks in [from, to) but the terminators, a run of
+ * consecutive ones a task.  The range takes in the gaps every earlier start
+ * left (their chunks are gone, their terminators stay): asked for one by
+ * one, they were a DELETE each at every start, a minute of the S3 workers
+ * on a timeline some weeks old.
+ */
+static void
+recovered_delete(TimeLineID tli, uint64 from, uint64 to)
+{
+	int			lo = 0,
+				hi = recoveredPresentLen;
+	uint64		runFrom = 0,
+				runTo = 0;
+
+	/* the first listed seq at or after from */
+	while (lo < hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+
+		if (recoveredPresent[mid] < from)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	for (; lo < recoveredPresentLen && recoveredPresent[lo] < to; lo++)
+	{
+		uint64		seq = recoveredPresent[lo];
+
+		if (recovered_terminator(seq))
+			continue;
+		if (runTo != seq)
+		{
+			if (runFrom < runTo)
+				(void) s3_schedule_wal_chunks_delete(tli, runFrom, runTo);
+			runFrom = seq;
+		}
+		runTo = seq + 1;
+	}
+	if (runFrom < runTo)
+		(void) s3_schedule_wal_chunks_delete(tli, runFrom, runTo);
 }
 
 /*
