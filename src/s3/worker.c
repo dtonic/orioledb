@@ -1345,7 +1345,16 @@ s3worker_main(Datum main_arg)
 			 * restart: recorded after, a death in between left the task
 			 * picked by nobody, and the erased location never passed it.
 			 */
-			while ((taskLocation = s3_queue_try_pick_task(&workers_locations[worker_num])) != InvalidS3TaskLocation)
+			/*
+			 * A shutdown takes no more background tasks: they are deletes of
+			 * WAL chunks a GC freed, which nothing waits for and the next
+			 * start removes again (chunks_gc_recover()).  Taken to the end, a
+			 * backlog of them held the postmaster past its stop timeout, and
+			 * the instance killed then left its lease to run out.  The tasks
+			 * a shutdown checkpoint waits for are in the first lane.
+			 */
+			while ((taskLocation = s3_queue_try_pick_task(&workers_locations[worker_num],
+														  !ShutdownRequestPending)) != InvalidS3TaskLocation)
 			{
 				s3process_task(taskLocation);
 				workers_locations[worker_num] = InvalidS3TaskLocation;
