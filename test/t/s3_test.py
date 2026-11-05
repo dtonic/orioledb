@@ -28,7 +28,7 @@ from .s3_base_test import S3BaseTest, s3_test_attrs, mock_put_object, \
  mock_put_object_conflict, mock_moto_unknown_error, FlakyPutObject, \
  RevokedKeyPut, AmbiguousPut, HoldChunksOf, HoldFirstGet, ConflictingPut, \
  FailingGet, RevokedKey, orig_get_object, orig_list_objects_v2, FailingDelete, \
- orig_delete_object, TransientServerError
+ orig_delete_object, TransientServerError, HoldWrites
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
@@ -968,24 +968,22 @@ class S3Test(S3BaseTest):
 			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
 		""")
 
-		started = threading.Event()
-
-		# 0.3 s a DELETE: a task of 1000 takes about 19 s at 16 at a time
-		def slow_delete(response):
-			if '/chunks/' in response.parse_key_name():
-				started.set()
-				time.sleep(0.3)
-			return orig_delete_object(response)
-
-		with patch('moto.s3.responses.S3Response.delete_object',
-		           new=slow_delete):
+		# 0.3 s a chunk DELETE, held before the store's write lock so the
+		# other writes (the shutdown checkpoint's) go on: a task of 1000
+		# takes about 19 s at 16 at a time
+		slow = HoldWrites(r'/chunks/', count=1 << 30, seconds=0.3,
+		                  methods=('DELETE', ))
+		self.s3_server.before_write = slow
+		try:
 			# six tasks, two workers on them: three rounds taken to the end
 			self.s3_archive_chunks(node, 6000)
-			self.assertTrue(started.wait(60), "no chunk delete came")
+			self.assertTrue(slow.entered.wait(60), "no chunk delete came")
 			begin = time.time()
-			node.stop()
+			node.stop(['-t', '300'])
 			self.assertLess(time.time() - begin, 40,
 			                "the shutdown waited for the chunk deletes")
+		finally:
+			self.s3_server.before_write = None
 		left = len(self.chunk_keys())
 		self.assertGreater(left, 1000)
 
