@@ -6729,6 +6729,27 @@ tbl_data_exists(ORelOids *oids)
 		return true;
 	}
 
+	/*
+	 * A tree evicted whole has its root in the evicted data, and its pages
+	 * on disk.  In S3 mode an S3 reader keeps the pages of a tree created
+	 * after the checkpoint it loaded in local parts only, which no map of a
+	 * checkpoint names: asked below, a reader's rebuild of such a tree (ADD
+	 * PRIMARY KEY on a table its replay had evicted) skipped the copy and
+	 * left the new tree empty while the writer's had every row.
+	 */
+	{
+		EvictedTreeData *evicted = read_evicted_data(oids->datoid,
+													 oids->relnode,
+													 oids->spcoid,
+													 false);
+
+		if (evicted != NULL)
+		{
+			pfree(evicted);
+			return true;
+		}
+	}
+
 	if (orioledb_s3_mode)
 	{
 		SeqBufTag	map_tag = {0};
