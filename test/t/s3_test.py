@@ -1514,6 +1514,67 @@ class S3Test(S3BaseTest):
 				result[obj["Key"]] = obj["ETag"]
 		return result
 
+	def test_s3_reader_rebuilds_a_table_it_had_evicted(self):
+		"""
+		ADD PRIMARY KEY rebuilds a table into a new tree, and a reader
+		replays it by copying the old tree, when tbl_data_exists() says the
+		old one has data.  A tree created after the checkpoint the reader
+		loaded, and evicted by the reader, has its pages in the reader's
+		local parts only, which no checkpoint's map names: the reader took
+		it for empty, and its new tree stayed empty while the writer's had
+		every row (seen on eksmvp under pgbench -i, whose large COPY evicted
+		pgbench_branches before its primary key was added).
+		"""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("CREATE EXTENSION orioledb;")
+		node.safe_psql("CHECKPOINT;")
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as reader:
+			self.loader.download(reader.data_dir)
+			reader.append_conf(port=reader.port)
+			reader.append_conf("""
+				orioledb.s3_reader = on
+				hot_standby = on
+			""")
+			open(os.path.join(reader.data_dir, "standby.signal"), "w").close()
+			reader.start()
+
+			def replayed():
+				lsn = node.execute("SELECT pg_current_wal_flush_lsn()")[0][0]
+				deadline = time.time() + 60
+				while time.time() < deadline:
+					try:
+						if reader.execute("SELECT pg_last_wal_replay_lsn() >= "
+						                  f"'{lsn}'")[0][0]:
+							return
+					except Exception:
+						pass
+					time.sleep(0.5)
+				self.fail("the reader did not replay the writer's WAL")
+
+			node.safe_psql("""
+				CREATE TABLE o_test (id int NOT NULL, v int) USING orioledb;
+				INSERT INTO o_test SELECT g, 0 FROM generate_series(1, 20) g;
+			""")
+			replayed()
+			self.assertEqual([(20, )], reader.execute("SELECT count(*) FROM o_test"))
+			# evict it whole on the reader, and read nothing of it after
+			reader.execute("SELECT orioledb_evict_pages('o_test'::regclass, 100)")
+			node.safe_psql("""
+				ALTER TABLE o_test ADD PRIMARY KEY (id);
+				UPDATE o_test SET v = v + 1;
+			""")
+			replayed()
+			self.assertEqual([(20, 20)],
+			                 node.execute("SELECT count(*), sum(v) FROM o_test"))
+			self.assertEqual([(20, 20)],
+			                 reader.execute("SELECT count(*), sum(v) FROM o_test"))
+			reader.stop()
+			reader.cleanup()
+		node.stop()
+
 	def test_s3_reader_writes_nothing_from_start_to_stop(self):
 		"""Across its start, the replay of the bucket's WAL, a restartpoint,
 		a restart and its stop, a reader changes no object but its pin."""
