@@ -90,6 +90,7 @@
 #define CHUNK_MAX_BYTES			(16 * 1024 * 1024)
 #define CHUNK_GC_INTERVAL_MS	10000
 #define TERMINATOR_ATTEMPTS		8
+#define BEHIND_WAIT_MS			20
 
 bool		s3_wal_shipping = true;
 int			s3_wal_chunk_delay = 1;
@@ -1399,6 +1400,7 @@ s3_wal_shipper_main(Datum main_arg)
 	StringInfoData chunk;
 	XLogRecPtr	chunkStart = InvalidXLogRecPtr;
 	TimestampTz chunkSince = 0;
+	bool		behind = false;
 	XLogRecPtr	flushed;
 	MemoryContext cxt;
 	TimestampTz lastReply = 0;
@@ -1700,11 +1702,12 @@ walk:
 				case 'w':
 					{
 						XLogRecPtr	dataStart = pq_getmsgint64(&msg);
+						XLogRecPtr	walEnd = pq_getmsgint64(&msg);
 						Size		dataLen;
 
-						(void) pq_getmsgint64(&msg);	/* walEnd */
 						(void) pq_getmsgint64(&msg);	/* sendTime */
 						dataLen = len - 25;
+						behind = walEnd > dataStart + dataLen;
 						if (chunk.len == 0)
 						{
 							chunkStart = dataStart;
@@ -1736,13 +1739,39 @@ walk:
 			 * Take what else is ready into this chunk, but not for longer
 			 * than orioledb.s3_wal_chunk_delay: under a steady stream of
 			 * commits the socket never runs dry, and the put, which every
-			 * waiting commit waits for, would be put off on and on.
+			 * waiting commit waits for, would be put off on and on.  While
+			 * the sender has more WAL flushed than it sent (a bulk load, a
+			 * catch-up after a restart), the delay does not cut the chunk:
+			 * the puts go one at a time, so a commit at the end of that WAL
+			 * waits for every put before it, and chunks of what one message
+			 * holds shipped a few MB/s.
 			 */
 			if (chunk.len < CHUNK_MAX_BYTES && !replyNow &&
-				(chunk.len == 0 ||
+				(chunk.len == 0 || behind ||
 				 !TimestampDifferenceExceeds(chunkSince, GetCurrentTimestamp(),
 											 s3_wal_chunk_delay)))
 				continue;
+		}
+
+		/*
+		 * The socket ran dry while the sender still has WAL for us: it
+		 * fills the socket buffer (a few hundred kB) and waits for us to
+		 * read it, so a put now would cut the chunk at what the buffer held.
+		 * Wait a little for the rest instead.
+		 */
+		if (len == 0 && behind && chunk.len > 0 &&
+			chunk.len < CHUNK_MAX_BYTES)
+		{
+			int			rc;
+
+			rc = WaitLatchOrSocket(MyLatch,
+								   WL_LATCH_SET | WL_SOCKET_READABLE |
+								   WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+								   wait_fd, BEHIND_WAIT_MS, PG_WAIT_EXTENSION);
+			ResetLatch(MyLatch);
+			if (rc & WL_TIMEOUT)
+				behind = false;
+			continue;
 		}
 
 		/* nothing more right now: put what we have, one chunk */
@@ -1767,6 +1796,7 @@ walk:
 			set_flushed(flushed);
 			write_seq_file(tli, nextSeq, flushed, false);
 			resetStringInfo(&chunk);
+			behind = false;
 			replyNow = true;
 		}
 
