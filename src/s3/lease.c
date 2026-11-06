@@ -66,6 +66,8 @@ PG_FUNCTION_INFO_V1(orioledb_s3_status);
 #define ROOT_KEY				"root"
 #define TOKEN_FILENAME			ORIOLEDB_DATA_DIR "/s3_token"
 #define EPOCHS_FILENAME			ORIOLEDB_DATA_DIR "/s3_epochs"
+/* the loader's pin a reader takes over (orioledb_s3_loader.py --reader) */
+#define READER_PIN_FILENAME		ORIOLEDB_DATA_DIR "/s3_reader_pin"
 #define LOADED_FILENAME			ORIOLEDB_DATA_DIR "/s3_loaded"
 #define AS_OF_FILENAME			ORIOLEDB_DATA_DIR "/s3_as_of"
 #define LINEAGE_FILENAME		ORIOLEDB_DATA_DIR "/s3_lineage"
@@ -1921,6 +1923,80 @@ gc_kept(void)
 	return Max(retain, Max(folded, collected));
 }
 
+/*
+ * The checkpoints the GC has folded and collected up to: what is gone from
+ * the bucket.  A pin it has counted all along holds it below.
+ */
+static uint32
+gc_removed(void)
+{
+	uint32		retain,
+				folded,
+				collected;
+
+	if (!s3_gc_progress(&retain, &folded, &collected, NULL))
+		ereport(FATAL,
+				(errcode(ERRCODE_CONNECTION_EXCEPTION),
+				 errmsg("could not read \"%s\" from the S3 bucket", GC_KEY)));
+	return Max(folded, collected);
+}
+
+/* a pin left to hold that long yet, at least, is taken over */
+#define READER_PIN_TAKEOVER_MARGIN	10
+
+/*
+ * The pin the loader left for this data directory (--reader), when it is
+ * still in the readers object with READER_PIN_TAKEOVER_MARGIN seconds to
+ * go: its id goes to id.  The file is read once: the reader's own pin
+ * replaces it.
+ */
+static bool
+reader_pin_handed_over(uint32 chkp, char *id, size_t idlen)
+{
+	FILE	   *f;
+	char		handed[64];
+	unsigned int handedChkp;
+	bool		found = false;
+	StringInfoData body;
+	char		etag[S3_ETAG_LEN];
+	int64		storageNow = -1;
+
+	f = AllocateFile(READER_PIN_FILENAME, "r");
+	if (f == NULL)
+		return false;
+	found = fscanf(f, "%63s %u", handed, &handedChkp) == 2;
+	FreeFile(f);
+	(void) unlink(READER_PIN_FILENAME);
+	if (!found || handedChkp != chkp)
+		return false;
+	found = false;
+
+	initStringInfo(&body);
+	if (lease_get(READERS_KEY, &body, etag, &storageNow) == S3_RESPONSE_OK)
+	{
+		const char *line;
+
+		storageNow = store_clock_or_local(storageNow, READERS_KEY);
+		for (line = body.data; line && *line;)
+		{
+			char		other[64];
+			unsigned int otherChkp;
+			long long	expires;
+			const char *end = strchr(line, '\n');
+
+			if (sscanf(line, "%63s %u %lld", other, &otherChkp, &expires) == 3 &&
+				strcmp(other, handed) == 0 && otherChkp == chkp &&
+				expires >= storageNow + READER_PIN_TAKEOVER_MARGIN)
+				found = true;
+			line = end ? end + 1 : NULL;
+		}
+	}
+	pfree(body.data);
+	if (found)
+		strlcpy(id, handed, idlen);
+	return found;
+}
+
 static char reader_id[64];
 static uint32 reader_checkpoint;
 
@@ -1928,25 +2004,39 @@ static uint32 reader_checkpoint;
  * A reader pins the checkpoint it opens, then checks the GC has not passed it
  * already: pinned before the GC reads the pins, it is counted; pinned after,
  * it sees the R the GC published first.
+ *
+ * R is published before the pins are read, so a new pin is checked against
+ * it, and a load that outlasted the checkpoints the GC keeps was refused
+ * however its own pin had held them.  The loader's pin, taken over, has been
+ * counted since before the load read anything (the loader checked R when it
+ * put it), so only what the GC has folded or collected stands against it.
  */
 static void
 reader_pin_and_check(uint32 chkp)
 {
 	uint64		nonce = 0;
-	uint32		retain;
+	uint32		kept;
+	bool		adopted;
 
-	if (!pg_strong_random(&nonce, sizeof(nonce)))
-		nonce = (uint64) time(NULL) ^ ((uint64) getpid() << 32);
-	snprintf(reader_id, sizeof(reader_id), "%016llx", (unsigned long long) nonce);
+	adopted = reader_pin_handed_over(chkp, reader_id, sizeof(reader_id));
+	if (!adopted)
+	{
+		if (!pg_strong_random(&nonce, sizeof(nonce)))
+			nonce = (uint64) time(NULL) ^ ((uint64) getpid() << 32);
+		snprintf(reader_id, sizeof(reader_id), "%016llx", (unsigned long long) nonce);
+	}
 	reader_checkpoint = chkp;
 	reader_pin(reader_id, chkp);
-	retain = gc_kept();
-	if (chkp < retain)
+	kept = adopted ? gc_removed() : gc_kept();
+	if (chkp < kept)
 		ereport(FATAL,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("the S3 bucket no longer keeps checkpoint %u", chkp),
-				 errdetail("Its GC keeps checkpoints from %u on.", retain),
+				 errdetail("Its GC keeps checkpoints from %u on.", kept),
 				 errhint("Load the data directory from the bucket again.")));
+	if (adopted)
+		ereport(LOG,
+				(errmsg("took over the S3 pin of the load, checkpoint %u", chkp)));
 }
 
 /*

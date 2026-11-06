@@ -153,7 +153,7 @@ Run the script with the same parameters as from your S3 Postgres cluster config:
 
 A reader is a read-only hot standby on the bucket of a running writer. It follows the writer's commits from the WAL shipped to the bucket, without a restart. Any number of readers can run on one bucket.
 
-1. Load the bucket into an empty data directory with the [S3 loader utility](#s3-loader-utility). The directory gets the writer's `postgresql.conf`, so the `orioledb.s3_*` settings are already there, and a `restore_command` that fetches WAL from the bucket.
+1. Load the bucket into an empty data directory with the [S3 loader utility](#s3-loader-utility), adding `--reader`. The directory gets the writer's `postgresql.conf`, so the `orioledb.s3_*` settings are already there, and a `restore_command` that fetches WAL from the bucket.
 
 2. Add to `postgresql.conf` in that directory:
 
@@ -170,6 +170,7 @@ A reader is a read-only hot standby on the bucket of a running writer. It follow
 
 A reader writes nothing to the bucket but a pin that keeps the checkpoint it loaded from the garbage collector. Keep in mind:
 
+- With `--reader` the loader leaves the pin it held while loading in place, and the reader takes it over at its start. Loaded without it, the reader pins anew and is refused (`the S3 bucket no longer keeps checkpoint N`) when the writer committed more checkpoints during the load than `orioledb.s3_gc_keep_checkpoints` keeps; then raise `orioledb.s3_gc_keep_time`, or load with `--reader`. The handed-over pin lapses after ten minutes, so start the reader within that.
 - A reader that falls more than about three quarters of the writer's `orioledb.s3_gc_max_pin_lag` checkpoints behind stops; load it again before then.
 - A reader that has made a restartpoint, by a `CHECKPOINT` or a clean shutdown, does not start again on its data directory; load it again.
 - A reader is not promoted. To make one the writer once the old writer is gone, stop it, load the bucket into the same directory with `--keep-parts`, which keeps the data files it already has, and start it.

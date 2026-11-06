@@ -3537,6 +3537,69 @@ class S3Test(S3BaseTest):
 			reader.cleanup()
 		node.stop()
 
+	def test_s3_reader_takes_over_the_pin_of_its_load(self):
+		"""
+		A reader pinned anew at its start and checked that pin against R,
+		which the GC publishes before it reads the pins: a load that outlasted
+		the checkpoints the GC keeps was refused ("no longer keeps
+		checkpoint") although the load's own pin had held them all along.
+		Loaded with --reader, the load's pin stays and the reader takes it
+		over, so only what the GC has removed stands against it.  A pin that
+		ran out in between is not taken over.
+		"""
+		node = self.gc_world()
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as reader:
+			self.loader.download(reader.data_dir, reader=True)
+			pinned = int(self.kv('root')['checkpoint'])
+			pin_file = os.path.join(reader.data_dir, 'orioledb_data',
+			                        's3_reader_pin')
+			with open(pin_file) as f:
+				handed = f.read().split()
+			self.assertEqual(str(pinned), handed[1])
+			self.assertIn(f"{handed[0]} {pinned} ",
+			              self.s3_object('readers').decode())
+			# the writer goes on: R passes the checkpoint, the pin holds the
+			# rest
+			deadline = time.time() + 60
+			v = 0
+			while time.time() < deadline and \
+                int(self.kv('gc').get('retain', 0)) <= pinned:
+				v += 1
+				node.safe_psql(f"UPDATE o_test SET v = {v};")
+				node.safe_psql("CHECKPOINT;")
+				time.sleep(1)
+			self.assertGreater(int(self.kv('gc')['retain']), pinned)
+			self.assertLessEqual(int(self.kv('gc').get('collected', 0)), pinned)
+			self.assertLessEqual(int(self.kv('gc').get('folded', 0)), pinned)
+			reader.append_conf(port=reader.port)
+			reader.append_conf("""
+				orioledb.s3_reader = on
+				hot_standby = on
+				orioledb.main_buffers = 8MB
+			""")
+			open(os.path.join(reader.data_dir, "standby.signal"), "w").close()
+			reader.start()
+			with open(reader.pg_log_file) as f:
+				self.assertIn(f"took over the S3 pin of the load, checkpoint {pinned}",
+				              f.read())
+			self.assertFalse(os.path.exists(pin_file))
+			deadline = time.time() + 60
+			count = None
+			while time.time() < deadline and count != [(30000, 30000 * v)]:
+				try:
+					count = reader.execute("SELECT count(*), sum(v) FROM o_test")
+				except Exception:
+					pass
+				time.sleep(0.5)
+			self.assertEqual([(30000, 30000 * v)], count)
+			# one pin, the load's id
+			lines = [l for l in self.s3_object('readers').decode().splitlines()
+			         if l.split()[1:2] == [str(pinned)]]
+			self.assertEqual([handed[0]], [l.split()[0] for l in lines])
+			reader.stop()
+			reader.cleanup()
+		node.stop()
+
 	def test_s3_gc_spares_a_loading_checkpoint(self):
 		"""The loader pins the checkpoint it reads, as a reader does: the
 		writer goes on and its GC passes while the load is under way, and
