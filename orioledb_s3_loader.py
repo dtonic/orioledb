@@ -1,13 +1,100 @@
 #!/usr/bin/env python3
 
-import argparse
-import boto3
 import os
-import re
-import struct
+import socket
 import sys
 import time
-import testgres
+
+# A standby's restore_command asks the restore server beside it (started on
+# the first call, see serve_restores): the server keeps its S3 client and
+# connections, and waits for new WAL instead of answering "the same as
+# before" every wal_retrieve_retry_interval.  This client loads nothing
+# else: the rest of the module (boto3) took a quarter of a second of CPU per
+# call.
+RESTORE_SOCKET = os.path.join('pg_wal', 'orioledb_s3_chunks', 'restore.sock')
+
+
+def restore_through_server(argv):
+	"""The answer of the restore server to --restore FILE PATH, starting the
+	server when none runs; None when no server answered, and the caller
+	restores the file itself."""
+	if not os.path.exists('standby.signal') or '--restore' not in argv:
+		return None
+	i = argv.index('--restore')
+	if len(argv) < i + 3:
+		return None
+	fname, path = argv[i + 1], argv[i + 2]
+	for started in (False, True):
+		conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		try:
+			conn.connect(RESTORE_SOCKET)
+		except OSError:
+			conn.close()
+			if started or not start_restore_server(argv, i):
+				return None
+			continue
+		try:
+			# the server waits at most RESTORE_WAIT for new WAL
+			conn.settimeout(RESTORE_WAIT + 120)
+			conn.sendall(f"{fname}\n{path}\n".encode())
+			reply = b''
+			while True:
+				part = conn.recv(64)
+				if not part:
+					break
+				reply += part
+			return int(reply.decode().strip())
+		except (OSError, ValueError):
+			return None
+		finally:
+			conn.close()
+	return None
+
+
+def start_restore_server(argv, i):
+	"""Start the restore server (its own session: the server's signals to
+	this restore_command do not reach it) and wait until it listens."""
+	import subprocess
+	cmd = [sys.executable] + argv[:i] + argv[i + 3:] + ['--restore-server']
+	try:
+		subprocess.Popen(cmd,
+		                 stdin=subprocess.DEVNULL,
+		                 stdout=subprocess.DEVNULL,
+		                 start_new_session=True,
+		                 close_fds=True)
+	except OSError:
+		return False
+	deadline = time.time() + 30
+	while time.time() < deadline:
+		if os.path.exists(RESTORE_SOCKET):
+			conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+			try:
+				conn.connect(RESTORE_SOCKET)
+				return True
+			except OSError:
+				pass
+			finally:
+				conn.close()
+		time.sleep(0.05)
+	return False
+
+
+# How long the restore server waits for WAL past what it gave the standby
+# last, polling the next chunk's key every RESTORE_POLL seconds; and how long
+# it stays without a request.
+RESTORE_WAIT = 30
+RESTORE_POLL = 0.2
+RESTORE_SERVER_IDLE = 600
+
+if __name__ == '__main__':
+	rc = restore_through_server(sys.argv)
+	if rc is not None:
+		sys.exit(rc)
+
+import argparse
+import boto3
+import re
+import struct
 
 from botocore.config import Config
 from botocore.exceptions import ClientError, ParamValidationError
@@ -101,6 +188,11 @@ class OrioledbS3ObjectLoader:
 		    "having restore_command read the bucket: for a server whose "
 		    "environment cannot run this script.  A reader then does not "
 		    "follow the writer")
+		# the restore server a standby's restore_command starts
+		parser.add_argument('--restore-server',
+		                    dest='restore_server',
+		                    action='store_true',
+		                    help=argparse.SUPPRESS)
 		parser.add_argument(
 		    '--restore-command',
 		    dest='restore_command',
@@ -156,7 +248,7 @@ class OrioledbS3ObjectLoader:
 		else:
 			verify = None
 
-		if args.restore:
+		if args.restore or args.restore_server:
 			# restore_command runs in the data directory: take the
 			# credentials the server uses, which a reload may have rotated,
 			# over the ones in the environment it was started with
@@ -251,14 +343,18 @@ class OrioledbS3ObjectLoader:
 		self.repair = args.repair_root
 		self.local_wal = args.local_wal
 		self.restore_command = args.restore_command
+		self.restore_server = args.restore_server
 		if args.restore is None and args.data_dir is None and \
-		    not args.sweep and not args.repair_root:
+		    not args.sweep and not args.repair_root and \
+		    not args.restore_server:
 			raise Exception("-d/--data-dir is required")
 		self.s3 = s3_client
 
 	def run(self):
 		if self.restore_args:
 			raise SystemExit(self.restore(*self.restore_args))
+		if self.restore_server:
+			return self.serve_restores()
 		if self.sweep:
 			return self.sweep_orphans()
 		if self.repair:
@@ -447,6 +543,10 @@ class OrioledbS3ObjectLoader:
 		          'a') as f:
 			f.write("restore_command = '%s'\n" % command.replace("'", "''"))
 			f.write("recovery_target_timeline = 'latest'\n")
+			if not self.local_wal and not self.restore_command:
+				# a standby's restore_command waits for new WAL itself (the
+				# restore server): ask again soon after an answer
+				f.write("wal_retrieve_retry_interval = '200ms'\n")
 		open(os.path.join(self.data_dir, 'recovery.signal'), 'w').close()
 
 	def read_object(self, key):
@@ -1170,6 +1270,143 @@ class OrioledbS3ObjectLoader:
 			f.write(data)
 		return 0
 
+	def serve_restores(self):
+		"""The restore server of a standby (started by its restore_command,
+		in the data directory): answers --restore requests over
+		RESTORE_SOCKET, one at a time, as the startup process makes them.
+		Asked for the segment it gave last and the bucket has nothing past
+		it, it waits for the next chunk (up to RESTORE_WAIT) instead of
+		giving the same again: PostgreSQL logged "invalid record length" on
+		every restore, and asked again only every
+		wal_retrieve_retry_interval.  Nothing new in the end, it answers
+		"not there", and the server reads the copy pg_wal keeps of the
+		segment.  It stops when the postmaster is gone, this script changed,
+		or nothing asked for RESTORE_SERVER_IDLE."""
+		import fcntl
+		import select
+		cache = os.path.dirname(RESTORE_SOCKET)
+		os.makedirs(cache, mode=0o700, exist_ok=True)
+		lock = open(os.path.join(cache, 'restore.lock'), 'w')
+		try:
+			fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+		except OSError:
+			return  # another server runs here
+		try:
+			os.unlink(RESTORE_SOCKET)
+		except FileNotFoundError:
+			pass
+		listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+		listener.bind(RESTORE_SOCKET)
+		listener.listen(4)
+		script = os.path.abspath(__file__)
+		script_mtime = os.stat(script).st_mtime
+		self.handed = (None, None)
+		self.settings = server_s3_settings('.')
+		last = time.time()
+		try:
+			while True:
+				ready, _, _ = select.select([listener], [], [], 1.0)
+				if ready:
+					conn, _ = listener.accept()
+					with conn:
+						try:
+							self.serve_restore(conn)
+						except Exception as e:
+							# the client restores the file itself
+							print(f"orioledb_s3_loader: restore server: {e}",
+							      file=sys.stderr)
+					last = time.time()
+				elif not postmaster_alive('.') or \
+				    os.stat(script).st_mtime != script_mtime or \
+				    time.time() - last > RESTORE_SERVER_IDLE:
+					break
+		finally:
+			try:
+				os.unlink(RESTORE_SOCKET)
+			except FileNotFoundError:
+				pass
+
+	def serve_restore(self, conn):
+		conn.settimeout(10)
+		request = b''
+		while request.count(b'\n') < 2:
+			part = conn.recv(4096)
+			if not part:
+				return
+			request += part
+		fname, path = request.decode().split('\n')[:2]
+		conn.settimeout(None)
+		# keys a reload rotated: as each --restore read them
+		settings = server_s3_settings('.')
+		if settings != self.settings:
+			self.parse_args()
+			self.settings = settings
+		rc = self.restore_waiting(fname, path, conn)
+		try:
+			conn.sendall(f"{rc}\n".encode())
+		except OSError:
+			pass
+
+	def restore_waiting(self, fname, path, conn):
+		"""restore() for the restore server: a segment it gave last, with
+		nothing after it in the bucket, is waited on."""
+		if not re.fullmatch(r'[0-9A-F]{24}', fname):
+			return self.restore(fname, path)
+		tli, segno = int(fname[0:8], 16), self.segno_of_name(fname)
+		deadline = time.time() + RESTORE_WAIT
+		came = False
+		while True:
+			try:
+				data = self.restore_segment(tli, segno)
+			except Exception as e:
+				print(f"orioledb_s3_loader: cannot restore {fname}: {e}",
+				      file=sys.stderr)
+				return RESTORE_NOT_FOUND
+			new = data is not None and self.handed != (fname, data)
+			# a chunk that came and left the segment as it was (a
+			# terminator, the next segment's WAL): the server has to look
+			# elsewhere, for a new timeline or the next segment
+			if new or came:
+				break
+			came = self.wait_for_chunk(tli, deadline, conn)
+			if not came:
+				break
+		if data is None:
+			return RESTORE_NOT_FOUND
+		kept = os.path.join('pg_wal', fname)
+		if not new and os.path.exists(kept) and \
+		    os.path.getsize(kept) == self.segment_size:
+			# PostgreSQL kept what it restored last: it reads that, and
+			# says no more of the end it reached there
+			return RESTORE_NOT_FOUND
+		with open(path, 'wb') as f:
+			f.write(data)
+		self.handed = (fname, data)
+		return 0
+
+	def wait_for_chunk(self, tli, deadline, conn):
+		"""Wait until the bucket has a chunk of the timeline past the ones
+		listed; False when the deadline passed first, the restore_command
+		went away (a shutdown), or a promotion was asked for."""
+		marker = os.path.join(self.chunk_cache(tli), 'listed')
+		while time.time() < deadline:
+			if os.path.exists('promote'):
+				return False
+			ready, _, _ = select_readable(conn, RESTORE_POLL)
+			if ready:
+				return False  # the client is gone: nothing comes from it
+			try:
+				with open(marker) as f:
+					after = int(f.read())
+			except (OSError, ValueError):
+				after = None
+			if after is not None:
+				if self.chunk_head(tli, after + 1) is not None:
+					return True
+			elif self.chunk_seqs(tli):
+				return True
+		return False
+
 	def list_objects(self, bucket_name, directory, start_after=None):
 		objects = []
 		paginator = self.s3.get_paginator('list_objects_v2')
@@ -1532,6 +1769,24 @@ def server_s3_settings(data_dir):
 	return found
 
 
+def select_readable(conn, timeout):
+	import select
+	return select.select([conn], [], [], timeout)
+
+
+def postmaster_alive(data_dir):
+	"""Whether the postmaster of postmaster.pid runs."""
+	try:
+		with open(os.path.join(data_dir, 'postmaster.pid')) as f:
+			pid = int(f.readline())
+		os.kill(pid, 0)
+		return True
+	except PermissionError:
+		return True
+	except (OSError, ValueError):
+		return False
+
+
 def parse_lsn(text):
 	hi, lo = text.split('/')
 	return (int(hi, 16) << 32) | int(lo, 16)
@@ -1598,6 +1853,7 @@ def get_control_data(data_dir: str):
 	"""
 
 	# this one is tricky (blame PG 9.4)
+	import testgres
 	_params = [testgres.get_bin_path("pg_controldata")]
 	_params += ["-D"]
 	_params += [data_dir]

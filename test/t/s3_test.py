@@ -1575,6 +1575,64 @@ class S3Test(S3BaseTest):
 			reader.cleanup()
 		node.stop()
 
+	def test_s3_reader_waits_for_wal_at_its_end(self):
+		"""A reader's restore_command asks its restore server, which waits
+		for WAL past the end it gave last: a commit shows on the reader at
+		once rather than after wal_retrieve_retry_interval, and an idle
+		reader no longer logs "invalid record length" on every retry.  The
+		server goes with the postmaster."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as reader:
+			self.loader.download(reader.data_dir)
+			reader.append_conf(port=reader.port)
+			reader.append_conf("""
+				orioledb.s3_reader = on
+				hot_standby = on
+			""")
+			open(os.path.join(reader.data_dir, "standby.signal"), "w").close()
+			reader.start()
+			sock = os.path.join(reader.data_dir, 'pg_wal', 'orioledb_s3_chunks',
+			                    'restore.sock')
+
+			def shows(i, within):
+				node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+				start = time.time()
+				while True:
+					try:
+						if reader.execute("SELECT count(*) FROM o_test "
+						                  f"WHERE id = {i}")[0][0]:
+							return time.time() - start
+					except Exception:
+						pass
+					self.assertLess(time.time() - start, within)
+					time.sleep(0.05)
+
+			shows(0, 60)
+			self.assertTrue(os.path.exists(sock))
+			with open(reader.pg_log_file) as f:
+				f.seek(0, os.SEEK_END)
+				time.sleep(12)
+				idle = f.read()
+			self.assertLessEqual(idle.count("invalid record length"), 1)
+			self.assertNotIn("waiting for WAL to become available", idle)
+			for i in range(1, 6):
+				shows(i, 3)
+			reader.stop()
+			deadline = time.time() + 10
+			while os.path.exists(sock) and time.time() < deadline:
+				time.sleep(0.2)
+			self.assertFalse(os.path.exists(sock))
+			reader.cleanup()
+		node.stop()
+
 	def test_s3_reader_writes_nothing_from_start_to_stop(self):
 		"""Across its start, the replay of the bucket's WAL, a restartpoint,
 		a restart and its stop, a reader changes no object but its pin."""
