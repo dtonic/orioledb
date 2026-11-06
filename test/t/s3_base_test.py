@@ -548,7 +548,8 @@ class OrioledbS3Loader:
 		self._verify = verify
 
 	def download(self, path, verbose=False, checkpoint_only=False, as_of=None,
-	             keep_parts=False, local_wal=False, repair_root=False):
+	             keep_parts=False, local_wal=False, repair_root=False,
+	             reader=False):
 		dir_path = os.path.dirname(os.path.realpath(__file__))
 		old_argv = sys.argv
 		sys.argv = [f"{dir_path}/../../orioledb_s3_loader.py"]
@@ -568,6 +569,8 @@ class OrioledbS3Loader:
 			sys.argv += ["--keep-parts"]
 		if local_wal:
 			sys.argv += ["--local-wal"]
+		if reader:
+			sys.argv += ["--reader"]
 		if path is None:
 			sys.argv.remove("-d")
 			sys.argv.remove(None)

@@ -70,6 +70,15 @@ class OrioledbS3ObjectLoader:
 		    "the last one committed; implies --checkpoint-only, and the data "
 		    "directory starts only as a reader")
 		parser.add_argument(
+		    '--reader',
+		    dest='reader',
+		    action='store_true',
+		    help="Load for an S3 reader: the pin the load holds stays, "
+		    "renewed once more, and its id is left in the data directory "
+		    "for the reader to take over at its start.  Pinning anew there, "
+		    "a reader whose load took longer than the GC keeps checkpoints "
+		    "was refused although the load's pin had held them")
+		parser.add_argument(
 		    '--keep-parts',
 		    dest='keep_parts',
 		    action='store_true',
@@ -232,6 +241,7 @@ class OrioledbS3ObjectLoader:
 		self.checkpoint_only = args.checkpoint_only or args.as_of is not None
 		self.as_of = args.as_of
 		self.keep_parts = args.keep_parts
+		self.reader = args.reader
 		self.restore_args = args.restore
 		self.segment_size = args.segment_size
 		self.endpoint = args.endpoint
@@ -270,11 +280,17 @@ class OrioledbS3ObjectLoader:
 				                f"committed one, {chkp_num}")
 			chkp_num = self.as_of
 		self.chkp_num = chkp_num
-		# held while the objects are read, so the GC leaves them
+		# held while the objects are read, so the GC leaves them; a reader
+		# takes it over (--reader)
 		self.pin = ReaderPin(self, chkp_num)
 		try:
 			self.load_checkpoint(root, chkp_num)
-		finally:
+		except BaseException:
+			self.pin.release()
+			raise
+		if self.reader:
+			self.pin.hand_over(self.data_dir)
+		else:
 			self.pin.release()
 
 	def load_checkpoint(self, root, chkp_num):
@@ -1264,6 +1280,9 @@ class ChunkGap(RestoreRefused):
 
 PIN_TTL = 600
 
+# the loader's pin a reader takes over: "<id> <checkpoint>"
+READER_PIN_FILE = os.path.join('orioledb_data', 's3_reader_pin')
+
 
 class ReaderPin:
 	"""
@@ -1359,6 +1378,22 @@ class ReaderPin:
 		self.stop.set()
 		self.thread.join()
 		self.remove()
+
+	def hand_over(self, data_dir):
+		"""Leave the pin to the reader that starts on data_dir: renewed for
+		a whole TTL, its id and checkpoint in READER_PIN_FILE.  The reader
+		renews it under the same id; held from before the load read
+		anything, the GC has counted it all along, so what it has folded and
+		collected is all the reader checks against (lease.c,
+		reader_pin_and_check())."""
+		self.stop.set()
+		self.thread.join()
+		self.put(self.chkp)
+		path = os.path.join(data_dir, READER_PIN_FILE)
+		tmp = f"{path}.tmp{os.getpid()}"
+		with open(tmp, 'w') as f:
+			f.write(f"{self.id} {self.chkp}\n")
+		os.replace(tmp, path)
 
 
 XIDMAP_RANGE_ENCODED = 2**64 - 1
