@@ -426,8 +426,13 @@ class S3WorkloadTest(S3BaseTest):
 		    os.path.join(node.data_dir, 'orioledb_data')):
 			for f in files:
 				fp = os.path.join(top, f)
-				if not os.path.islink(fp):
-					total += os.stat(fp).st_blocks * 512
+				# the server renames and removes files meanwhile
+				# (*.gcstate.tmp)
+				try:
+					if not os.path.islink(fp):
+						total += os.stat(fp).st_blocks * 512
+				except FileNotFoundError:
+					pass
 		return total
 
 	def wait_eviction(self, node, limit, timeout=180):
