@@ -105,6 +105,7 @@ The defaults suit most installations.
 | `orioledb.s3_queue_size` | `1MB` | restart | Size of the shared queue of S3 tasks. |
 | `orioledb.s3_headers_buffers` | `1MB` | restart | Size of the buffers for S3 metadata. |
 | `orioledb.s3_auth_retry_time` | `300s` | reload | How long a request the bucket refuses as unauthorized is retried, so that rotating the keys does not fail requests in between. `0` fails at once. |
+| `orioledb.s3_keep_connections` | `on` | reload | Each server process keeps its connection to the bucket between requests, saving a TCP connect and TLS handshake per request (a commit waits for one WAL chunk put). A connection is closed after a transport error or a refused request that carried a body. `off` opens one per request. |
 | `orioledb.s3_lease_duration` | `30s` | restart | How long the writer's lease on the bucket lasts without renewal. Another instance may take the bucket over this long after the writer stops renewing it. |
 | `orioledb.s3_wal_shipping` | `on` | restart | Ships WAL to the bucket as it is written. With `synchronous_standby_names = 's3'` a commit returns once its WAL is in the bucket. |
 | `orioledb.s3_wal_conninfo` | empty | restart | How the WAL shipper connects to this server. Empty uses the first Unix socket as the bootstrap superuser. |

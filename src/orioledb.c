@@ -1308,6 +1308,19 @@ _PG_init(void)
 							NULL,
 							NULL);
 
+	DefineCustomBoolVariable("orioledb.s3_keep_connections",
+							 "Keeps a server process's connection to S3 between requests",
+							 "Saves a connection and TLS handshake per request; every "
+							 "commit waits for a WAL chunk put.  Off opens a connection "
+							 "per request and asks the store to close it.",
+							 &s3_keep_connections,
+							 true,
+							 PGC_SIGHUP,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	DefineCustomIntVariable("orioledb.s3_auth_retry_time",
 							"How long an S3 request refused as unauthorized is retried",
 							"New credentials take effect on a configuration reload; "

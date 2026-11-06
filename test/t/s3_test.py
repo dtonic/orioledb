@@ -2470,6 +2470,49 @@ class S3Test(S3BaseTest):
 			new_node.stop()
 			new_node.cleanup()
 
+	def test_s3_commits_keep_the_shippers_connection(self):
+		"""The WAL shipper's chunk puts leave the connection open for the
+		next (the test store closes it anyway: Werkzeug does not keep
+		connections); orioledb.s3_keep_connections = off asks the store to
+		close it after each, as before."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+		""")
+
+		def chunk_connections(first):
+			seen = []
+
+			def hook(environ):
+				if '/wal/' in environ.get('PATH_INFO', '') and \
+				   '/chunks/' in environ.get('PATH_INFO', ''):
+					seen.append(environ.get('HTTP_CONNECTION', '').lower())
+
+			self.s3_server.before_write = hook
+			try:
+				for i in range(first, first + 10):
+					node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+			finally:
+				self.s3_server.before_write = None
+			return seen
+
+		seen = chunk_connections(1)
+		self.assertGreaterEqual(len(seen), 10)
+		self.assertNotIn('close', seen)
+
+		node.append_conf("orioledb.s3_keep_connections = off")
+		node.reload()
+		time.sleep(1)
+		seen = chunk_connections(101)
+		self.assertGreaterEqual(len(seen), 10)
+		self.assertEqual({'close'}, set(seen))
+		self.assertEqual([(20, )], node.execute("SELECT count(*) FROM o_test"))
+		node.stop()
+
 	def test_s3_keys_rotate_on_a_reload(self):
 		"""Once the store refuses the old key, requests are retried for
 		orioledb.s3_auth_retry_time; new keys set meanwhile and reloaded are

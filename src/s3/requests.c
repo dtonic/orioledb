@@ -417,18 +417,56 @@ s3_request_backoff(int attempt, long http_code)
  * response body; etag, when not NULL, the response's ETag (palloc'd, or NULL).
  */
 /*
- * A fresh connection per request, and the store is asked to close it: the
- * closing side keeps the connection in TIME_WAIT, and a WAL shipper putting
- * a chunk per group of commits ran this machine out of ephemeral ports when
- * it closed them itself (connects failing with curl error 7 until the lease
- * ran out).  Connections are not reused: a store may answer a PUT before it
- * reads its body and keep the connection, and the next request on it then
- * gets an answer that is not its own (a DELETE answered 412).
+ * A server process keeps its connection to the store between requests
+ * (orioledb.s3_keep_connections): a new one costs a TCP connect, a TLS
+ * handshake and loading the CA bundle, about as long again as the request,
+ * and every commit waits for a WAL chunk put.  It is kept only when the
+ * exchange left it clean: no transport error, and either no request body or
+ * a 2xx answer.  A store may answer a PUT before it reads its body (412 to
+ * If-None-Match) and keep the connection, and the next request on it then
+ * got an answer that was not its own (a DELETE answered 412); such a
+ * connection is closed instead.  The postmaster never keeps one, as its
+ * children would share it.
+ *
+ * Otherwise a fresh connection per request, and the store is asked to close
+ * it: the closing side keeps the connection in TIME_WAIT, and a WAL shipper
+ * putting a chunk per group of commits ran this machine out of ephemeral
+ * ports when it closed them itself (connects failing with curl error 7 until
+ * the lease ran out).
  */
+bool		s3_keep_connections = true;
+
+static CURL *keptCurl = NULL;
+static pid_t keptPid = 0;
+static bool keptBusy = false;
+
 static CURL *
-request_handle(struct curl_slist **slist)
+request_handle(struct curl_slist **slist, bool keep)
 {
 	CURL	   *curl;
+
+	if (keep && IsUnderPostmaster && s3_keep_connections)
+	{
+		/*
+		 * Left in the middle of a transfer (an ERROR out of it), or made by
+		 * another process: not ours to use or close.
+		 */
+		if (keptCurl != NULL && (keptBusy || keptPid != MyProcPid))
+			keptCurl = NULL;
+		if (keptCurl != NULL)
+			curl_easy_reset(keptCurl);
+		else
+		{
+			keptCurl = curl_easy_init();
+			if (keptCurl == NULL)
+				ereport(FATAL,
+						(errcode(ERRCODE_OUT_OF_MEMORY),
+						 errmsg("could not initialize curl")));
+			keptPid = MyProcPid;
+		}
+		keptBusy = true;
+		return keptCurl;
+	}
 
 	*slist = curl_slist_append(*slist, "Connection: close");
 	curl = curl_easy_init();
@@ -437,6 +475,26 @@ request_handle(struct curl_slist **slist)
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("could not initialize curl")));
 	return curl;
+}
+
+/*
+ * Done with a handle request_handle() gave: the kept one stays, with its
+ * connection, if the exchange left that clean.
+ */
+static void
+request_handle_done(CURL *curl, bool clean)
+{
+	if (curl != keptCurl)
+	{
+		curl_easy_cleanup(curl);
+		return;
+	}
+	keptBusy = false;
+	if (!clean)
+	{
+		curl_easy_cleanup(keptCurl);
+		keptCurl = NULL;
+	}
 }
 
 /*
@@ -597,7 +655,7 @@ s3_request_ext(const char *method, char *objectname,
 		resp.received = 0;
 		resp.mismatch = false;
 
-		curl = request_handle(&slist);
+		curl = request_handle(&slist, true);
 		if (strcmp(method, "HEAD") == 0)
 			curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
 		else if (strcmp(method, "GET") != 0)
@@ -630,7 +688,9 @@ s3_request_ext(const char *method, char *objectname,
 		sc = curl_easy_perform(curl);
 		http_code = 0;
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-		curl_easy_cleanup(curl);
+		request_handle_done(curl,
+							sc == 0 && (dataSize == 0 || data == NULL ||
+										http_code / 100 == 2));
 
 		curl_slist_free_all(slist);
 		pfree(url);
@@ -991,7 +1051,7 @@ delete_slot_start(CURLM *multi, DeleteSlot *slot, char *objectname,
 						 s3_host, objectpath);
 	initStringInfo(&slot->body);
 	slot->index = index;
-	slot->curl = request_handle(&slot->slist);
+	slot->curl = request_handle(&slot->slist, false);
 	curl_easy_setopt(slot->curl, CURLOPT_CUSTOMREQUEST, "DELETE");
 	curl_easy_setopt(slot->curl, CURLOPT_HTTPHEADER, slot->slist);
 	curl_easy_setopt(slot->curl, CURLOPT_URL, slot->url);
