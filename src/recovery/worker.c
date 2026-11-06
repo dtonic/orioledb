@@ -219,6 +219,16 @@ recovery_worker_main(Datum main_arg)
 
 		pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
 		pqsignal(SIGUSR1, procsignal_sigusr1_handler);
+
+		/*
+		 * A reload is noted, and taken where an S3 request waits to be
+		 * retried (s3/requests.c, request_wait_reload()).  A bgworker ignores
+		 * SIGHUP by default, so a worker loading parts after the keys were
+		 * rotated kept signing with the revoked ones: refused, it retried for
+		 * the whole orioledb.s3_auth_retry_time while the reader's replay
+		 * waited on it.
+		 */
+		pqsignal(SIGHUP, SignalHandlerForConfigReload);
 		BackgroundWorkerUnblockSignals();
 
 		shm_mq_set_receiver(GET_WORKER_QUEUE(id), MyProc);
