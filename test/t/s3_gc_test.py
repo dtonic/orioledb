@@ -585,7 +585,9 @@ class S3GcTest(S3BaseTest):
 			for v in range(1, 5):
 				node.safe_psql(f"UPDATE o_test SET v = {v};")
 				node.safe_psql("CHECKPOINT;")
-			self.assertGreater(int(self.kv('gc')['pin_floor']), pin)
+			# the GC runs after a checkpoint, not within it
+			self.assertTrue(self.wait_until(
+			    lambda: int(self.kv('gc')['pin_floor']) > pin, 30, 0.5))
 			time.sleep(5)
 			# the pin is below the floor, but its reader has not renewed since
 			self.assertLessEqual(int(self.kv('gc')['folded']), pin)
