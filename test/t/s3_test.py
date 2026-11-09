@@ -12,6 +12,7 @@ import sys
 from tempfile import mkdtemp, mkstemp
 
 import threading
+import unittest
 from threading import Thread
 from unittest.mock import patch
 
@@ -1629,16 +1630,110 @@ class S3Test(S3BaseTest):
 			self.assertLessEqual(idle.count("invalid record length"), 1)
 			self.assertNotIn("waiting for WAL to become available", idle)
 			# apart, so that no later WAL makes a commit show
-			for i in range(1, 6):
-				for table in ('o_test', 'h_test'):
-					shows(i, 2.5, table)
-					time.sleep(2)
+			with open(reader.pg_log_file) as f:
+				f.seek(0, os.SEEK_END)
+				for i in range(1, 6):
+					for table in ('o_test', 'h_test'):
+						shows(i, 2.5, table)
+						time.sleep(2)
+				busy = f.read()
+			# the server puts new WAL into pg_wal: each chunk logs its end
+			# once, and nothing is "restored" from the archive
+			self.assertLessEqual(busy.count("invalid record length"), 12)
+			self.assertNotIn("restored log file", busy)
 			reader.stop()
 			deadline = time.time() + 10
 			while os.path.exists(sock) and time.time() < deadline:
 				time.sleep(0.2)
 			self.assertFalse(os.path.exists(sock))
 			reader.cleanup()
+		node.stop()
+
+	@unittest.skipUnless(sys.platform.startswith('linux'), "prctl")
+	def test_s3_restore_server_killed(self):
+		"""A restore server killed by a signal leaves the reader running.
+		In a container the postmaster is often PID 1 and adopts the server,
+		and an untracked child killed by a signal made it restart every
+		process, which an S3 reader cannot do.  This process stands in for
+		that PID 1 (a child subreaper): what it reaps must have exited 0."""
+		import ctypes
+		libc = ctypes.CDLL(None, use_errno=True)
+		PR_SET_CHILD_SUBREAPER = 36
+
+		def servers():
+			found = {}
+			for pid in os.listdir('/proc'):
+				try:
+					with open(f'/proc/{pid}/cmdline', 'rb') as f:
+						args = f.read().split(b'\0')
+					with open(f'/proc/{pid}/stat') as f:
+						ppid = int(f.read().rsplit(')', 1)[1].split()[1])
+				except (OSError, ValueError, IndexError):
+					continue
+				if b'--restore-server' in args:
+					found[int(pid)] = ppid
+			return found
+
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("synchronous_standby_names = 's3'")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		self.assertEqual(libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0), 0)
+		try:
+			with self.initNode(self.getBasePort() + 1, 'tgsb') as reader:
+				self.loader.download(reader.data_dir)
+				reader.append_conf(port=reader.port)
+				reader.append_conf("""
+					orioledb.s3_reader = on
+					hot_standby = on
+				""")
+				open(os.path.join(reader.data_dir, "standby.signal"),
+				     "w").close()
+				reader.start()
+				pid = reader.pid
+
+				def shows(i, within):
+					node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+					start = time.time()
+					while True:
+						try:
+							if reader.execute("SELECT count(*) FROM o_test "
+							                  f"WHERE id = {i}")[0][0]:
+								return
+						except Exception:
+							pass
+						self.assertLess(time.time() - start, within)
+						time.sleep(0.05)
+
+				shows(0, 60)
+				found = servers()
+				adopted = [p for p, pp in found.items() if pp == os.getpid()]
+				self.assertEqual(len(adopted), 1, found)
+				# the server itself, under its keeper
+				served = [p for p, pp in found.items() if pp == adopted[0]]
+				os.kill((served or adopted)[0], signal.SIGKILL)
+				_, status = os.waitpid(adopted[0], 0)
+				self.assertTrue(os.WIFEXITED(status), status)
+				self.assertEqual(os.WEXITSTATUS(status), 0)
+				# the next restore_command starts a server again
+				for i in range(1, 4):
+					shows(i, 5)
+				self.assertEqual(reader.pid, pid)
+				self.assertEqual(len(servers()), 2)
+				reader.stop()
+				reader.cleanup()
+		finally:
+			libc.prctl(PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0)
+			try:
+				while os.waitpid(-1, os.WNOHANG)[0]:
+					pass
+			except ChildProcessError:
+				pass
 		node.stop()
 
 	def test_s3_reader_writes_nothing_from_start_to_stop(self):

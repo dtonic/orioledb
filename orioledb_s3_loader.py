@@ -91,7 +91,40 @@ RESTORE_SETTLE = 0.25
 RESTORE_POLL = 0.1
 RESTORE_SERVER_IDLE = 600
 
+
+def keep_restore_server():
+	"""Run the restore server under a keeper that only waits for it and exits
+	0 however it ended.  The server leaves the session of the restore_command
+	that started it, and its parent becomes PID 1: in a container, often the
+	postmaster.  The postmaster takes an untracked child killed by a signal
+	(an OOM kill, a kill -9) for a crashed backend and restarts every
+	process, and an S3 reader past a restartpoint cannot start again.  The
+	keeper is forked before boto3 is imported, so it stays small; the next
+	restore_command starts a new server once this one is gone."""
+	import signal
+	pid = os.fork()
+	if pid == 0:
+		return
+
+	def forward(signum, frame):
+		try:
+			os.kill(pid, signum)
+		except OSError:
+			pass
+
+	for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP,
+	               signal.SIGQUIT):
+		signal.signal(signum, forward)
+	try:
+		os.waitpid(pid, 0)
+	except OSError:
+		pass
+	os._exit(0)
+
+
 if __name__ == '__main__':
+	if '--restore-server' in sys.argv:
+		keep_restore_server()
 	rc = restore_through_server(sys.argv)
 	if rc is not None:
 		sys.exit(rc)
@@ -1286,7 +1319,8 @@ class OrioledbS3ObjectLoader:
 		record length" on every restore, and asked again only every
 		wal_retrieve_retry_interval (5 s).  Nothing new in the end, it
 		answers "not there", and the server reads the copy pg_wal keeps of
-		the segment, logging its end no more.
+		the segment, logging its end no more.  New WAL goes into pg_wal too
+		(see restore_waiting), so each chunk logs its end once.
 
 		The hold is short (RESTORE_WAIT, RESTORE_SETTLE right after new WAL)
 		because a long one kept OrioleDB commits from showing: the recovery
@@ -1405,11 +1439,26 @@ class OrioledbS3ObjectLoader:
 			# PostgreSQL kept what it restored last: it reads that, and
 			# says no more of the end it reached there
 			return RESTORE_NOT_FOUND
-		with open(path, 'wb') as f:
-			f.write(data)
 		self.handed = (fname, data)
 		self.just_handed = True
-		return 0
+		if len(data) != self.segment_size:
+			with open(path, 'wb') as f:
+				f.write(data)
+			return 0
+		# Put the segment into pg_wal and answer "not there": PostgreSQL
+		# reads pg_wal next, in the same attempt.  It logs the end of WAL it
+		# reaches in a restored file every time, and once more when it reads
+		# the same end from pg_wal, but from pg_wal only once per position:
+		# each new chunk logged three lines ("restored log file" and two
+		# "invalid record length"), and now logs one.  A file it has open
+		# keeps its old contents (a new inode), and it closes it at the end
+		# of WAL before it asks again.
+		tmp = kept + '.s3restore'
+		with open(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600),
+		          'wb') as f:
+			f.write(data)
+		os.replace(tmp, kept)
+		return RESTORE_NOT_FOUND
 
 	def wait_for_chunk(self, tli, deadline, conn):
 		"""Wait until the bucket has a chunk of the timeline past the ones
