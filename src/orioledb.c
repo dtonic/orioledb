@@ -197,6 +197,15 @@ static get_relation_info_hook_type prev_get_relation_info_hook = NULL;
 database_size_hook_type prev_database_size_hook = NULL;
 static ReindexConcurrentlySkipHook_type prev_reindex_concurrently_skip_hook = NULL;
 static AcceptInvalidationMessagesHookType prev_AcceptInvalidationMessagesHook = NULL;
+static emit_log_hook_type prev_emit_log_hook = NULL;
+
+/* settings shown to superusers only, whose values the server log omits */
+static const char *const secret_settings[] = {
+	"orioledb.s3_secretkey",
+	"orioledb.s3_wal_conninfo",
+};
+
+static void orioledb_emit_log_hook(ErrorData *edata);
 
 #if PG_VERSION_NUM < 180000
 static skip_tree_height_hook_type prev_skip_tree_height_hook = NULL;
@@ -1785,11 +1794,49 @@ _PG_init(void)
 	prev_reindex_concurrently_skip_hook = ReindexConcurrentlySkipHook;
 	ReindexConcurrentlySkipHook = orioledb_reindex_concurrently_skip;
 	RecoveryStopsBeforeHook = orioledb_recovery_stops_before_hook;
+	prev_emit_log_hook = emit_log_hook;
+	emit_log_hook = orioledb_emit_log_hook;
 
 	if (enable_rewind)
 		VacuumHorizonHook = orioledb_vacuum_horizon_hook;
 	orioledb_setup_ddl_hooks();
 	stopevents_make_cxt();
+}
+
+/*
+ * A reload logs, in the postmaster, each setting it changed with its new
+ * value ("parameter \"%s\" changed to \"%s\"", guc.c).  For
+ * orioledb.s3_secretkey that put the secret key into the server log at every
+ * key rotation, although the setting is shown to superusers only.  Keep the
+ * name of a secret setting in that message and drop its value.
+ */
+static void
+orioledb_emit_log_hook(ErrorData *edata)
+{
+	if (edata->message_id && edata->message &&
+		strcmp(edata->message_id, "parameter \"%s\" changed to \"%s\"") == 0)
+	{
+		int			i;
+
+		for (i = 0; i < lengthof(secret_settings); i++)
+		{
+			char		quoted[NAMEDATALEN + 2];
+
+			snprintf(quoted, sizeof(quoted), "\"%s\"", secret_settings[i]);
+			if (strncmp(edata->message, "parameter ", 10) == 0 ?
+				strncmp(edata->message + 10, quoted, strlen(quoted)) == 0 :
+				strstr(edata->message, secret_settings[i]) != NULL)
+			{
+				/* in ErrorContext, freed with the report */
+				edata->message = psprintf("parameter \"%s\" changed",
+										  secret_settings[i]);
+				break;
+			}
+		}
+	}
+
+	if (prev_emit_log_hook)
+		prev_emit_log_hook(edata);
 }
 
 static void

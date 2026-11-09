@@ -1058,6 +1058,35 @@ class S3Test(S3BaseTest):
 			                     "WHERE name = 'orioledb.s3_secretkey'"))
 		node.stop()
 
+	def test_s3_secret_key_is_not_logged_on_a_reload(self):
+		"""A reload logs each setting it changed with its new value: a key
+		rotation put orioledb.s3_secretkey into the server log.  The log
+		names the setting and leaves its value out; other settings are
+		logged as before."""
+		node = self.node
+		node.append_conf("orioledb.s3_secretkey = 'first-secret-value'")
+		node.start()
+		node.append_conf("""
+			orioledb.s3_secretkey = 'second-secret-value'
+			orioledb.s3_accesskey = 'second-access-value'
+		""")
+		node.reload()
+		deadline = time.time() + 30
+		log = ''
+		while time.time() < deadline and \
+		    'orioledb.s3_accesskey" changed' not in log:
+			time.sleep(0.2)
+			with open(node.pg_log_file) as f:
+				log = f.read()
+		self.assertIn('parameter "orioledb.s3_secretkey" changed\n', log)
+		self.assertIn('parameter "orioledb.s3_accesskey" changed to '
+		              '"second-access-value"', log)
+		self.assertNotIn('second-secret-value', log)
+		self.assertNotIn('first-secret-value', log)
+		self.assertEqual([('second-secret-value', )],
+		                 node.execute("SHOW orioledb.s3_secretkey"))
+		node.stop()
+
 	def test_s3_loader_reads_keys_from_an_included_file(self):
 		"""restore_command takes the server's keys from its configuration
 		files, which a checkpoint puts into the bucket: the keys are best
@@ -1091,6 +1120,70 @@ class S3Test(S3BaseTest):
 		finally:
 			shutil.rmtree(data)
 			shutil.rmtree(secrets)
+
+	def test_s3_loader_reads_keys_of_a_configuration_directory(self):
+		"""A server started with -D naming a configuration directory (its
+		data_directory set there), or with config_file, reads no
+		postgresql.conf in the data directory: neither does the loader.  On
+		Kubernetes the keys came from a secret in that directory, and the
+		restore server did not see them change."""
+		loader = runpy.run_path(os.path.join(
+		    os.path.dirname(os.path.realpath(__file__)),
+		    '../../orioledb_s3_loader.py'),
+		                        run_name='loader')
+		data = mkdtemp()
+		conf = mkdtemp()
+		with open(os.path.join(conf, 's3.conf'), 'w') as f:
+			f.write("orioledb.s3_accesskey = 'secret-access'\n"
+			        "orioledb.s3_secretkey = 'secret-secret'\n")
+		with open(os.path.join(conf, 'postgresql.conf'), 'w') as f:
+			f.write(f"data_directory = '{data}'\n"
+			        "include 's3.conf'\n")
+		# the checkpoint's copy of the writer's postgresql.conf
+		with open(os.path.join(data, 'postgresql.conf'), 'w') as f:
+			f.write("orioledb.s3_accesskey = 'stale'\n")
+		with open(os.path.join(data, 'postgresql.auto.conf'), 'w') as f:
+			f.write("orioledb.s3_region = 'eu-west-1'\n")
+		expected = {
+		    'AWS_ACCESS_KEY_ID': 'secret-access',
+		    'AWS_SECRET_ACCESS_KEY': 'secret-secret',
+		    'AWS_DEFAULT_REGION': 'eu-west-1'
+		}
+		try:
+			for opts in (f'/usr/bin/postgres "-D" "{conf}"\n',
+			             f'/usr/bin/postgres "-D" "{data}" "-c" '
+			             f'"config_file={conf}/postgresql.conf"\n',
+			             f'/usr/bin/postgres "-D" "{data}" '
+			             f'"--config-file={conf}/postgresql.conf"\n'):
+				with open(os.path.join(data, 'postmaster.opts'), 'w') as f:
+					f.write(opts)
+				self.assertEqual(expected, loader['server_s3_settings'](data),
+				                 opts)
+			# the data directory's own when the server reads it
+			with open(os.path.join(data, 'postmaster.opts'), 'w') as f:
+				f.write(f'/usr/bin/postgres "-D" "{data}"\n')
+			self.assertEqual(
+			    {
+			        'AWS_ACCESS_KEY_ID': 'stale',
+			        'AWS_DEFAULT_REGION': 'eu-west-1'
+			    }, loader['server_s3_settings'](data))
+			# a credentials file is read anew when it changes
+			creds = os.path.join(conf, 'aws_credentials')
+			with patch.dict(os.environ, {
+			    'AWS_SHARED_CREDENTIALS_FILE': creds,
+			    'AWS_CONFIG_FILE': os.path.join(conf, 'missing')
+			}):
+				self.assertEqual((None, None),
+				                 loader['aws_credential_files']())
+				with open(creds, 'w') as f:
+					f.write("[default]\naws_access_key_id = A\n")
+				first = loader['aws_credential_files']()
+				with open(creds, 'w') as f:
+					f.write("[default]\naws_access_key_id = B\n")
+				self.assertNotEqual(first, loader['aws_credential_files']())
+		finally:
+			shutil.rmtree(data)
+			shutil.rmtree(conf)
 
 	def test_s3_scan_reads_ahead(self):
 		"""

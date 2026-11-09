@@ -289,9 +289,17 @@ class OrioledbS3ObjectLoader:
 		if args.restore or args.restore_server:
 			# restore_command runs in the data directory: take the
 			# credentials the server uses, which a reload may have rotated,
-			# over the ones in the environment it was started with
-			for key, value in server_s3_settings('.').items():
-				os.environ[key] = value
+			# over the ones in the environment it was started with; a key
+			# no longer set goes back to that environment's (a restore
+			# server reads them again for every rotation)
+			settings = server_s3_settings('.')
+			for key, value in STARTED_ENV.items():
+				if key in settings:
+					os.environ[key] = settings[key]
+				elif value is None:
+					os.environ.pop(key, None)
+				else:
+					os.environ[key] = value
 
 		if args.resolved_bucket:
 			self.resolved = (args.resolved_endpoint, args.resolved_bucket,
@@ -1356,7 +1364,7 @@ class OrioledbS3ObjectLoader:
 		script_mtime = os.stat(script).st_mtime
 		self.handed = (None, None)
 		self.just_handed = False
-		self.settings = server_s3_settings('.')
+		self.settings = (server_s3_settings('.'), aws_credential_files())
 		last = time.time()
 		try:
 			while True:
@@ -1391,8 +1399,9 @@ class OrioledbS3ObjectLoader:
 			request += part
 		fname, path = request.decode().split('\n')[:2]
 		conn.settimeout(None)
-		# keys a reload rotated: as each --restore read them
-		settings = server_s3_settings('.')
+		# keys a reload rotated, or a new credentials file (a Kubernetes
+		# secret): as each --restore read them
+		settings = (server_s3_settings('.'), aws_credential_files())
 		if settings != self.settings:
 			# a new client, from a new session: the default one keeps the
 			# credentials it found first
@@ -1715,6 +1724,13 @@ XIDMAP_RANGE_ENCODED = 2**64 - 1
 # restore_command that calls it directly reads it as "not there" too)
 RESTORE_NOT_FOUND = 99
 
+# the AWS_* variables server_s3_settings() can set, as this process started
+STARTED_ENV = {
+    key: os.environ.get(key)
+    for key in ('AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY',
+                'AWS_DEFAULT_REGION')
+}
+
 
 def decode_xidmap_items(data, count, path):
 	"""The xidmap items of a range file: per item the differences of its csn
@@ -1833,16 +1849,59 @@ def server_s3_settings(data_dir):
 			else:
 				read_conf(target, depth + 1)
 
-	read_conf(os.path.join(data_dir, 'postgresql.conf'), 0)
-	read_conf(os.path.join(data_dir, 'postgresql.auto.conf'), 0)
 	try:
 		with open(os.path.join(data_dir, 'postmaster.opts')) as f:
-			text = f.read()
-		for m in in_opts.finditer(text):
-			found[names[m.group(1)]] = m.group(2)
+			opts = f.read()
 	except OSError:
-		pass
+		opts = ''
+	# the configuration file the server reads: a -D that names a
+	# configuration directory (data_directory set there), or config_file;
+	# PostgreSQL reads no postgresql.conf in the data directory then
+	read_conf(server_config_file(data_dir, opts), 0)
+	read_conf(os.path.join(data_dir, 'postgresql.auto.conf'), 0)
+	for m in in_opts.finditer(opts):
+		found[names[m.group(1)]] = m.group(2)
 	return found
+
+
+def server_config_file(data_dir, opts):
+	"""The postgresql.conf of the server whose postmaster.opts is OPTS."""
+	args = re.findall(r'"([^"]*)"', opts)
+	config_file = None
+	config_dir = None
+	for i, arg in enumerate(args):
+		following = args[i + 1] if i + 1 < len(args) else ''
+		if arg == '-D':
+			config_dir = following
+		elif arg.startswith('-D') and len(arg) > 2:
+			config_dir = arg[2:]
+		elif arg == '-c' and re.match(r'config[_-]file=', following):
+			config_file = following.split('=', 1)[1]
+		elif re.match(r'--config[_-]file=', arg):
+			config_file = arg.split('=', 1)[1]
+	if config_file and os.path.isabs(config_file):
+		return config_file
+	if config_dir and os.path.isabs(config_dir):
+		return os.path.join(config_dir, 'postgresql.conf')
+	return os.path.join(data_dir, 'postgresql.conf')
+
+
+def aws_credential_files():
+	"""The contents of the shared credentials and config files boto3 reads
+	(None for a missing one): a restore server makes its S3 client again
+	when they change, as the keys of a Kubernetes secret do."""
+	paths = (os.environ.get('AWS_SHARED_CREDENTIALS_FILE',
+	                        os.path.expanduser('~/.aws/credentials')),
+	         os.environ.get('AWS_CONFIG_FILE',
+	                        os.path.expanduser('~/.aws/config')))
+	contents = []
+	for path in paths:
+		try:
+			with open(path, 'rb') as f:
+				contents.append(f.read())
+		except OSError:
+			contents.append(None)
+	return tuple(contents)
 
 
 def select_readable(conn, timeout):
