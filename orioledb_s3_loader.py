@@ -79,11 +79,16 @@ def start_restore_server(argv, i):
 	return False
 
 
-# How long the restore server waits for WAL past what it gave the standby
-# last, polling the next chunk's key every RESTORE_POLL seconds; and how long
-# it stays without a request.
-RESTORE_WAIT = 30
-RESTORE_POLL = 0.2
+# How long the restore server holds a request for WAL past what it gave the
+# standby last, polling the next chunk's key every RESTORE_POLL seconds:
+# RESTORE_SETTLE right after it gave new WAL, RESTORE_WAIT otherwise.  Never
+# long: an OrioleDB transaction the recovery workers applied becomes visible
+# only when the startup process next handles its interrupts, which it does
+# between the attempts to read WAL, not while restore_command runs (see
+# serve_restores).  And how long the server stays without a request.
+RESTORE_WAIT = 1.0
+RESTORE_SETTLE = 0.25
+RESTORE_POLL = 0.1
 RESTORE_SERVER_IDLE = 600
 
 if __name__ == '__main__':
@@ -544,9 +549,10 @@ class OrioledbS3ObjectLoader:
 			f.write("restore_command = '%s'\n" % command.replace("'", "''"))
 			f.write("recovery_target_timeline = 'latest'\n")
 			if not self.local_wal and not self.restore_command:
-				# a standby's restore_command waits for new WAL itself (the
-				# restore server): ask again soon after an answer
-				f.write("wal_retrieve_retry_interval = '200ms'\n")
+				# a standby's restore_command holds a request for new WAL
+				# itself (the restore server): ask again at once after an
+				# answer, without the sleep that logs "waiting for WAL"
+				f.write("wal_retrieve_retry_interval = '50ms'\n")
 		open(os.path.join(self.data_dir, 'recovery.signal'), 'w').close()
 
 	def read_object(self, key):
@@ -1275,13 +1281,27 @@ class OrioledbS3ObjectLoader:
 		in the data directory): answers --restore requests over
 		RESTORE_SOCKET, one at a time, as the startup process makes them.
 		Asked for the segment it gave last and the bucket has nothing past
-		it, it waits for the next chunk (up to RESTORE_WAIT) instead of
-		giving the same again: PostgreSQL logged "invalid record length" on
-		every restore, and asked again only every
-		wal_retrieve_retry_interval.  Nothing new in the end, it answers
-		"not there", and the server reads the copy pg_wal keeps of the
-		segment.  It stops when the postmaster is gone, this script changed,
-		or nothing asked for RESTORE_SERVER_IDLE."""
+		it, it holds the request for a moment while it polls for the next
+		chunk, instead of giving the same again: PostgreSQL logged "invalid
+		record length" on every restore, and asked again only every
+		wal_retrieve_retry_interval (5 s).  Nothing new in the end, it
+		answers "not there", and the server reads the copy pg_wal keeps of
+		the segment, logging its end no more.
+
+		The hold is short (RESTORE_WAIT, RESTORE_SETTLE right after new WAL)
+		because a long one kept OrioleDB commits from showing: the recovery
+		workers apply a transaction after the startup process sends it, and
+		its commit becomes visible (gets its CSN) only when the startup
+		process drains its finished list, in its interrupt handling.  That
+		runs once per attempt of WaitForWALToBecomeAvailable(), not while
+		the startup process waits in system() for restore_command, so a
+		commit the workers finished a moment after the startup process went
+		to read on waited for the restore's answer (18 s with a 30 s hold,
+		until the next RUNNING_XACTS). A heap commit, replayed by the startup
+		process itself, showed at once.
+
+		It stops when the postmaster is gone, this script changed, or nothing
+		asked for RESTORE_SERVER_IDLE."""
 		import fcntl
 		import select
 		cache = os.path.dirname(RESTORE_SOCKET)
@@ -1301,6 +1321,7 @@ class OrioledbS3ObjectLoader:
 		script = os.path.abspath(__file__)
 		script_mtime = os.stat(script).st_mtime
 		self.handed = (None, None)
+		self.just_handed = False
 		self.settings = server_s3_settings('.')
 		last = time.time()
 		try:
@@ -1353,7 +1374,9 @@ class OrioledbS3ObjectLoader:
 		if not re.fullmatch(r'[0-9A-F]{24}', fname):
 			return self.restore(fname, path)
 		tli, segno = int(fname[0:8], 16), self.segno_of_name(fname)
-		deadline = time.time() + RESTORE_WAIT
+		deadline = time.time() + \
+		    (RESTORE_SETTLE if self.just_handed else RESTORE_WAIT)
+		self.just_handed = False
 		came = False
 		while True:
 			try:
@@ -1382,6 +1405,7 @@ class OrioledbS3ObjectLoader:
 		with open(path, 'wb') as f:
 			f.write(data)
 		self.handed = (fname, data)
+		self.just_handed = True
 		return 0
 
 	def wait_for_chunk(self, tli, deadline, conn):

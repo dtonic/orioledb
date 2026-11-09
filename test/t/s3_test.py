@@ -1576,11 +1576,15 @@ class S3Test(S3BaseTest):
 		node.stop()
 
 	def test_s3_reader_waits_for_wal_at_its_end(self):
-		"""A reader's restore_command asks its restore server, which waits
-		for WAL past the end it gave last: a commit shows on the reader at
-		once rather than after wal_retrieve_retry_interval, and an idle
-		reader no longer logs "invalid record length" on every retry.  The
-		server goes with the postmaster."""
+		"""A reader's restore_command asks its restore server, which holds
+		a request for WAL past the end it gave last for a moment: a commit
+		shows on the reader at once rather than after
+		wal_retrieve_retry_interval, and an idle reader no longer logs
+		"invalid record length" on every retry.  An OrioleDB commit shows as
+		soon as a heap one: it becomes visible only when the startup process
+		handles its interrupts, which it does not while restore_command runs,
+		so the hold stays short (with a 30 s hold it showed after 8-18 s,
+		when the next WAL came).  The server goes with the postmaster."""
 		node = self.node
 		node.append_conf(self.s3_conf())
 		node.append_conf("synchronous_standby_names = 's3'")
@@ -1588,6 +1592,7 @@ class S3Test(S3BaseTest):
 		node.safe_psql("""
 			CREATE EXTENSION orioledb;
 			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			CREATE TABLE h_test (id int PRIMARY KEY) USING heap;
 		""")
 		node.safe_psql("CHECKPOINT;")
 		with self.initNode(self.getBasePort() + 1, 'tgsb') as reader:
@@ -1602,12 +1607,12 @@ class S3Test(S3BaseTest):
 			sock = os.path.join(reader.data_dir, 'pg_wal', 'orioledb_s3_chunks',
 			                    'restore.sock')
 
-			def shows(i, within):
-				node.safe_psql(f"INSERT INTO o_test VALUES ({i});")
+			def shows(i, within, table='o_test'):
+				node.safe_psql(f"INSERT INTO {table} VALUES ({i});")
 				start = time.time()
 				while True:
 					try:
-						if reader.execute("SELECT count(*) FROM o_test "
+						if reader.execute(f"SELECT count(*) FROM {table} "
 						                  f"WHERE id = {i}")[0][0]:
 							return time.time() - start
 					except Exception:
@@ -1623,8 +1628,11 @@ class S3Test(S3BaseTest):
 				idle = f.read()
 			self.assertLessEqual(idle.count("invalid record length"), 1)
 			self.assertNotIn("waiting for WAL to become available", idle)
+			# apart, so that no later WAL makes a commit show
 			for i in range(1, 6):
-				shows(i, 3)
+				for table in ('o_test', 'h_test'):
+					shows(i, 2.5, table)
+					time.sleep(2)
 			reader.stop()
 			deadline = time.time() + 10
 			while os.path.exists(sock) and time.time() < deadline:
