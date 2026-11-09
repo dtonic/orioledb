@@ -1058,6 +1058,35 @@ class S3Test(S3BaseTest):
 			                     "WHERE name = 'orioledb.s3_secretkey'"))
 		node.stop()
 
+	def test_s3_secret_key_is_not_logged_on_a_reload(self):
+		"""A reload logs each setting it changed with its new value: a key
+		rotation put orioledb.s3_secretkey into the server log.  The log
+		names the setting and leaves its value out; other settings are
+		logged as before."""
+		node = self.node
+		node.append_conf("orioledb.s3_secretkey = 'first-secret-value'")
+		node.start()
+		node.append_conf("""
+			orioledb.s3_secretkey = 'second-secret-value'
+			orioledb.s3_accesskey = 'second-access-value'
+		""")
+		node.reload()
+		deadline = time.time() + 30
+		log = ''
+		while time.time() < deadline and \
+		    'orioledb.s3_accesskey" changed' not in log:
+			time.sleep(0.2)
+			with open(node.pg_log_file) as f:
+				log = f.read()
+		self.assertIn('parameter "orioledb.s3_secretkey" changed\n', log)
+		self.assertIn('parameter "orioledb.s3_accesskey" changed to '
+		              '"second-access-value"', log)
+		self.assertNotIn('second-secret-value', log)
+		self.assertNotIn('first-secret-value', log)
+		self.assertEqual([('second-secret-value', )],
+		                 node.execute("SHOW orioledb.s3_secretkey"))
+		node.stop()
+
 	def test_s3_loader_reads_keys_from_an_included_file(self):
 		"""restore_command takes the server's keys from its configuration
 		files, which a checkpoint puts into the bucket: the keys are best
