@@ -77,8 +77,23 @@ static void s3_smgr_init(BTreeDescr *descr);
 static void s3_smgr_open(BTreeDescr *descr);
 static void s3_smgr_close(BTreeDescr *descr);
 
+/*
+ * Number of slots counting the page writes to the data files, see
+ * disk_write_slot().
+ */
+#define DISK_WRITE_SLOTS	1024
+
 typedef struct
 {
+	/*
+	 * Page writes to the data files, counted per slot of (tree, block): the
+	 * number started and the number finished.  read_page_from_disk_unlocked()
+	 * compares them around its read to tell a page torn by a write that went
+	 * on at the same time from a page that is corrupt on disk.
+	 */
+	pg_atomic_uint64 diskWritesStarted[DISK_WRITE_SLOTS];
+	pg_atomic_uint64 diskWritesFinished[DISK_WRITE_SLOTS];
+
 	pg_atomic_uint64 writesStarted;
 	pg_atomic_uint64 writesFinished;
 	ConditionVariable cv[FLEXIBLE_ARRAY_MEMBER];
@@ -134,6 +149,9 @@ static bool get_free_disk_extent_copy_blkno(BTreeDescr *desc, off_t page_size,
 static bool write_page_to_disk(BTreeDescr *desc, FileExtent *extent,
 							   uint32 curChkpNum,
 							   Pointer page, off_t page_size);
+static bool write_page_to_disk_internal(BTreeDescr *desc, FileExtent *extent,
+										uint32 curChkpNum,
+										Pointer page, off_t page_size);
 static void write_page(OBTreeFindPageContext *context,
 					   OInMemoryBlkno blkno, Page img,
 					   uint32 checkpoint_number,
@@ -165,6 +183,11 @@ btree_io_shmem_init(Pointer buf, bool found)
 
 		pg_atomic_init_u64(&ioShmem->writesStarted, 0);
 		pg_atomic_init_u64(&ioShmem->writesFinished, 0);
+		for (i = 0; i < DISK_WRITE_SLOTS; i++)
+		{
+			pg_atomic_init_u64(&ioShmem->diskWritesStarted[i], 0);
+			pg_atomic_init_u64(&ioShmem->diskWritesFinished[i], 0);
+		}
 
 		for (i = 0; i < max_procs; i++)
 			ConditionVariableInit(&ioShmem->cv[i]);
@@ -1535,7 +1558,8 @@ oriole_checksum_block(const OrioleDBChecksummablePage *page, uint32 len)
 
 static bool
 check_orioledb_page_checksum(OrioleDBOndiskPageHeader ondisk_page_header,
-							 char *buf, const char *label, uint32 len)
+							 char *buf, const char *label, uint32 len,
+							 int elevel)
 {
 	uint16		computedCheckSum = 0;
 
@@ -1548,7 +1572,7 @@ check_orioledb_page_checksum(OrioleDBOndiskPageHeader ondisk_page_header,
 
 	if (computedCheckSum != ondisk_page_header.checkSum)
 	{
-		ereport(WARNING,
+		ereport(elevel,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("%s page checksum mismatch: stored %u, computed %u",
 						label, ondisk_page_header.checkSum, computedCheckSum)));
@@ -1578,9 +1602,9 @@ check_orioledb_compress_version(OrioleDBOndiskPageHeader ondisk_page_header)
  * Reads a page from disk to the img from a valid downlink. It's fills an empty
  * array of offsets for the page.
  */
-OReadPageResult
-read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
-					FileExtent *extent)
+static OReadPageResult
+read_page_from_disk_internal(BTreeDescr *desc, Pointer img, uint64 downlink,
+							 FileExtent *extent, int elevel)
 {
 	off_t		byte_offset,
 				read_size;
@@ -1618,7 +1642,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 		needs_page_version_convert = check_orioledb_page_version(ondisk_page_header);
 
 		if (orioledb_checksums_enabled &&
-			!check_orioledb_page_checksum(ondisk_page_header, img, "plain", oriole_checksum_block_len(read_size)))
+			!check_orioledb_page_checksum(ondisk_page_header, img, "plain", oriole_checksum_block_len(read_size), elevel))
 			return OReadPageResultChecksumFailed;
 
 		elog(DEBUG1, "Read plain disk page: checkpoint %u", ondisk_page_header.checkpointNum);
@@ -1645,7 +1669,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 			needs_page_version_convert = check_orioledb_page_version(ondisk_page_header);
 
 			if (orioledb_checksums_enabled &&
-				!check_orioledb_page_checksum(ondisk_page_header, buf, "compressed", oriole_checksum_block_len(read_size)))
+				!check_orioledb_page_checksum(ondisk_page_header, buf, "compressed", oriole_checksum_block_len(read_size), elevel))
 				return OReadPageResultChecksumFailed;
 
 			needs_compress_version_convert = check_orioledb_compress_version(ondisk_page_header);
@@ -1689,7 +1713,7 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 				 */
 				memcpy(img, &ondisk_page_header, O_PAGE_HEADER_SIZE);
 
-				if (!check_orioledb_page_checksum(ondisk_page_header, img, "compressed (len=1)", oriole_checksum_block_len(ORIOLEDB_BLCKSZ)))
+				if (!check_orioledb_page_checksum(ondisk_page_header, img, "compressed (len=1)", oriole_checksum_block_len(ORIOLEDB_BLCKSZ), elevel))
 					return OReadPageResultChecksumFailed;
 			}
 
@@ -1749,11 +1773,124 @@ read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
 }
 
 /*
+ * Reads a page from disk to the img from a valid downlink.  The caller must
+ * keep the page from being written meanwhile: it holds the parent's downlink
+ * locked, so the page is not in memory and nobody can write it.
+ */
+OReadPageResult
+read_page_from_disk(BTreeDescr *desc, Pointer img, uint64 downlink,
+					FileExtent *extent)
+{
+	return read_page_from_disk_internal(desc, img, downlink, extent, WARNING);
+}
+
+/*
+ * The slot counting the writes of the tree's block at `off`.
+ */
+static inline int
+disk_write_slot(BTreeDescr *desc, uint64 off)
+{
+	uint64		key;
+
+	key = hash_combine64(((uint64) desc->oids.datoid << 32) |
+						 desc->oids.relnode, off);
+	return (int) (murmurhash64(key) % DISK_WRITE_SLOTS);
+}
+
+/*
+ * Waits up to this long, in milliseconds, for the writes that tore a page to
+ * be done before reporting the page as corrupt.
+ */
+#define TORN_READ_MAX_WAIT_MS	10000
+
+/*
+ * Reads a page from disk like read_page_from_disk(), but from a downlink the
+ * caller took earlier without keeping the page from being loaded and written
+ * again since.
+ *
+ * A sequential scan collects the downlinks of the leaves on disk and reads
+ * them afterwards, in file order, without any lock.  Meanwhile a leaf can be
+ * loaded, changed and evicted again.  A page that was already written during
+ * the current checkpoint is written over in place (copy-on-write only applies
+ * across checkpoints), so the scan can read the block while it is being
+ * written.  A newer image is fine: the scan takes it back to its snapshot
+ * with the page's undo.  But a read and a write of the same block at the same
+ * time are not atomic against each other, and the read can return a mix of
+ * the old and the new image, which fails its checksum.
+ *
+ * So a checksum failure is retried while writes of the same slot overlapped
+ * the read: such a page is torn, not corrupt.  Writers count their writes
+ * in the slot before and after writing (write_page_to_disk()).  A write that
+ * overlapped the read had started before the read ended and had not finished
+ * before it began, so the started count read after the read exceeds the
+ * finished count read before it.  A failure no write overlapped is reported
+ * as before.
+ */
+OReadPageResult
+read_page_from_disk_unlocked(BTreeDescr *desc, Pointer img, uint64 downlink,
+							 FileExtent *extent)
+{
+	int			slot = disk_write_slot(desc, DOWNLINK_GET_DISK_OFF(downlink));
+	int			waited = 0;
+
+	while (true)
+	{
+		OReadPageResult result;
+		uint64		finished,
+					started;
+
+		finished = pg_atomic_read_u64(&ioShmem->diskWritesFinished[slot]);
+		pg_memory_barrier();
+		result = read_page_from_disk_internal(desc, img, downlink, extent,
+											  DEBUG1);
+		if (result != OReadPageResultChecksumFailed)
+			return result;
+		pg_memory_barrier();
+		started = pg_atomic_read_u64(&ioShmem->diskWritesStarted[slot]);
+
+		if (started == finished || waited >= TORN_READ_MAX_WAIT_MS)
+			break;
+
+		elog(DEBUG1, "page with file offset " UINT64_FORMAT
+			 " was written while it was read, reading it again",
+			 DOWNLINK_GET_DISK_OFF(downlink));
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 1, WAIT_EVENT_PG_SLEEP);
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+		waited++;
+	}
+
+	/* corrupt on disk: read it once more to report it */
+	return read_page_from_disk_internal(desc, img, downlink, extent, WARNING);
+}
+
+/*
  * Writes a page to the disk. An array of file offsets must be valid.
+ *
+ * The write is counted in its slot (see read_page_from_disk_unlocked()).  A
+ * write that errors out stays counted as going on, which only makes the
+ * readers of that slot wait out TORN_READ_MAX_WAIT_MS before they report a
+ * page that fails its checksum.
  */
 static bool
 write_page_to_disk(BTreeDescr *desc, FileExtent *extent, uint32 curChkpNum,
 				   Pointer page, off_t page_size)
+{
+	int			slot = disk_write_slot(desc, extent->off);
+	bool		result;
+
+	(void) pg_atomic_fetch_add_u64(&ioShmem->diskWritesStarted[slot], 1);
+	result = write_page_to_disk_internal(desc, extent, curChkpNum,
+										 page, page_size);
+	(void) pg_atomic_fetch_add_u64(&ioShmem->diskWritesFinished[slot], 1);
+
+	return result;
+}
+
+static bool
+write_page_to_disk_internal(BTreeDescr *desc, FileExtent *extent,
+							uint32 curChkpNum, Pointer page, off_t page_size)
 {
 
 	off_t		byte_offset,
@@ -1769,6 +1906,7 @@ write_page_to_disk(BTreeDescr *desc, FileExtent *extent, uint32 curChkpNum,
 	if (!OCompressIsValid(desc->compress))
 	{
 		OrioleDBOndiskPageHeader *ondisk_page_header;
+		Jsonb	   *params = NULL;
 
 		/*
 		 * Easy case, write whole page to uncompressed index.
@@ -1791,7 +1929,28 @@ write_page_to_disk(BTreeDescr *desc, FileExtent *extent, uint32 curChkpNum,
 		if (orioledb_checksums_enabled)
 			ondisk_page_header->checkSum = (uint16) ((oriole_checksum_block(&cp, oriole_checksum_block_len(write_size)) % 65535) + 1);
 
-		err = btree_smgr_write(desc, buf, curChkpNum, write_size, byte_offset) != write_size;
+		if (STOPEVENTS_ENABLED() && stopevent_enabled(STOPEVENT_WRITE_PAGE_TORN))
+			params = btree_page_stopevent_params(desc, page);
+		if (params && check_stopevent(STOPEVENT_WRITE_PAGE_TORN, params))
+		{
+			/*
+			 * For the tests: tear the write, so that a concurrent read can
+			 * find the block half written.  The body goes first and the
+			 * header, with the checksum, last: the body always differs from
+			 * the image written before, as it holds the page's csn and undo
+			 * location.
+			 */
+			off_t		body = write_size - O_PAGE_HEADER_SIZE;
+
+			err = btree_smgr_write(desc, buf + O_PAGE_HEADER_SIZE, curChkpNum,
+								   body, byte_offset + O_PAGE_HEADER_SIZE) != body;
+			handle_stopevent(STOPEVENT_WRITE_PAGE_TORN, params);
+			if (!err)
+				err = btree_smgr_write(desc, buf, curChkpNum, O_PAGE_HEADER_SIZE,
+									   byte_offset) != O_PAGE_HEADER_SIZE;
+		}
+		else
+			err = btree_smgr_write(desc, buf, curChkpNum, write_size, byte_offset) != write_size;
 
 		elog(DEBUG1, "Wrote plain disk page: checkpoint %u", curChkpNum);
 	}

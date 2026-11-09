@@ -41,6 +41,7 @@ extern Datum pg_stopevents(PG_FUNCTION_ARGS);
 extern bool pid_is_waiting_for_stopevent(int pid);
 extern void handle_stopevent(int event_id, Jsonb *params);
 extern bool check_stopevent(int event_id, Jsonb *params);
+extern bool stopevent_enabled(int event_id);
 extern void wait_for_stopevent_enabled(int event_id);
 extern void stopevents_make_cxt(void);
 

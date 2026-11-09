@@ -4,6 +4,7 @@
 from itertools import chain, groupby
 import re
 import os
+import time
 import glob
 import stat
 import unittest
@@ -142,6 +143,88 @@ class FilesTest(BaseTest):
 
 	def test_seq_scan_compressed(self):
 		self.seq_scan_base(True)
+
+	def test_seq_scan_reads_leaf_written_over_meanwhile(self):
+		"""A sequential scan collects the downlinks of the leaves on disk and
+		reads them afterwards without a lock.  A leaf already written during
+		the current checkpoint is written over in place when it is evicted
+		again, so the scan can read the block while it is half written.  The
+		scan has to read it again once the write is done, not report the
+		leaf as corrupt."""
+		node = self.node
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION IF NOT EXISTS orioledb;
+			CREATE TABLE o_torn (
+				key int PRIMARY KEY,
+				value int NOT NULL
+			) USING orioledb;
+			INSERT INTO o_torn SELECT i, 0 FROM generate_series(1, 5000) i;
+			CHECKPOINT;
+		""")
+		node.safe_psql("SELECT orioledb_evict_pages('o_torn'::regclass, 0);")
+		# The first write after the checkpoint moves the rightmost leaf to a
+		# new block, the last in the file; the next one writes over it.
+		node.safe_psql("UPDATE o_torn SET value = 1 WHERE key = 5000;")
+		node.safe_psql("SELECT orioledb_evict_pages('o_torn'::regclass, 0);")
+
+		ctrl = node.connect()
+		scan = node.connect()
+		writer = node.connect()
+		scan_pid = scan.pid
+		writer_pid = writer.pid
+		scan.execute("SET max_parallel_workers_per_gather = 0;")
+		scan.execute("SET orioledb.enable_stopevents = true;")
+		writer.execute("SET orioledb.enable_stopevents = true;")
+
+		try:
+			# the scan stops after reading the first leaf from disk
+			ctrl.execute("SELECT pg_stopevent_set('scan_disk_page', 'true');")
+			t_scan = ThreadQueryExecutor(
+			    scan, "SELECT count(*), sum(value) FROM o_torn;")
+			t_scan.start()
+			wait_stopevent(node, scan_pid)
+
+			# the rightmost leaf is loaded, changed and written over in place,
+			# and the write stops half done
+			ctrl.execute("""SELECT pg_stopevent_set('write_page_torn',
+			    '$.treeName == "o_torn_pkey" && $.level == 0');""")
+			writer.execute("UPDATE o_torn SET value = 2 WHERE key = 5000;")
+			writer.commit()
+			t_write = ThreadQueryExecutor(
+			    writer, "SELECT orioledb_evict_pages('o_torn'::regclass, 0);")
+			t_write.start()
+			wait_stopevent(node, writer_pid)
+
+			# the scan reads the half written leaf and waits for the write
+			ctrl.execute("SELECT pg_stopevent_reset('scan_disk_page');")
+			deadline = time.time() + 30
+			while t_scan.is_alive() and time.time() < deadline:
+				if ctrl.execute("SELECT 1 FROM pg_stat_activity "
+				                "WHERE pid = %d AND wait_event = 'PgSleep';" %
+				                scan_pid):
+					break
+				time.sleep(0.05)
+			self.assertTrue(t_scan.is_alive(),
+			                "the scan did not wait for the write")
+
+			ctrl.execute("SELECT pg_stopevent_reset('write_page_torn');")
+			t_write.join()
+			# the scan's snapshot was taken before the second update
+			self.assertEqual(t_scan.join(), [(5000, 1)])
+		finally:
+			# a failure must not leave the writer parked
+			ctrl.execute("SELECT pg_stopevent_reset('scan_disk_page');")
+			ctrl.execute("SELECT pg_stopevent_reset('write_page_torn');")
+		for con in (ctrl, scan, writer):
+			con.close()
+		self.assertEqual(
+		    node.execute("SELECT count(*), sum(value) FROM o_torn;"),
+		    [(5000, 2)])
+		self.assertTrue(
+		    node.execute(
+		        "SELECT orioledb_tbl_check('o_torn'::regclass, TRUE);")[0][0])
+		node.stop()
 
 	def test_check_if_tmp_not_exist(self):
 		node = self.node
