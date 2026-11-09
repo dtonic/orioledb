@@ -435,6 +435,18 @@ handle_stopevent(int event_id, Jsonb *params)
 	MemoryContextReset(stopevents_cxt);
 }
 
+/*
+ * Is the event set?  Lets a caller skip building costly params for an event
+ * nobody waits on.
+ */
+bool
+stopevent_enabled(int event_id)
+{
+	Assert(event_id >= 0 && event_id < STOPEVENTS_COUNT);
+
+	return stopevents[event_id].enabled;
+}
+
 bool
 check_stopevent(int event_id, Jsonb *params)
 {

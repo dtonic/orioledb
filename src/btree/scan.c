@@ -1886,8 +1886,12 @@ read_disk_leaf_into_img(BTreeSeqScan *scan, uint64 downlinkLoc, CommitSeqNo csn)
 	/* a scan's read does not keep the part from eviction (s3/headers.c) */
 	if (orioledb_s3_mode)
 		s3_headers_scan_read(true);
-	read_result = read_page_from_disk(scan->desc, scan->leafImg, downlinkLoc,
-									  &extent);
+	/*
+	 * The downlink was taken earlier and the leaf may be written over in
+	 * place meanwhile, see read_page_from_disk_unlocked().
+	 */
+	read_result = read_page_from_disk_unlocked(scan->desc, scan->leafImg,
+											   downlinkLoc, &extent);
 	if (orioledb_s3_mode)
 		s3_headers_scan_read(false);
 	header = (BTreePageHeader *) scan->leafImg;
