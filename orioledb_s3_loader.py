@@ -1360,6 +1360,9 @@ class OrioledbS3ObjectLoader:
 		# keys a reload rotated: as each --restore read them
 		settings = server_s3_settings('.')
 		if settings != self.settings:
+			# a new client, from a new session: the default one keeps the
+			# credentials it found first
+			boto3.DEFAULT_SESSION = None
 			self.parse_args()
 			self.settings = settings
 		rc = self.restore_waiting(fname, path, conn)
