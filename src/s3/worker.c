@@ -64,8 +64,24 @@ typedef struct S3WorkerCtl
 	pg_atomic_flag workersInProgress[FLEXIBLE_ARRAY_MEMBER];
 } S3WorkerCtl;
 
+/*
+ * How many entries of its part of workers_file_checksums a worker has filled
+ * and not flushed, and for which checkpoint.  In shared memory, as the
+ * entries are: a worker that exits in a task (a request the store refused
+ * for good is its FATAL) starts again with the entries it had, not with
+ * none.  Left behind, up to WORKERS_FILE_CHECKSUMS_MAX_LEN - 1 files were
+ * missing from file_checksums, and with them from the manifest's "file"
+ * lines: a checkpoint that said it was complete and restored without them.
+ */
+typedef struct S3WorkerChecksums
+{
+	uint32		chkpNum;
+	uint32		len;
+} S3WorkerChecksums;
+
 static volatile S3TaskLocation *workers_locations = NULL;
 static S3FileChecksum *workers_file_checksums = NULL;
+static S3WorkerChecksums *workers_checksums = NULL;
 
 static S3WorkerCtl *workers_ctl = NULL;
 static S3ChecksumState *checksum_state = NULL;
@@ -86,6 +102,8 @@ s3_workers_shmem_needs(void)
 	size = add_size(size,
 					CACHELINEALIGN(mul_size(sizeof(S3TaskLocation), s3_num_workers)));
 	size = add_size(size,
+					CACHELINEALIGN(mul_size(sizeof(S3WorkerChecksums), s3_num_workers)));
+	size = add_size(size,
 					CACHELINEALIGN(mul_size(sizeof(S3FileChecksum),
 											s3_num_workers *
 											WORKERS_FILE_CHECKSUMS_MAX_LEN)));
@@ -105,10 +123,15 @@ s3_workers_init_shmem(Pointer ptr, bool found)
 	workers_locations = (S3TaskLocation *) ptr;
 	ptr += CACHELINEALIGN(mul_size(sizeof(S3TaskLocation), s3_num_workers));
 
+	workers_checksums = (S3WorkerChecksums *) ptr;
+	ptr += CACHELINEALIGN(mul_size(sizeof(S3WorkerChecksums), s3_num_workers));
+
 	workers_file_checksums = (S3FileChecksum *) ptr;
 
 	if (!found)
 	{
+		memset(workers_checksums, 0, sizeof(S3WorkerChecksums) * s3_num_workers);
+
 		pg_atomic_init_u32(&workers_ctl->fileChecksumsCnt, 0);
 
 		ConditionVariableInit(&workers_ctl->fileChecksumsFlushedCV);
@@ -179,6 +202,8 @@ s3_workers_checkpoint_init(void)
 		char		worker_filename[MAXPGPATH];
 
 		pg_atomic_clear_flag(&workers_ctl->workersInProgress[i]);
+		workers_checksums[i].chkpNum = 0;
+		workers_checksums[i].len = 0;
 
 		snprintf(worker_filename, sizeof(worker_filename), "%s.%d",
 				 FILE_CHECKSUMS_FILENAME, i);
@@ -197,11 +222,21 @@ s3_workers_checkpoint_finish(void)
 
 	s3_workers_wait_for_flush();
 
-	file = BasicOpenFile(FILE_CHECKSUMS_FILENAME, O_CREAT | O_WRONLY | O_TRUNC | PG_BINARY);
+	/*
+	 * Written aside and renamed.  Written in place, a checkpointer that died
+	 * in the copy left the file cut inside a line: the next checkpoint's
+	 * workers all refused it ("invalid line format") and restarted for
+	 * ever, with no checkpoint done until the file was removed by hand; cut
+	 * inside a line's checkpoint number, the line read as an older
+	 * checkpoint's and the manifest named that one's object for the file.
+	 */
+	file = BasicOpenFile(FILE_CHECKSUMS_FILENAME ".tmp",
+						 O_CREAT | O_WRONLY | O_TRUNC | PG_BINARY);
 	if (file < 0)
 		ereport(ERROR,
 				(errcode_for_file_access(),
-				 errmsg("could not create file \"%s\": %m", FILE_CHECKSUMS_FILENAME)));
+				 errmsg("could not create file \"%s\": %m",
+						FILE_CHECKSUMS_FILENAME ".tmp")));
 
 	for (int i = 0; i < s3_num_workers; i++)
 	{
@@ -247,9 +282,12 @@ s3_workers_checkpoint_finish(void)
 	if (pg_fsync(file) != 0)
 		ereport(FATAL,
 				(errcode_for_file_access(),
-				 errmsg("could not fsync file \"%s\": %m", FILE_CHECKSUMS_FILENAME)));
+				 errmsg("could not fsync file \"%s\": %m",
+						FILE_CHECKSUMS_FILENAME ".tmp")));
 
 	close(file);
+	(void) durable_rename(FILE_CHECKSUMS_FILENAME ".tmp",
+						  FILE_CHECKSUMS_FILENAME, ERROR);
 
 	/* The compaction is completed, now we can remove worker files */
 	for (int i = 0; i < s3_num_workers; i++)
@@ -280,6 +318,33 @@ flush_worker_checksum_state(void)
 	snprintf(filename, MAXPGPATH, "%s.%d", FILE_CHECKSUMS_FILENAME, worker_num);
 
 	flushS3ChecksumState(checksum_state, filename);
+	workers_checksums[worker_num].len = 0;
+}
+
+/*
+ * This worker's checksum state for checkpoint chkpNum, with the entries a
+ * worker that exited before flushing them left in shared memory.
+ */
+static void
+open_worker_checksum_state(uint32 chkpNum)
+{
+	S3WorkerChecksums *shared = &workers_checksums[worker_num];
+
+	if (checksum_state != NULL)
+		return;
+
+	checksum_state = makeS3ChecksumState(chkpNum,
+										 get_worker_file_checksums(),
+										 WORKERS_FILE_CHECKSUMS_MAX_LEN,
+										 FILE_CHECKSUMS_FILENAME);
+	if (shared->chkpNum == chkpNum &&
+		shared->len <= WORKERS_FILE_CHECKSUMS_MAX_LEN)
+		checksum_state->fileChecksumsLen = shared->len;
+	else
+	{
+		shared->chkpNum = chkpNum;
+		shared->len = 0;
+	}
 }
 
 /*
@@ -565,6 +630,7 @@ part_done:
 	{
 		char	   *filename;
 		SeqBufTag	chkp_tag;
+		uint32		objectChkpNum = task->typeSpecific.filePart.objectChkpNum;
 
 		memset(&chkp_tag, 0, sizeof(chkp_tag));
 		chkp_tag.key = task->typeSpecific.filePart.key;
@@ -575,15 +641,19 @@ part_done:
 		/* the run that writes a map is the one whose key it is */
 		objectname = s3_map_object_name(task->typeSpecific.filePart.key,
 										s3_lease_token(),
+										objectChkpNum != 0 ? objectChkpNum :
 										task->typeSpecific.filePart.chkpNum);
 
 		elog(DEBUG1, "S3 map put %s %s", objectname, filename);
 
 		/*
 		 * The key names the writer: no other writer's map is ever here, and
-		 * ours may be written again (a build, then the checkpoint).
+		 * ours may be written again (a build, then the checkpoint).  A
+		 * build's copy under the committed checkpoint's number is for a tree
+		 * that checkpoint did not have; it never replaces a map that
+		 * checkpoint wrote.
 		 */
-		s3_put_file(objectname, filename, false);
+		s3_put_file(objectname, filename, objectChkpNum != 0);
 
 		pfree(filename);
 		pfree(objectname);
@@ -728,18 +798,32 @@ part_done:
 
 			pg_atomic_test_set_flag(&workers_ctl->workersInProgress[worker_num]);
 
-			if (checksum_state == NULL)
-				checksum_state = makeS3ChecksumState(task->typeSpecific.writePGFile.chkpNum,
-													 get_worker_file_checksums(),
-													 WORKERS_FILE_CHECKSUMS_MAX_LEN,
-													 FILE_CHECKSUMS_FILENAME);
+			open_worker_checksum_state(task->typeSpecific.writePGFile.chkpNum);
 
 			Assert(checksum_state->checkpointNumber == task->typeSpecific.writePGFile.chkpNum);
+
+			/*
+			 * The task the worker before this one exited in: its entry is
+			 * the last one it left.  The file is read again here, so the
+			 * entry is made again too; kept as well, the file had two lines
+			 * in the checksum file, which the next checkpoint refuses.
+			 */
+			if (s3_worker_replaying && checksum_state->fileChecksumsLen > 0 &&
+				strcmp(checksum_state->fileChecksums[checksum_state->fileChecksumsLen - 1].filename,
+					   filename) == 0)
+				checksum_state->fileChecksumsLen--;
 
 			if (checksum_state->fileChecksumsLen == WORKERS_FILE_CHECKSUMS_MAX_LEN)
 				flush_worker_checksum_state();
 
 			entry = getS3FileChecksum(checksum_state, filename, data, size);
+
+			/*
+			 * Counted before the put: a put that ends this worker leaves the
+			 * entry to the worker that takes the task again, which adds it a
+			 * second time, with the same checksum.
+			 */
+			workers_checksums[worker_num].len = checksum_state->fileChecksumsLen;
 
 			if (entry->changed)
 				(void) s3_put_object_with_contents(objectname, data, size,
@@ -872,6 +956,40 @@ s3_schedule_map_file_write(uint32 chkpNum, OIndexKey key)
 
 	elog(DEBUG1, "S3 schedule map write: %u %u %u (%llu)",
 		 key.oids.datoid, key.oids.relnode, chkpNum,
+		 (unsigned long long) location);
+
+	pfree(task);
+
+	return location;
+}
+
+/*
+ * Schedule a copy of the map a build named with chkpNum, under the number of
+ * the checkpoint the bucket has committed.  The build's number is the local
+ * one: ahead of the bucket's when the build ended behind a checkpoint in
+ * progress, or after one the bucket has not committed.  A data directory
+ * loaded from the bucket then starts from the committed checkpoint and looks
+ * for the map of a tree built after it under that number
+ * (s3_adopt_built_tree_map()).  The copy is no line of any manifest.
+ */
+S3TaskLocation
+s3_schedule_map_copy_write(uint32 chkpNum, uint32 objectChkpNum, OIndexKey key)
+{
+	S3Task	   *task;
+	S3TaskLocation location;
+
+	Assert(objectChkpNum != 0 && objectChkpNum != chkpNum);
+	task = (S3Task *) palloc0(sizeof(S3Task));
+	task->type = S3TaskTypeWriteFilePart;
+	task->typeSpecific.filePart.chkpNum = chkpNum;
+	task->typeSpecific.filePart.key = key;
+	task->typeSpecific.filePart.partNum = -1;
+	task->typeSpecific.filePart.objectChkpNum = objectChkpNum;
+
+	location = s3_queue_put_task((Pointer) task, sizeof(S3Task));
+
+	elog(DEBUG1, "S3 schedule map copy write: %u %u %u as %u (%llu)",
+		 key.oids.datoid, key.oids.relnode, chkpNum, objectChkpNum,
 		 (unsigned long long) location);
 
 	pfree(task);
@@ -1363,7 +1481,14 @@ s3worker_main(Datum main_arg)
 			if (!pg_atomic_unlocked_test_flag(&workers_ctl->workersInProgress[worker_num]) &&
 				pg_atomic_read_u32(&workers_ctl->fileChecksumsCnt) == 0)
 			{
-				/* checksum_state might be NULL if the worker restarted */
+				/*
+				 * A worker that restarted has no state of its own, but may
+				 * have entries the one before it left unflushed.
+				 */
+				if (checksum_state == NULL &&
+					workers_checksums[worker_num].len > 0)
+					open_worker_checksum_state(workers_checksums[worker_num].chkpNum);
+
 				if (checksum_state != NULL)
 				{
 					if (checksum_state->fileChecksumsLen > 0)

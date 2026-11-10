@@ -202,6 +202,7 @@ typedef struct
 	List	   *tablespaces;
 	List	   *smallFileNames;
 	List	   *smallFileSizes;
+	List	   *smallFileData;	/* the bytes the checksum was taken of */
 	int			smallFilesTotalSize;
 	int			smallFilesNum;
 	S3ChecksumState *checksumState;
@@ -265,6 +266,7 @@ s3_perform_backup(int flags, S3TaskLocation maxLocation)
 	state.chkpNum = chkpNum;
 	state.smallFileNames = NIL;
 	state.smallFileSizes = NIL;
+	state.smallFileData = NIL;
 	state.smallFilesTotalSize = sizeof(int);
 	state.smallFilesNum = 0;
 	state.checksumState = makeS3ChecksumState(chkpNum, fileChecksums,
@@ -777,32 +779,6 @@ write_data(File file, char *filename, int offset, Pointer ptr, int length)
 						filename)));
 }
 
-static Pointer
-read_small_file(const char *filename, int size)
-{
-	File		file;
-	Pointer		buffer;
-	int			rc;
-
-	buffer = (Pointer) palloc(size);
-
-	file = PathNameOpenFile(filename, O_RDONLY | PG_BINARY);
-	if (file < 0)
-		return NULL;
-
-	rc = FileRead(file, buffer, size, 0, WAIT_EVENT_DATA_FILE_READ);
-
-	if (rc < 0)
-		ereport(ERROR,
-				(errcode_for_file_access(),
-				 errmsg("could not read small file \"%s\": %m",
-						filename)));
-
-	FileClose(file);
-
-	return buffer;
-}
-
 static S3TaskLocation
 flush_small_files(S3BackupState *state)
 {
@@ -855,12 +831,18 @@ flush_small_files(S3BackupState *state)
 		offset += len;
 	}
 
-	forboth(lc, state->smallFileNames, lc2, state->smallFileSizes)
+	/*
+	 * The bytes read when the file's checksum was taken, not the file read
+	 * again by the size stat() gave: a file removed in between gave no data
+	 * to write (the checkpoint's ERROR, after its control file was written),
+	 * and one that shrank put what the buffer happened to hold after its
+	 * end into the bundle, under a checksum of other bytes.
+	 */
+	forboth(lc, state->smallFileData, lc2, state->smallFileSizes)
 	{
 		int			len = lfirst_int(lc2);
-		Pointer		data = read_small_file(lfirst(lc), len);
 
-		write_data(file, filename, offset, data, len);
+		write_data(file, filename, offset, (Pointer) lfirst(lc), len);
 		offset += len;
 	}
 
@@ -872,8 +854,10 @@ flush_small_files(S3BackupState *state)
 
 	list_free_deep(state->smallFileNames);
 	list_free(state->smallFileSizes);
+	list_free_deep(state->smallFileData);
 	state->smallFileNames = NIL;
 	state->smallFileSizes = NIL;
+	state->smallFileData = NIL;
 	state->smallFilesTotalSize = sizeof(int);
 	state->smallFilesNum++;
 
@@ -883,7 +867,7 @@ flush_small_files(S3BackupState *state)
 static S3TaskLocation
 accumulate_small_file(S3BackupState *state, const char *path, int size)
 {
-	int			sizeRequired = 3 * sizeof(int) + strlen(path) + 1 + size;
+	int			sizeRequired;
 	S3TaskLocation location = 0;
 	Pointer		data;
 	uint64		dataSize;
@@ -891,7 +875,14 @@ accumulate_small_file(S3BackupState *state, const char *path, int size)
 	/* First check if the file changed */
 	data = read_file(path, &dataSize);
 
-	if (data != NULL)
+	/* removed since the directory was read: not a file of this checkpoint */
+	if (data == NULL)
+		return 0;
+
+	/* what was read is what goes into the bundle, whatever stat() said */
+	size = (int) dataSize;
+	sizeRequired = 3 * sizeof(int) + strlen(path) + 1 + size;
+
 	{
 		S3FileChecksum *entry;
 
@@ -911,8 +902,6 @@ accumulate_small_file(S3BackupState *state, const char *path, int size)
 			pfree(data);
 			return 0;
 		}
-
-		pfree(data);
 	}
 
 	/* The file changed, put it into the smallFileNames list */
@@ -922,6 +911,7 @@ accumulate_small_file(S3BackupState *state, const char *path, int size)
 
 	state->smallFileNames = lappend(state->smallFileNames, pstrdup(path));
 	state->smallFileSizes = lappend_int(state->smallFileSizes, size);
+	state->smallFileData = lappend(state->smallFileData, data);
 	state->smallFilesTotalSize += sizeRequired;
 
 	return location;

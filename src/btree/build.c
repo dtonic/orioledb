@@ -22,6 +22,8 @@
 #include "btree/split.h"
 #include "checkpoint/checkpoint.h"
 #include "recovery/recovery.h"
+#include "s3/lease.h"
+#include "s3/manifest.h"
 #include "s3/worker.h"
 #include "tableam/descr.h"
 #include "tuple/toast.h"
@@ -486,7 +488,26 @@ btree_write_file_header(BTreeDescr *desc, CheckpointFileHeader *file_header)
 		{
 			OIndexKey	key = {.oids = desc->oids};
 
+			uint32		committed = s3_lease_root_checkpoint();
+
 			result = s3_schedule_map_file_write(checkpoint_number, key);
+
+			/*
+			 * The bucket's committed checkpoint is not the one the map is
+			 * named with: this build ended behind a checkpoint in progress,
+			 * or after one the bucket has not committed.  A writer that takes
+			 * over before the bucket gets there starts from the committed
+			 * one and looks for this tree's map under its number.  The later
+			 * task's location covers both.
+			 */
+			if (committed != 0 && committed != checkpoint_number)
+			{
+				/* noted first: a copy never noted is never removed */
+				s3_note_map_copy(desc->oids.datoid, desc->oids.relnode,
+								 committed);
+				result = s3_schedule_map_copy_write(checkpoint_number,
+													committed, key);
+			}
 		}
 	}
 	else

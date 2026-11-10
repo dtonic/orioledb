@@ -3808,6 +3808,18 @@ checkpoint_ix(int flags, BTreeDescr *descr)
 			free_seq_buf_pages(descr, descr->nextChkp[cur_chkp_index].shared);
 			pfree(dead_name);
 		}
+
+		/*
+		 * The tree's files have to stay until these uploads are done: the
+		 * manifest names them from here on.  Whoever drops the tree waits
+		 * for this location first (cleanup_btree_extended()).
+		 */
+		if (location > 0)
+		{
+			BTreeS3PartsInfo *partsInfo = &BTREE_GET_META(descr)->partsInfo[chkpNum % 2];
+
+			partsInfo->writeMaxLocation = Max(partsInfo->writeMaxLocation, location);
+		}
 	}
 
 	chkp_inc_changecount_before(checkpoint_state);
@@ -6379,6 +6391,27 @@ evictable_tree_init_meta(BTreeDescr *desc, EvictedTreeData **evicted_data,
 
 			prev_chkp_file = PathNameOpenFile(prev_chkp_fname, O_RDONLY | PG_BINARY);
 			prev_chkp_file_exist = prev_chkp_file >= 0;
+		}
+		else if (orioledb_s3_mode &&
+				 !prev_chkp_file_exist &&
+				 found)
+		{
+			/*
+			 * A tree known under the current checkpoint's own number, with no
+			 * map here.  A build that ended while that checkpoint walked the
+			 * trees, at a place the walk had passed, named its map with it:
+			 * the checkpoint's image of the numbers has the tree, but the map
+			 * was the build's upload, no line of the checkpoint's manifest,
+			 * and a data directory loaded at that checkpoint did not get it.
+			 * Recovery replaying a change of the table opens the tree here,
+			 * before any later checkpoint: read as empty, it kept only the
+			 * rows replayed.
+			 */
+			if (s3_try_load_map_file(prev_chkp_tag.num, prev_chkp_tag.key))
+			{
+				prev_chkp_file = PathNameOpenFile(prev_chkp_fname, O_RDONLY | PG_BINARY);
+				prev_chkp_file_exist = prev_chkp_file >= 0;
+			}
 		}
 		else if (orioledb_s3_mode &&
 				 !prev_chkp_file_exist &&

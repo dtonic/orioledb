@@ -1536,6 +1536,129 @@ collect_abandoned_trees(uint32 r, uint32 committed)
 }
 
 /*
+ * The copies builds put of their maps (s3_note_map_copy()): each goes once
+ * the checkpoint it is numbered with is collected.  A writer that takes over
+ * starts from a checkpoint the GC keeps, and looks for a built tree's map
+ * under that number only.  The list is taken aside first, as the dropped
+ * trees' is; what cannot go yet is noted again.
+ */
+static void
+collect_map_copies(uint32 collected)
+{
+	char	   *taken = psprintf("%s.gc", S3_MAP_COPIES_FILE);
+	int			fd;
+	struct stat st;
+	char	   *data;
+	S3Manifest *rm = NULL;
+	bool		fetched = false;
+
+	if (stat(taken, &st) != 0)
+	{
+		int			lock = s3_local_lists_lock();
+		bool		renamed = rename(S3_MAP_COPIES_FILE, taken) == 0;
+
+		s3_local_lists_unlock(lock);
+		if (!renamed)
+		{
+			pfree(taken);
+			return;
+		}
+	}
+	fd = BasicOpenFile(taken, O_RDONLY | PG_BINARY);
+	if (fd < 0 || fstat(fd, &st) != 0)
+	{
+		if (fd >= 0)
+			close(fd);
+		pfree(taken);
+		return;
+	}
+	data = palloc(st.st_size + 1);
+	if (read(fd, data, st.st_size) != st.st_size)
+	{
+		close(fd);
+		pfree(data);
+		pfree(taken);
+		return;
+	}
+	close(fd);
+
+	for (off_t pos = 0; pos + (off_t) sizeof(S3MapCopy) <= st.st_size;
+		 pos += sizeof(S3MapCopy))
+	{
+		S3MapCopy	rec;
+		char	   *key;
+		S3ManifestTreeKey tkey;
+		S3ManifestTree *named;
+
+		memset(&tkey, 0, sizeof(tkey));
+		memcpy(&rec, data + pos, sizeof(rec));
+		gc_check_stop();
+		if (collected <= rec.chkp)
+		{
+			/* a start may still be from its checkpoint */
+			int			lock = s3_local_lists_lock();
+
+			fd = BasicOpenFile(S3_MAP_COPIES_FILE,
+							   O_WRONLY | O_CREAT | O_APPEND | PG_BINARY);
+			if (fd < 0 || write(fd, &rec, sizeof(rec)) != sizeof(rec) ||
+				pg_fsync(fd) != 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not write file \"%s\": %m",
+								S3_MAP_COPIES_FILE)));
+			close(fd);
+			s3_local_lists_unlock(lock);
+			continue;
+		}
+
+		/*
+		 * Not one a start took as its tree's own map: recovery does that
+		 * with the map of a tree built after the checkpoint it started from
+		 * (s3_adopt_built_tree_map()), and the manifests then name the tree
+		 * with that number.  The copy is their reference from there on, and
+		 * goes as any map does once the reference moves off it.
+		 */
+		if (!fetched)
+		{
+			rm = gc_manifest_fetch(collected);
+			fetched = true;
+		}
+		if (rm == NULL)
+		{
+			/* cannot tell: next pass */
+			int			lock = s3_local_lists_lock();
+
+			fd = BasicOpenFile(S3_MAP_COPIES_FILE,
+							   O_WRONLY | O_CREAT | O_APPEND | PG_BINARY);
+			if (fd < 0 || write(fd, &rec, sizeof(rec)) != sizeof(rec) ||
+				pg_fsync(fd) != 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not write file \"%s\": %m",
+								S3_MAP_COPIES_FILE)));
+			close(fd);
+			s3_local_lists_unlock(lock);
+			continue;
+		}
+		tkey.datoid = rec.datoid;
+		tkey.relnode = rec.relnode;
+		named = hash_search(rm->trees, &tkey, HASH_FIND, NULL);
+		if (named != NULL && named->map == rec.chkp)
+			continue;
+		key = psprintf("trees/%u/%u/maps/" UINT64_FORMAT "-%u",
+					   rec.datoid, rec.relnode, rec.token, rec.chkp);
+		gc_delete(key);
+		pfree(key);
+	}
+	if (rm != NULL)
+		s3_manifest_free(rm);
+	gc_flush();
+	(void) unlink(taken);
+	pfree(data);
+	pfree(taken);
+}
+
+/*
  * The oldest checkpoint from `retain` back that was published within
  * orioledb.s3_gc_keep_time.  A manifest does not change, so the times read
  * are kept for the next passes.  One without a time (published before
@@ -1922,6 +2045,7 @@ s3_gc_cycle(void)
 	}
 
 	removed += collect_abandoned_trees(r, committed);
+	collect_map_copies(collected);
 	gc_flush();
 	if (removed > 0)
 		ereport(LOG,

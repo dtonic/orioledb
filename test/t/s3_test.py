@@ -29,7 +29,7 @@ from .s3_base_test import S3BaseTest, s3_test_attrs, mock_put_object, \
  mock_put_object_conflict, mock_moto_unknown_error, FlakyPutObject, \
  RevokedKeyPut, AmbiguousPut, HoldChunksOf, HoldFirstGet, ConflictingPut, \
  FailingGet, RevokedKey, orig_get_object, orig_list_objects_v2, FailingDelete, \
- orig_delete_object, TransientServerError, HoldWrites
+ orig_delete_object, TransientServerError, HoldWrites, AccessDenied
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
@@ -2182,6 +2182,184 @@ class S3Test(S3BaseTest):
 			third.stop()
 			third.cleanup()
 
+	def test_s3_takeover_reads_an_index_built_behind_the_checkpointer(self):
+		"""A build that ends while a checkpoint walks the trees, at a place
+		the walk has passed, names its map with that checkpoint's number.
+		The checkpoint commits with the tree known under its number, but the
+		map is the build's upload, not the checkpoint's: a data directory
+		loaded at that checkpoint has to get it too, or it opens the index
+		empty."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_lease_duration = 15
+			orioledb.enable_stopevents = true
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, v text, w int) USING orioledb;
+			CREATE INDEX o_test_w ON o_test (w);
+			INSERT INTO o_test SELECT g, md5(g::text), g FROM generate_series(1, 2000) g;
+		""")
+		con = node.connect()
+		# the walk goes by type: a unique index comes before a regular one
+		con.execute("SELECT pg_stopevent_set('checkpoint_step', "
+		            "'$.action == \"walkDownwards\" && "
+		            "$.treeName == \"o_test_w\"');")
+		con.commit()
+		checkpoint = Thread(target=lambda: node.safe_psql("CHECKPOINT;"))
+		checkpoint.start()
+		wait_checkpointer_stopevent(node)
+		node.safe_psql("CREATE UNIQUE INDEX o_test_v ON o_test (v);")
+		con.execute("SELECT pg_stopevent_reset('checkpoint_step');")
+		con.commit()
+		con.close()
+		checkpoint.join()
+		# recovery replays these into the index, before any later checkpoint
+		node.safe_psql("INSERT INTO o_test SELECT g, md5(g::text), g "
+		               "FROM generate_series(2001, 2100) g;")
+		node.stop(['-m', 'immediate'])
+
+		by_index = """
+			SET enable_seqscan = off;
+			SET enable_bitmapscan = off;
+			SELECT count(*) FROM o_test WHERE v >= '';
+		"""
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			plan = new_node.safe_psql(
+			    "SET enable_seqscan = off; SET enable_bitmapscan = off; "
+			    "EXPLAIN SELECT count(*) FROM o_test WHERE v >= '';").decode()
+			self.assertIn("o_test_v", plan)
+			self.assertEqual("2100",
+			                 new_node.safe_psql(by_index).decode().strip())
+			new_node.stop()
+			new_node.cleanup()
+
+	def test_s3_takeover_reads_an_index_built_behind_a_checkpoint_not_done(self):
+		"""The same build, behind a checkpoint the writer dies in: its map is
+		named with a checkpoint the bucket never committed, and the takeover
+		starts from the one before."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_lease_duration = 15
+			orioledb.enable_stopevents = true
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, v text, w int) USING orioledb;
+			CREATE INDEX o_test_w ON o_test (w);
+			INSERT INTO o_test SELECT g, md5(g::text), g FROM generate_series(1, 2000) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		node.safe_psql("UPDATE o_test SET w = w + 1;")
+		con = node.connect()
+		con.execute("SELECT pg_stopevent_set('checkpoint_step', "
+		            "'$.action == \"walkDownwards\" && "
+		            "$.treeName == \"o_test_w\"');")
+		con.commit()
+		def checkpoint_cut_short():
+			try:
+				node.safe_psql("CHECKPOINT;")
+			except QueryException:
+				pass	# the stop below ends it
+
+		checkpoint = Thread(target=checkpoint_cut_short)
+		checkpoint.daemon = True
+		checkpoint.start()
+		wait_checkpointer_stopevent(node)
+		node.safe_psql("CREATE UNIQUE INDEX o_test_v ON o_test (v);")
+		node.safe_psql("INSERT INTO o_test SELECT g, md5(g::text), g "
+		               "FROM generate_series(2001, 2100) g;")
+		con.close()
+		node.stop(['-m', 'immediate'])
+
+		by_index = """
+			SET enable_seqscan = off;
+			SET enable_bitmapscan = off;
+			SELECT count(*) FROM o_test WHERE v >= '';
+		"""
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual("2100",
+			                 new_node.safe_psql(by_index).decode().strip())
+			new_node.stop()
+			new_node.cleanup()
+
+	def test_s3_load_of_a_checkpoint_a_tree_was_dropped_in(self):
+		"""A checkpoint queues a tree's parts and map for upload and goes on
+		to the next tree; its manifest names them.  A DROP that commits
+		then waits for those uploads before it removes the files: removed
+		first, the S3 worker found no file, the checkpoint committed all
+		the same, and a data directory loaded from it failed on the map
+		the bucket never got."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_lease_duration = 30
+			orioledb.enable_stopevents = true
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_gone (id int PRIMARY KEY, v text) USING orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, v text) USING orioledb;
+			INSERT INTO o_gone SELECT g, md5(g::text) FROM generate_series(1, 2000) g;
+			INSERT INTO o_test SELECT g, md5(g::text) FROM generate_series(1, 2000) g;
+		""")
+		release = threading.Event()
+
+		def held_put(response):
+			if response.parse_key_name().startswith('trees/'):
+				release.wait(20)
+			return mock_put_object(response)
+
+		con = node.connect()
+		# the walk is past o_gone here, its uploads queued behind held ones
+		con.execute("SELECT pg_stopevent_set('checkpoint_step', "
+		            "'$.action == \"walkDownwards\" && "
+		            "$.treeName == \"o_test_pkey\"');")
+		con.commit()
+		with patch('moto.s3.responses.S3Response.put_object', new=held_put):
+			checkpoint = Thread(target=lambda: node.safe_psql("CHECKPOINT;"))
+			checkpoint.start()
+			wait_checkpointer_stopevent(node)
+			drop = Thread(target=lambda: node.safe_psql("DROP TABLE o_gone;"))
+			drop.start()
+			drop.join(3)
+			# short of the lease: its renewals wait behind the held puts
+			release.set()
+			drop.join(60)
+			self.assertFalse(drop.is_alive())
+			con.execute("SELECT pg_stopevent_reset('checkpoint_step');")
+			con.commit()
+			con.close()
+			checkpoint.join(60)
+			self.assertFalse(checkpoint.is_alive())
+		node.stop(['-m', 'immediate'])
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			self.assertEqual("2000", new_node.safe_psql(
+			    "SELECT count(*) FROM o_test").decode().strip())
+			self.assertEqual("0", new_node.safe_psql(
+			    "SELECT count(*) FROM pg_class WHERE relname = 'o_gone'"
+			).decode().strip())
+			new_node.stop()
+			new_node.cleanup()
+
 	def test_s3_takeover_reads_what_came_after_the_load(self):
 		"""A data directory loaded while the writer still committed is behind
 		the bucket: the writer it starts as puts a terminator after the last
@@ -2881,6 +3059,52 @@ class S3Test(S3BaseTest):
 			self.assertEqual(NodeStatus.Running, reader.status())
 			reader.stop()
 			reader.cleanup()
+		node.stop()
+
+	def test_s3_worker_that_exits_keeps_the_checksums_it_had(self):
+		"""An S3 worker keeps the checksums of the PostgreSQL files it puts
+		in a buffer, written out a hundred at a time and when the backup
+		ends.  A worker that exits in a task (a put the store refuses for
+		good) starts again with what it had: left behind, those files were
+		in no "file" line of the checkpoint's manifest, which still said
+		it was complete, and a data directory loaded from it lacked them."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_auth_retry_time = 0
+			orioledb.s3_lease_duration = 30
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 100);
+		""")
+		puts = [0]
+
+		def refusing_once(response):
+			if response.parse_key_name().startswith('data/'):
+				puts[0] += 1
+				if puts[0] == 60:
+					raise AccessDenied()
+			return mock_put_object(response)
+
+		with patch('moto.s3.responses.S3Response.put_object',
+		           new=refusing_once):
+			node.safe_psql("CHECKPOINT;")
+		self.assertGreater(puts[0], 60)
+		with open(node.pg_log_file) as f:
+			self.assertIn("http code = 403", f.read())
+		first = int(self.s3_body('root')['checkpoint'])
+		node.safe_psql("CHECKPOINT;")
+		second = int(self.s3_body('root')['checkpoint'])
+		self.assertGreater(second, first)
+		# nothing was created in between: a file the second checkpoint has
+		# and the first has not is one the first lost
+		lost = set(self.manifest(second)['files']) - \
+		    set(self.manifest(first)['files'])
+		self.assertEqual(set(), lost)
 		node.stop()
 
 	def test_s3_a_refused_key_fails_with_no_retry_time(self):
@@ -4189,6 +4413,53 @@ class S3Test(S3BaseTest):
 				hi, lo = rest.split('/')
 				m['redo'] = (int(hi, 16) << 32) | int(lo, 16)
 		return m
+
+	def test_s3_gc_removes_the_map_copy_of_a_build(self):
+		"""A build that ends behind a checkpoint in progress puts a copy of
+		its map under the number of the checkpoint the bucket has committed,
+		for a writer that takes over from there.  No manifest names the
+		copy: the build notes it, and the GC removes it once that
+		checkpoint is collected and no start can be from it."""
+		node = self.gc_world("""
+			orioledb.enable_stopevents = true
+		""")
+		node.safe_psql("CREATE INDEX o_test_v ON o_test (v);")
+		node.safe_psql("UPDATE o_test SET v = 1 WHERE id <= 1000;")
+		committed = int(self.kv('root')['checkpoint'])
+		con = node.connect()
+		# the walk goes by type: a unique index comes before a regular one
+		con.execute("SELECT pg_stopevent_set('checkpoint_step', "
+		            "'$.action == \"walkDownwards\" && "
+		            "$.treeName == \"o_test_v\"');")
+		con.commit()
+		checkpoint = Thread(target=lambda: node.safe_psql("CHECKPOINT;"))
+		checkpoint.start()
+		wait_checkpointer_stopevent(node)
+		node.safe_psql("CREATE UNIQUE INDEX o_test_u ON o_test (id, v);")
+		con.execute("SELECT pg_stopevent_reset('checkpoint_step');")
+		con.commit()
+		con.close()
+		checkpoint.join()
+		datoid = node.execute("SELECT oid FROM pg_database "
+		                      "WHERE datname = current_database()")[0][0]
+		relnode = node.execute("SELECT relfilenode FROM pg_class "
+		                       "WHERE relname = 'o_test_u'")[0][0]
+		maps = f"trees/{datoid}/{relnode}/maps/"
+		copy = f"{maps}{self.kv('root')['token']}-{committed}"
+		self.assertIn(copy, self.all_keys(maps))
+
+		for v in range(2, 5):
+			node.safe_psql(f"UPDATE o_test SET v = {v} WHERE id <= 1000;")
+			node.safe_psql("CHECKPOINT;")
+		self.assertTrue(self.wait_for_collected(committed + 1))
+		deadline = time.time() + 30
+		while copy in self.all_keys(maps) and time.time() < deadline:
+			time.sleep(1)
+		self.assertNotIn(copy, self.all_keys(maps))
+		# the index's own map is there: the index reads whole from the bucket
+		self.assert_bucket_restores(
+		    node, [(30000, )],
+		    query="SELECT count(*) FROM o_test WHERE (id, v) >= (0, 0)")
 
 	def test_s3_gc_removes_old_checkpoints(self):
 		"""Once a checkpoint is no longer retained, its manifest goes, and so

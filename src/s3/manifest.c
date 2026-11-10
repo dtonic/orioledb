@@ -55,6 +55,9 @@
 
 static StringInfo collected = NULL;
 static StringInfo catalogTrees = NULL;
+
+/* this process looked for the maps of trees built before this run started */
+static bool adoptedBuilt = false;
 static uint32 collectChkp = 0;
 
 void
@@ -242,6 +245,41 @@ s3_note_dropped_tree(Oid datoid, Oid relnode)
 				(errcode_for_file_access(),
 				 errmsg("could not write file \"%s\": %m",
 						S3_DROPPED_TREES_FILE)));
+	close(fd);
+	s3_local_lists_unlock(lock);
+}
+
+/*
+ * A build puts a copy of its map under the checkpoint the bucket has
+ * committed, for a writer that takes over from that checkpoint.  The copy is
+ * no line of any manifest, so no reference ever moves off it: it is noted
+ * here, and the GC removes it once that checkpoint is collected, when no
+ * start can be from it any more.  The note is local: after a takeover the
+ * copy is either the new writer's reference (it took the map as the tree's
+ * own, and the GC follows that) or stays until the tree is dropped.
+ */
+void
+s3_note_map_copy(Oid datoid, Oid relnode, uint32 chkp)
+{
+	S3MapCopy	rec;
+	int			fd;
+	int			lock;
+
+	memset(&rec, 0, sizeof(rec));
+	rec.chkp = chkp;
+	rec.datoid = datoid;
+	rec.relnode = relnode;
+	rec.token = s3_lease_token();
+	lock = s3_local_lists_lock();
+	fd = BasicOpenFile(S3_MAP_COPIES_FILE,
+					   O_WRONLY | O_CREAT | O_APPEND | PG_BINARY);
+	if (fd < 0 ||
+		write(fd, &rec, sizeof(rec)) != sizeof(rec) ||
+		pg_fsync(fd) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not write file \"%s\": %m",
+						S3_MAP_COPIES_FILE)));
 	close(fd);
 	s3_local_lists_unlock(lock);
 }
@@ -806,6 +844,29 @@ s3_manifest_prepare(uint32 chkpNum, int bundles)
 
 				/* 0: no map yet, the tree is still listed as alive */
 				tree->map = o_get_latest_chkp_num(a, b, c, chkpNum, &known);
+
+				/*
+				 * A tree no checkpoint of this data directory has seen may
+				 * be one the writer before this run built, its map in the
+				 * bucket under the checkpoint this run started from.  It is
+				 * taken when the build's WAL is replayed or the tree is
+				 * first opened; a build that began before that checkpoint's
+				 * REDO is not replayed as one, and a tree nothing opens
+				 * stayed "0" here, manifest after manifest.  Its map was
+				 * then no reference of any of them: the sweep took it for
+				 * garbage and the epochs of its token were let go, and the
+				 * tree was empty when it was opened at last.  Looked for
+				 * once, in the first manifest of the run: a tree made since
+				 * has no such map.
+				 */
+				if (!known && !adoptedBuilt)
+				{
+					ORelOids	oids = {a, b, b};
+
+					oids.spcoid = c;
+					s3_adopt_built_tree_map(oids);
+					tree->map = o_get_latest_chkp_num(a, b, c, chkpNum, &known);
+				}
 				if (!known)
 					tree->map = 0;
 			}
@@ -850,6 +911,7 @@ s3_manifest_prepare(uint32 chkpNum, int bundles)
 		if (line)
 			line++;
 	}
+	adoptedBuilt = true;
 	hash_seq_init(&seq, trees);
 	while ((tree = hash_seq_search(&seq)) != NULL)
 		appendStringInfo(&body, "tree %u %u %u %u\n", tree->key.datoid,

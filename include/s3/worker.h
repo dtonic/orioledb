@@ -68,6 +68,12 @@ typedef struct
 			uint32		chkpNum;
 			int64		partNum;
 			bool		claimed;
+
+			/*
+			 * A map put under another checkpoint's number than its file's
+			 * (s3_schedule_map_copy_write()); 0 for the file's own.
+			 */
+			uint32		objectChkpNum;
 		}			filePart;
 		char		walFilename[1];
 		struct
@@ -104,6 +110,9 @@ extern S3TaskLocation s3_schedule_empty_dir_write(uint32 chkpNum,
 												  char *dirname);
 extern S3TaskLocation s3_schedule_file_part_write(OIndexKey key, int64 partNum);
 extern S3TaskLocation s3_schedule_map_file_write(uint32 chkpNum, OIndexKey key);
+extern S3TaskLocation s3_schedule_map_copy_write(uint32 chkpNum,
+												 uint32 objectChkpNum,
+												 OIndexKey key);
 extern S3TaskLocation s3_schedule_dead_file_write(uint32 chkpNum, OIndexKey key);
 extern S3TaskLocation s3_schedule_wal_file_write(char *filename, bool archived);
 extern S3TaskLocation s3_schedule_undo_file_write(UndoLogType undoType,
