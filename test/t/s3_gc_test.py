@@ -464,10 +464,15 @@ class S3GcTest(S3BaseTest):
 	def test_s3_gc_resets_the_state_of_a_relnode_named_again(self):
 		"""A tree dropped by R whose relnode a later manifest names again is a
 		new tree under old keys: its GC state starts over, rather than the
-		dropped tree's dead bits marking the new tree's parts dead."""
+		dropped tree's dead bits marking the new tree's parts dead.  It
+		starts over where the fold gets to the drop, before any list of the
+		new tree is folded: one pass that folds past both the drop and the
+		new tree's first lists ORed them into the dropped tree's state, and
+		removed parts by it, before it looked at the drop."""
 		node = self.gc_world("""
 			orioledb.s3_gc_interval = 3600
 			orioledb.s3_gc_keep_checkpoints = 2
+			log_min_messages = debug1
 		""")
 		datoid = self.datoid(node)
 		relnode = self.primary_relnode(node)
@@ -498,8 +503,16 @@ class S3GcTest(S3BaseTest):
 		self.assertTrue(self.gc_passes_until(
 		    node, lambda: self.gc_field('collected') >= c4))
 		self.assertTrue(self.log_contains(node, "a tree has its relnode again"))
-		self.assertFalse(os.path.exists(state_file))
-		self.assertFalse(self.all_keys(state_key))
+		# the state went at the drop, in the fold, and what is there now is
+		# of the lists folded after it
+		self.assertTrue(self.log_contains(
+		    node, f"S3 GC lets the state of tree {datoid}/{relnode} go: "
+		    f"dropped by checkpoint {c4}"))
+		with open(node.pg_log_file) as f:
+			log = f.read()
+		self.assertLess(
+		    log.index(f"S3 GC lets the state of tree {datoid}/{relnode} go"),
+		    log.index("a tree has its relnode again"))
 		# the tree itself was left alone, and its GC goes on from a clean state
 		node.safe_psql("UPDATE o_test SET v = 5;")
 		node.safe_psql("CHECKPOINT;")

@@ -746,6 +746,23 @@ gc_manifest_fetch(uint32 chkpNum)
 	return m;
 }
 
+/* A tree's state with nothing folded: no part, no block size known. */
+static void
+tree_start_over(GcTree *tree)
+{
+	HASHCTL		ctl;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(uint64);
+	ctl.entrysize = sizeof(GcPart);
+	ctl.hcxt = tree->cxt;
+	tree->blocksPerPart = 0;
+	tree->skip = false;
+	tree->changed = false;
+	tree->parts = hash_create("orioledb s3 gc parts", 64, &ctl,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
 static GcTree *
 get_tree(HTAB *trees, S3ManifestTree *t)
 {
@@ -754,19 +771,9 @@ get_tree(HTAB *trees, S3ManifestTree *t)
 
 	if (!found)
 	{
-		HASHCTL		ctl;
-
-		memset(&ctl, 0, sizeof(ctl));
-		ctl.keysize = sizeof(uint64);
-		ctl.entrysize = sizeof(GcPart);
-		ctl.hcxt = CurrentMemoryContext;
 		tree->spcoid = t->spcoid;
-		tree->blocksPerPart = 0;
-		tree->skip = false;
-		tree->changed = false;
 		tree->cxt = CurrentMemoryContext;
-		tree->parts = hash_create("orioledb s3 gc parts", 64, &ctl,
-								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		tree_start_over(tree);
 		state_load(tree);
 	}
 	return tree;
@@ -1786,6 +1793,82 @@ skipped_lines(void)
 	return out.data;
 }
 
+/* the trees whose state the fold let go this pass, at their drop */
+static List *gcFoldDropped = NIL;
+
+static bool
+fold_dropped(S3ManifestTreeKey *key)
+{
+	ListCell   *lc;
+
+	foreach(lc, gcFoldDropped)
+	{
+		S3ManifestTreeKey *k = lfirst(lc);
+
+		if (k->datoid == key->datoid && k->relnode == key->relnode)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Before the lists of checkpoint k are folded: a tree the manifest before k
+ * names and k's does not was dropped, and its state goes here, at its drop.
+ * A tree made later under the same relnode (OIDs wrapped around) has the
+ * dropped one's keys, and its lists are folded into the state those keys
+ * name: left to the pass's end, the dropped tree's dead bits and part ends
+ * were still there when the new tree's lists were ORed in, and a part of
+ * the new tree whose live blocks the old bits covered was removed in that
+ * same pass, before the dropped tree was looked at.  The dropped tree's own
+ * parts need no state: they go with everything under its prefix once the
+ * manifests that named it are collected.  With no manifest for k (not
+ * published) the next one there is stands for it, as it does for the fold.
+ */
+static void
+fold_drop_states(HTAB *trees, uint32 k, uint32 collected, uint32 committed)
+{
+	ManifestTrees *cur = NULL,
+			   *prev = NULL;
+	HTAB	   *named;
+	HASHCTL		ctl;
+
+	for (uint32 n = k; n <= committed && cur == NULL; n++)
+		cur = manifest_trees(n);
+	for (uint32 n = k - 1; n >= Max(collected, 1) && prev == NULL; n--)
+		prev = manifest_trees(n);
+	if (cur == NULL || prev == NULL)
+		return;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(S3ManifestTreeKey);
+	ctl.entrysize = sizeof(S3ManifestTreeKey);
+	ctl.hcxt = CurrentMemoryContext;
+	named = hash_create("orioledb s3 gc named trees", Max(64, cur->count),
+						&ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	for (int i = 0; i < cur->count; i++)
+		(void) hash_search(named, &cur->keys[i], HASH_ENTER, NULL);
+	for (int i = 0; i < prev->count; i++)
+	{
+		S3ManifestTreeKey *key = &prev->keys[i];
+		S3ManifestTreeKey *noted;
+		GcTree	   *tree;
+
+		if (key->datoid == SYS_TREES_DATOID ||
+			hash_search(named, key, HASH_FIND, NULL) != NULL)
+			continue;
+		elog(DEBUG1, "S3 GC lets the state of tree %u/%u go: dropped by checkpoint %u",
+			 key->datoid, key->relnode, k);
+		state_drop(key->datoid, key->relnode);
+		tree = hash_search(trees, key, HASH_FIND, NULL);
+		if (tree != NULL)
+			tree_start_over(tree);
+		noted = palloc(sizeof(S3ManifestTreeKey));
+		*noted = *key;
+		gcFoldDropped = lappend(gcFoldDropped, noted);
+	}
+	hash_destroy(named);
+}
+
 /*
  * One pass.  Returns the number of parts removed.
  */
@@ -1813,6 +1896,7 @@ s3_gc_cycle(void)
 	gcFailed = NULL;
 	gc_parts = NIL;
 	gc_pending = NIL;
+	gcFoldDropped = NIL;
 	initStringInfo(&skippedBefore);
 	if (committed < (uint32) s3_gc_keep_checkpoints ||
 		!s3_gc_progress(&published, &folded, &collected, &skippedBefore))
@@ -1864,6 +1948,7 @@ s3_gc_cycle(void)
 		S3Manifest *m;
 
 		gc_check_stop();
+		fold_drop_states(trees, k, collected, committed);
 		m = gc_manifest_fetch(k);
 
 		if (m == NULL)
@@ -1918,12 +2003,19 @@ s3_gc_cycle(void)
 		/*
 		 * R's manifest has to know every reference of its checkpoint, or an
 		 * object R reads would look unreferenced; an older complete one does
-		 * as well, as references only move forward.
+		 * as well, as references only move forward.  It has to be one that
+		 * was published, too: a manifest prepared for a checkpoint the bucket
+		 * never committed (the shipper was away) says it is complete but has
+		 * no REDO, and the WAL below R is deleted by R's REDO.  Taken as R,
+		 * it deleted no segment and moved the collected mark past them: the
+		 * segments up to the next R's REDO were never looked at again.
 		 */
 		for (rk = r; rk > collected && rm == NULL; rk--)
 		{
 			rm = gc_manifest_fetch(rk);
-			if (rm != NULL && !rm->complete)
+			if (rm != NULL &&
+				(!rm->complete || rm->redoLsn == InvalidXLogRecPtr ||
+				 rm->timeline == 0))
 			{
 				s3_manifest_free(rm);
 				rm = NULL;
@@ -1971,17 +2063,20 @@ s3_gc_cycle(void)
 				if (tree_named(&d->key, rk + 1, committed))
 				{
 					/*
-					 * A new tree under the dropped one's keys.  The dropped
-					 * tree's dead bits would OR into the new tree's parts,
-					 * and a live part would go: the state starts over.  Its
-					 * lists up to r are folded already, so nothing of the
-					 * dropped tree comes back; a list of the new tree folded
-					 * this pass (r past R') is lost with it, a leak only.
+					 * A new tree under the dropped one's keys: the dropped
+					 * tree's objects are left, as the keys are the new
+					 * tree's now.  Its state went when the fold got to its
+					 * drop (fold_drop_states()), before any list of the new
+					 * tree was folded.  A drop folded past by a pass before
+					 * this one is not known here: the state starts over
+					 * once more then, and what the new tree had folded into
+					 * it since is lost with it, a leak only.
 					 */
 					ereport(LOG,
 							(errmsg("S3 GC leaves dropped tree %u/%u: a tree has its relnode again, its GC state starts over",
 									d->key.datoid, d->key.relnode)));
-					state_drop(d->key.datoid, d->key.relnode);
+					if (!fold_dropped(&d->key))
+						state_drop(d->key.datoid, d->key.relnode);
 					continue;
 				}
 				removed += collect_dropped_tree(&d->key);

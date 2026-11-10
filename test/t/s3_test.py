@@ -4196,7 +4196,9 @@ class S3Test(S3BaseTest):
 		the GC removes are gone in the end, and the rest restores."""
 		node = self.gc_world()
 		first = self.part_etags()
-		failing = FailingDelete(20)
+		# each key fails once: a pass with one part to remove took all the
+		# failures on that key before, and its retries outlasted the wait
+		failing = FailingDelete(10, once_a_key=True)
 		with patch('moto.s3.responses.S3Response.delete_object',
 		           new=lambda response: failing(response)):
 			for v in range(1, 4):
