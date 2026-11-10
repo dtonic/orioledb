@@ -24,6 +24,9 @@ class FakeS3:
 
 	def __init__(self, objects):
 		self.objects = dict(objects)
+		# keys a listing leaves out though a GET has them: a store whose
+		# listing lags its writes
+		self.unlisted = set()
 
 	def get_object(self, Bucket, Key, Range=None):
 		if Key not in self.objects:
@@ -41,7 +44,8 @@ class FakeS3:
 
 	def paginate(self, Bucket, Prefix, StartAfter=None):
 		keys = sorted(k for k in self.objects
-		              if k.startswith(Prefix) and (StartAfter is None or k > StartAfter))
+		              if k.startswith(Prefix) and k not in self.unlisted and
+		              (StartAfter is None or k > StartAfter))
 		yield {'Contents': [{'Key': k} for k in keys]} if keys else {}
 
 
@@ -204,6 +208,103 @@ class S3LoaderTest(unittest.TestCase):
 		self.assertEqual(b'N' * 1000, bytes(seg[1000:2000]))
 		self.assertEqual(bytes(SEG - 2000), bytes(seg[2000:]))
 
+	def test_a_terminators_mark_without_its_chunk_fences_nothing(self):
+		"""A writer that put its terminator short of the end takes it away
+		again, the chunk first and its mark after: a mark left alone (the
+		writer died in between) names no terminator, and no restore fails
+		on it."""
+		lo = SEG
+		l = self.make_loader({
+		    self.chunk_key(1, 0): terminator(5),
+		    self.chunk_key(1, 1): chunk(5, lo, lo + 1000),
+		    "wal/00000001/terminators/0": b'',
+		    "wal/00000001/terminators/2": b'',
+		})
+		seg = l.assemble_segment(1, 1)
+		self.assertEqual(bytes([5]) * 1000, bytes(seg[0:1000]))
+		self.assertEqual(0, l.restore(self.seg_name(1, 1),
+		                              os.path.join(self.tmp.name, 'o')))
+
+	def test_a_chunk_missing_at_the_segment_end_is_refused(self):
+		"""The chunk after the last one of a segment is of the next segment:
+		with the one between them missing, nothing of this segment follows
+		the gap to show it, and the segment ended there, short of WAL that
+		was acknowledged."""
+		lo, hi = SEG, 2 * SEG
+		l = self.make_loader({
+		    self.chunk_key(1, 0): chunk(1, lo, lo + 1000),
+		    # 1, [lo + 1000, hi + 10), is missing
+		    self.chunk_key(1, 2): chunk(1, hi + 10, hi + 500),
+		})
+		with self.assertRaises(loader.ChunkGap):
+			l.assemble_segment(1, 1)
+		self.assertEqual(128, l.restore(self.seg_name(1, 1),
+		                                os.path.join(self.tmp.name, 'o')))
+
+	def test_a_segment_with_no_chunk_before_later_ones_is_refused(self):
+		"""No chunk of the segment at all, and chunks after it: its WAL is
+		missing, the bucket's WAL does not end there."""
+		l = self.make_loader({
+		    self.chunk_key(1, 0): chunk(1, 0, SEG),
+		    self.chunk_key(1, 3): chunk(1, 2 * SEG + 10, 2 * SEG + 500),
+		})
+		with self.assertRaises(loader.ChunkGap):
+			l.assemble_segment(1, 1)
+
+	def test_a_chunk_the_listing_left_out_is_asked_for(self):
+		"""A listing that lags the writes leaves out a chunk put just
+		before one it has.  A GET does not lag: the number missing between
+		two listed is asked for, here the last chunk of the segment, before
+		a chunk of the next one."""
+		lo, hi = SEG, 2 * SEG
+		l = self.make_loader({
+		    self.chunk_key(1, 0): chunk(1, lo, lo + 1000),
+		    self.chunk_key(1, 1): chunk(1, lo + 1000, hi + 10,
+		                                body=b'L' * (SEG - 990)),
+		    self.chunk_key(1, 2): chunk(1, hi + 10, hi + 500),
+		})
+		l.s3.unlisted.add(self.chunk_key(1, 1))
+		seg = l.assemble_segment(1, 1)
+		self.assertEqual(SEG, len(seg))
+		self.assertEqual(bytes([1]) * 1000, bytes(seg[0:1000]))
+		self.assertEqual(b'L' * (SEG - 1000), bytes(seg[1000:]))
+
+	def test_a_chunk_the_listing_left_out_before_a_terminator_is_asked_for(self):
+		"""The same before a terminator: a takeover puts it after the last
+		chunk, which the listing may not show yet, and no chunk follows the
+		gap.  Left out, recovery ended before that chunk's commits."""
+		lo = SEG
+		l = self.make_loader({
+		    self.chunk_key(1, 0): chunk(5, lo, lo + 1000),
+		    self.chunk_key(1, 1): chunk(5, lo + 1000, lo + 3000,
+		                                body=b'L' * 2000),
+		    self.chunk_key(1, 2): terminator(7),
+		    "wal/00000001/terminators/2": b'',
+		})
+		l.s3.unlisted.add(self.chunk_key(1, 1))
+		seg = l.assemble_segment(1, 1)
+		self.assertEqual(b'L' * 2000, bytes(seg[1000:3000]))
+		self.assertEqual(bytes(SEG - 3000), bytes(seg[3000:]))
+
+	def test_a_restart_shipping_again_across_the_segment_end_keeps_its_size(self):
+		"""A chunk ends past the segment, inside a record a crash cut; the
+		restarted writer ships again from that record's start, before the
+		segment's end.  What the first chunk put from there on is cleared,
+		inside the segment only: the segment stays one segment long."""
+		lo, hi = SEG, 2 * SEG
+		l = self.make_loader({
+		    self.chunk_key(1, 0): chunk(1, lo, hi + 50),
+		    self.chunk_key(1, 1): chunk(1, hi - 60, hi + 200, body=b'R' * 260),
+		})
+		seg = l.assemble_segment(1, 1)
+		self.assertEqual(SEG, len(seg))
+		self.assertEqual(bytes([1]) * (SEG - 60), bytes(seg[0:SEG - 60]))
+		self.assertEqual(b'R' * 60, bytes(seg[SEG - 60:]))
+		nxt = l.assemble_segment(1, 2)
+		self.assertEqual(SEG, len(nxt))
+		self.assertEqual(b'R' * 200, bytes(nxt[0:200]))
+		self.assertEqual(bytes(SEG - 200), bytes(nxt[200:]))
+
 	def test_before_the_switch_point_the_segment_is_the_parents(self):
 		switch = 2 * SEG + 4096
 		parent = bytes([9]) * SEG
@@ -325,6 +426,32 @@ class S3LoaderTest(unittest.TestCase):
 		with open(os.path.join(self.tmp.name, 'orioledb_data',
 		                       's3_wal_seq')) as f:
 			self.assertEqual(f"1 9 {lo + SEG + 500}\n", f.read())
+
+	def test_a_record_running_into_the_next_segment_ends_there(self):
+		"""The checkpoint record may start at the end of a segment and end
+		in the next one: where it ends says whether the loader has to put
+		the next segment into pg_wal too, and a load of the checkpoint alone
+		is cut after the record's tail, behind that segment's long page
+		header."""
+		block = 8192
+		pos = SEG - 16  # the last 16 bytes of the segment
+		first = bytearray(b'a' * SEG)
+		first[pos:pos + 4] = struct.pack('<I', 100)
+		self.assertEqual(SEG + 40 + 84,
+		                 loader.record_end(first, pos, block))
+		# not past the end: nothing to cut, the record's end is not here
+		self.assertEqual(bytes(first),
+		                 bytes(loader.end_after_record(first, pos, block)))
+		both = first + bytearray(b'b' * SEG)
+		cut = loader.end_after_record(both, pos, block, SEG)
+		self.assertEqual(bytes(first), bytes(cut[:SEG]))
+		self.assertEqual(b'b' * (40 + 84), bytes(cut[SEG:SEG + 124]))
+		self.assertEqual(bytes(SEG - 124), bytes(cut[SEG + 124:]))
+		# a record inside one segment, over a page boundary
+		pos = block - 16
+		one = bytearray(b'c' * SEG)
+		one[pos:pos + 4] = struct.pack('<I', 100)
+		self.assertEqual(block + 24 + 84, loader.record_end(one, pos, block))
 
 	def test_decode_xidmap_items(self):
 		def zigzag(v):

@@ -5076,24 +5076,30 @@ class S3Test(S3BaseTest):
 		inside = [
 		    k for k, h in zip(keys, ranges) if h[3] // segment_size == segno
 		]
-		self.assertGreater(len(inside), 2)
-		hidden = inside[len(inside) // 2]
-		# whether each listing that had the chunk hid it
+		# a run of chunks longer than the loader asks for one by one (a
+		# short hole in a listing is filled by GETs, which do not lag: the
+		# loader's own test has that): only another listing brings these
+		self.assertGreater(len(inside), 8)
+		middle = len(inside) // 2
+		hidden = inside[middle - 2:middle + 3]
+		# whether each listing that had the chunks hid them
 		listings = []
 
 		def lagging_listing(response):
 			body = orig_list_objects_v2(response)
-			if f"<Key>{hidden}</Key>" not in body:
+			if not any(f"<Key>{key}</Key>" in body for key in hidden):
 				return body
 			listings.append(not listings)
 			if not listings[-1]:
 				return body
-			return re.sub(r"<Contents>(?:(?!</Contents>).)*<Key>" +
-			              re.escape(hidden) +
-			              r"</Key>(?:(?!</Contents>).)*</Contents>",
-			              "",
-			              body,
-			              flags=re.S)
+			for key in hidden:
+				body = re.sub(r"<Contents>(?:(?!</Contents>).)*<Key>" +
+				              re.escape(key) +
+				              r"</Key>(?:(?!</Contents>).)*</Contents>",
+				              "",
+				              body,
+				              flags=re.S)
+			return body
 
 		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
 			self.loader.download(new_node.data_dir)
@@ -5118,7 +5124,7 @@ class S3Test(S3BaseTest):
 				self.assertEqual(e.code, 0)
 			finally:
 				sys.argv = old_argv
-			# the first listing missed the chunk, and a later one had it
+			# the first listing missed the chunks, and a later one had them
 			self.assertEqual([True, False], listings[:2])
 			with open(os.path.join(node.data_dir, 'pg_wal', name), 'rb') as f:
 				original = f.read()

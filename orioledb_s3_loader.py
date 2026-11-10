@@ -865,17 +865,33 @@ class OrioledbS3ObjectLoader:
 		ckpt_seg = parse_lsn(control["Latest checkpoint location"]) // size
 		self.makedirs(os.path.join(self.data_dir, 'pg_wal'), exist_ok=True,
 		              mode=0o700)
+		ckpt_pos = parse_lsn(control["Latest checkpoint location"]) % size
+		block_size = int(control["WAL block size"])
 		for segno in range(redo_seg, ckpt_seg + 1):
 			name = self.segment_name(tli, segno)
 			seg = self.restore_segment(tli, segno)
 			if seg is None:
 				raise Exception(f"The S3 bucket has no WAL segment {name}")
-			if self.checkpoint_only and segno == ckpt_seg:
+			if segno == ckpt_seg and \
+			    record_end(seg, ckpt_pos, block_size) > size:
+				# the checkpoint record runs into the next segment.  The
+				# server reads it before it turns to restore_command: with
+				# its start alone in pg_wal it found no valid checkpoint
+				# record, and did not start
+				tail_name = self.segment_name(tli, segno + 1)
+				tail = self.restore_segment(tli, segno + 1)
+				if tail is None:
+					raise Exception(
+					    f"The S3 bucket has no WAL segment {tail_name}")
+				both = bytearray(seg) + bytearray(tail)
+				if self.checkpoint_only:
+					both = end_after_record(both, ckpt_pos, block_size, size)
+				seg = both[:size]
+				self.write_wal(tail_name, both[size:])
+			elif self.checkpoint_only and segno == ckpt_seg:
 				# the segment goes on past the checkpoint record: a load of
 				# the checkpoint alone stops there
-				seg = end_after_record(
-				    seg, parse_lsn(control["Latest checkpoint location"]) % size,
-				    int(control["WAL block size"]))
+				seg = end_after_record(seg, ckpt_pos, block_size)
 			self.write_wal(name, seg)
 
 		latest = tli
@@ -1025,9 +1041,12 @@ class OrioledbS3ObjectLoader:
 				with open(path, 'rb') as f:
 					head = f.read(32)
 			else:
-				head = self.s3.get_object(
-				    Bucket=self.bucket_name, Key=self.chunk_key(tli, mark),
-				    Range='bytes=0-31')['Body'].read()
+				head = self.chunk_head(tli, mark)
+			if head is None or len(head) < 32:
+				# a terminator the writer put short of the end and took away
+				# again, its mark not yet (the chunk goes first, so that it
+				# never fences off the chunks after it): it fences nothing
+				continue
 			magic, _, token, _, _ = struct.unpack('<IIQQQ', head)
 			if magic == TERMINATOR_MAGIC:
 				result.append((mark, token))
@@ -1126,9 +1145,29 @@ class OrioledbS3ObjectLoader:
 				f.write(body)
 			os.replace(tmp, path)
 
+		# A store whose listing lags its writes can leave out a chunk put
+		# just before one it lists.  Where the WAL goes on after it the gap
+		# shows (assemble_segment), but not where a terminator or a chunk of
+		# a later segment follows: the segment then ended at the chunk
+		# before, and recovery with it, short of WAL that was acknowledged.
+		# A GET does not lag: ask for the numbers a short hole leaves out.
+		# The holes the shipper's cleanup and the GC leave are long, or have
+		# nothing there.
+		holes = []
+		prev = after
+		for seq in seqs:
+			if prev is not None and 1 < seq - prev <= CHUNK_HOLE_PROBE + 1:
+				holes.extend(range(prev + 1, seq))
+			prev = seq
+		holes = holes[-CHUNK_HOLE_PROBES_MAX:]
+
 		missing = set()
 		with ThreadPoolExecutor(MAX_CONCURRENCY) as executor:
-			list(executor.map(fetch, seqs))
+			list(executor.map(fetch, seqs + holes))
+		if holes:
+			found = [seq for seq in holes if seq not in missing]
+			missing.difference_update(holes)
+			seqs = sorted(seqs + found)
 		if seqs:
 			tmp = f"{marker}.tmp{os.getpid()}"
 			with open(tmp, 'w') as f:
@@ -1246,7 +1285,24 @@ class OrioledbS3ObjectLoader:
 				continue
 			if magic != CHUNK_MAGIC:
 				raise Exception(f"chunk {seq} of timeline {tli} is not a chunk")
-			if end <= lo or start >= hi:
+			if end <= lo:
+				continue
+			if start >= hi:
+				# a chunk of a later segment: the WAL between what is laid
+				# here and it was acknowledged as well.  With no chunk
+				# between them, one is missing at the end of this segment,
+				# where no chunk of it follows to show the gap
+				if partial is None:
+					laid = pos
+					if laid is None:
+						if first is None:
+							first = self.first_chunk_seq(tli)
+						if seq != first:
+							laid = lo
+					if laid is not None and laid < hi:
+						raise ChunkGap(
+						    f"WAL chunks of timeline {tli} miss {laid:X} to "
+						    f"{start:X} (before chunk {seq})")
 				continue
 			if pos is None:
 				# the chunks of a timeline follow one another from its first
@@ -1270,8 +1326,12 @@ class OrioledbS3ObjectLoader:
 				    f"(before chunk {seq})")
 			body = self.chunk_body(tli, seq)
 			zero_from = max(start, lo)
-			if pos > zero_from:
-				seg[zero_from - lo:pos - lo] = bytes(pos - zero_from)
+			# a chunk before it may have ended past this segment (a restart
+			# ships again from before the segment's end): clear only what is
+			# in it, a slice past the end would make the segment longer
+			zero_to = min(pos, hi)
+			if zero_to > zero_from:
+				seg[zero_from - lo:zero_to - lo] = bytes(zero_to - zero_from)
 			a, b = max(start, lo), min(end, hi)
 			seg[a - lo:b - lo] = body[a - start:b - start]
 			pos = end
@@ -1285,6 +1345,9 @@ class OrioledbS3ObjectLoader:
 				return bytearray(data)
 		if pos is None and partial is None:
 			return None
+		if len(seg) != size:
+			raise RestoreRefused(f"segment {name} assembled from the WAL "
+			                     f"chunks holds {len(seg)} bytes, not {size}")
 		return seg
 
 	def restore(self, fname, path):
@@ -1590,6 +1653,10 @@ class OrioledbS3ObjectLoader:
 
 CHUNK_MAGIC = 0x3143574f
 TERMINATOR_MAGIC = 0x3154574f
+# the numbers a hole in the listed chunks may leave out to be asked for one by
+# one, and how many a listing asks for in all
+CHUNK_HOLE_PROBE = 4
+CHUNK_HOLE_PROBES_MAX = 32
 
 
 class RestoreRefused(Exception):
@@ -1772,25 +1839,37 @@ def parse_root_body(text):
 	return root
 
 
-def end_after_record(seg, pos, block_size):
-	"""SEG with zeros after the WAL record at offset POS of it, if that
-	record ends in it.  Each page starts with a header (a long one on the
-	segment's first page), which a record runs over."""
+def record_end(seg, pos, block_size, segment_size=None):
+	"""Where the WAL record at offset POS of SEG ends, as an offset from
+	SEG's start: past its length when the record runs into the next
+	segment.  SEG may be several segments of SEGMENT_SIZE in a row.  Each
+	page starts with a header (a long one on a segment's first page), which
+	a record runs over."""
 	short_header, long_header = 24, 40
+	if segment_size is None:
+		segment_size = len(seg)
 
 	def skip(p, n):
 		data = b''
 		while n > 0:
 			if p % block_size == 0:
-				p += long_header if p == 0 else short_header
+				p += long_header if p % segment_size == 0 else short_header
 			take = min(n, block_size - p % block_size)
 			data += bytes(seg[p:p + take])
 			p += take
 			n -= take
 		return p, data
 
+	# a record starts aligned, with its length: that is never cut by a page
 	_, head = skip(pos, 4)
 	end, _ = skip(pos, struct.unpack('<I', head)[0])
+	return end
+
+
+def end_after_record(seg, pos, block_size, segment_size=None):
+	"""SEG with zeros after the WAL record at offset POS of it, if that
+	record ends in it."""
+	end = record_end(seg, pos, block_size, segment_size)
 	if end > len(seg):
 		return seg
 	seg = bytearray(seg)
