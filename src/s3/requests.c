@@ -1382,7 +1382,21 @@ write_file_part(const char *filename, uint64 offset,
 		return;
 	}
 
-	FileWriteback(file, offset, size, WAIT_EVENT_DATA_FILE_FLUSH);
+	/*
+	 * What is fetched from the bucket is synced before it counts as here, as
+	 * the fsync setting has it.  A part is marked loaded once this returns,
+	 * and that mark may reach the disk before the part's bytes do: after a
+	 * crash of the machine the part was a hole the header called loaded,
+	 * read as pages and never fetched again.  A tree's map left empty or
+	 * short was read as the tree's map by the next start.  The sync is of
+	 * the part's whole segment file, with whatever else of it is not on disk
+	 * yet; fsync = off leaves it out, with every other sync, and a data
+	 * directory is then loaded from the bucket again after such a crash.
+	 */
+	if (FileSync(file, WAIT_EVENT_DATA_FILE_SYNC) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not fsync file \"%s\": %m", filename)));
 
 	FileClose(file);
 }

@@ -876,7 +876,16 @@ btree_smgr_sync(BTreeDescr *desc, uint32 chkpNum, off_t length)
 	if (use_mmap || use_device)
 		return;
 
-	for (num = 0; num < length / ORIOLEDB_SEGMENT_SIZE; num++)
+	/*
+	 * Every segment that holds some of the length, the last one too.  The
+	 * count used to be the number of whole segments: a tree shorter than one
+	 * segment synced nothing, and a longer one never its last segment, so
+	 * what a checkpoint wrote there reached the disk only when the kernel
+	 * got to it.  After a crash of the machine the checkpoint's own pages
+	 * could be missing from the file (in S3 mode from the local copy only:
+	 * the bucket's parts are put from what was written).
+	 */
+	for (num = 0; (off_t) num * ORIOLEDB_SEGMENT_SIZE < length; num++)
 	{
 		File		file;
 
