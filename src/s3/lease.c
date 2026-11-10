@@ -135,6 +135,7 @@ typedef struct
 	char		writerEtag[S3_ETAG_LEN];
 	TimestampTz renewedAt;
 	TimestampTz deadline;		/* local clock: not ours after this */
+	int64		deadlineElapsed;	/* the same on the clock that only runs on */
 	int64		clockOffset;	/* the store's clock minus ours, seconds */
 	RootBody	root;
 	char		rootEtag[S3_ETAG_LEN];
@@ -487,9 +488,65 @@ lease_cas(const char *key, StringInfo body, const char *ifMatch,
 	}
 
 	if (!parsed || curToken != token || strcmp(curOwner, owner) != 0)
+	{
+		/*
+		 * Not ours, but still the object the put was to replace: the put did
+		 * not land (a 5xx, a 429, no answer), and nobody else's did.  That
+		 * is no loss.  A start replaces the object of the writer before it,
+		 * so every failed put of a start read back that writer's body, and
+		 * was taken for another writer's: one 503 ended the start, and the
+		 * attempts the start has for it were never made.  A put that lands
+		 * after this read is found by the next attempt, which reads our own
+		 * body under another attempt number.
+		 */
+		if (ifMatch != NULL && strcmp(curEtag, ifMatch) == 0)
+			return CAS_UNKNOWN;
 		return CAS_LOST;
+	}
 	strlcpy(etag, curEtag, S3_ETAG_LEN);
 	return curAttempt == attempt ? CAS_DONE : CAS_STALE;
+}
+
+/*
+ * The lease's local deadline is kept on two clocks, and the lease is ours
+ * only while neither has passed it.  The wall clock alone can be set back (a
+ * time step, a VM resumed with a stale clock): a writer then went on taking
+ * the lease for its own past the moment the store let another writer have
+ * it, and for the keys the new writer has not written yet that deadline is
+ * the only fence.  A clock that counts the time elapsed since boot does not
+ * go back; alone, it misses a pause of the whole machine by its hypervisor,
+ * which the wall clock shows once it is set right.  CLOCK_BOOTTIME counts
+ * time suspended, CLOCK_MONOTONIC (where there is no other) may not.
+ */
+#ifdef CLOCK_BOOTTIME
+#define LEASE_ELAPSED_CLOCK CLOCK_BOOTTIME
+#else
+#define LEASE_ELAPSED_CLOCK CLOCK_MONOTONIC
+#endif
+
+static int64
+lease_elapsed_usec(void)
+{
+	struct timespec ts;
+
+	if (clock_gettime(LEASE_ELAPSED_CLOCK, &ts) != 0)
+		elog(PANIC, "could not read the clock the S3 writer lease is kept by: %m");
+	return (int64) ts.tv_sec * INT64CONST(1000000) + ts.tv_nsec / 1000;
+}
+
+/*
+ * The deadline as a wall-clock time no later than either clock allows: what
+ * is left on the elapsed clock, counted from now.
+ */
+static TimestampTz
+lease_deadline_of(TimestampTz deadline, int64 deadlineElapsed)
+{
+	TimestampTz byElapsed;
+
+	if (deadline == 0)
+		return 0;
+	byElapsed = GetCurrentTimestamp() + (deadlineElapsed - lease_elapsed_usec());
+	return Min(deadline, byElapsed);
 }
 
 static void
@@ -893,8 +950,9 @@ startup_cas_failed(CasResult res, const char *key)
  * data directory that is running now.  A copy renews it, which ends the wait.
  */
 static void
-wait_for_own_lease(WriterBody *writer, char *writerEtag, int64 storageNow)
+wait_for_own_lease(WriterBody *writer, char *writerEtag, int64 *storeClock)
 {
+	int64		storageNow = *storeClock;
 	StringInfoData body;
 	char		etag[S3_ETAG_LEN];
 
@@ -905,6 +963,15 @@ wait_for_own_lease(WriterBody *writer, char *writerEtag, int64 storageNow)
 					   " seconds left.",
 					   writer->expiresAt - storageNow + 1)));
 	initStringInfo(&body);
+
+	/*
+	 * The store's clock as last read goes back to the caller, which sets the
+	 * offset between that clock and ours by it.  Left at what it was before
+	 * the wait, the offset came out short by the time waited, and so did the
+	 * expires_at of the lease taken next and of its first renewal: up to a
+	 * whole lease duration, a lease written as already run out while its
+	 * writer was starting.
+	 */
 	while (writer->expiresAt >= storageNow)
 	{
 		WriterBody	cur;
@@ -924,6 +991,7 @@ wait_for_own_lease(WriterBody *writer, char *writerEtag, int64 storageNow)
 							   "this data directory was waiting for: a copy of "
 							   "this data directory is running.",
 							   cur.token, cur.owner)));
+		*storeClock = storageNow;
 	}
 	pfree(body.data);
 }
@@ -975,6 +1043,7 @@ s3_lease_acquire(void)
 	bool		haveControl;
 	int64		storageNow = -1;
 	TimestampTz sentAt = 0;
+	int64		sentElapsed = 0;
 	CasResult	res = CAS_UNKNOWN;
 	uint64		runToken = pm_lease.token;
 	char		runOwner[OWNER_LEN];
@@ -1074,7 +1143,7 @@ s3_lease_acquire(void)
 							   "for " INT64_FORMAT " more seconds.",
 							   writer.token, writer.owner,
 							   writer.expiresAt - storageNow + 1)));
-		wait_for_own_lease(&writer, writerEtag, storageNow);
+		wait_for_own_lease(&writer, writerEtag, &storageNow);
 	}
 
 	memset(&pm_lease, 0, sizeof(pm_lease));
@@ -1097,6 +1166,7 @@ s3_lease_acquire(void)
 			s3_lease_duration;
 		render_writer(&body, &newWriter);
 		sentAt = GetCurrentTimestamp();
+		sentElapsed = lease_elapsed_usec();
 		res = lease_cas(WRITER_KEY, &body, writerExists ? writerEtag : NULL,
 						pm_lease.token, pm_lease.owner, newWriter.attempt,
 						false, writerEtag, NULL, &current);
@@ -1134,6 +1204,8 @@ s3_lease_acquire(void)
 	pm_lease.renewedAt = sentAt;
 	pm_lease.deadline = TimestampTzPlusSeconds(sentAt,
 											   s3_lease_duration - LEASE_MARGIN_SECS);
+	pm_lease.deadlineElapsed = sentElapsed +
+		(int64) (s3_lease_duration - LEASE_MARGIN_SECS) * INT64CONST(1000000);
 
 	/* the token is ours before root says so: a crash in between keeps it ours */
 	write_token_file(pm_lease.token, bucket);
@@ -1439,15 +1511,18 @@ s3_lease_lost(const char *detail)
  * epoch lookup (every S3 worker's key) then never waits on a store that does
  * not answer.
  */
+
 static TimestampTz
 lease_deadline(void)
 {
 	TimestampTz deadline;
+	int64		deadlineElapsed;
 
 	LWLockAcquire(&lease->lock, LW_SHARED);
 	deadline = lease->deadline;
+	deadlineElapsed = lease->deadlineElapsed;
 	LWLockRelease(&lease->lock);
-	return deadline;
+	return lease_deadline_of(deadline, deadlineElapsed);
 }
 
 /*
@@ -1464,6 +1539,7 @@ lease_renew(void)
 	int64		storageNow,
 				clockOffset;
 	TimestampTz sentAt;
+	int64		sentElapsed;
 	uint32		attempt;
 	char		etag[S3_ETAG_LEN];
 	bool		done = false;
@@ -1487,6 +1563,7 @@ lease_renew(void)
 		w.expiresAt = (int64) time(NULL) + clockOffset + s3_lease_duration;
 		render_writer(&body, &w);
 		sentAt = GetCurrentTimestamp();
+		sentElapsed = lease_elapsed_usec();
 		res = lease_cas(WRITER_KEY, &body, etag, w.token, w.owner, w.attempt,
 						false, etag, &storageNow, &current);
 		if (res == CAS_DONE)
@@ -1499,6 +1576,8 @@ lease_renew(void)
 			lease->renewedAt = sentAt;
 			lease->deadline = TimestampTzPlusSeconds(sentAt,
 													 s3_lease_duration - LEASE_MARGIN_SECS);
+			lease->deadlineElapsed = sentElapsed +
+				(int64) (s3_lease_duration - LEASE_MARGIN_SECS) * INT64CONST(1000000);
 			lease->clockOffset = clockOffset;
 			LWLockRelease(&lease->lock);
 			done = true;
@@ -2185,6 +2264,7 @@ orioledb_s3_status(PG_FUNCTION_ARGS)
 	bool		running;
 	uint64		token;
 	TimestampTz deadline;
+	int64		deadlineElapsed;
 	uint32		root;
 	uint32		gc[3];
 
@@ -2198,6 +2278,7 @@ orioledb_s3_status(PG_FUNCTION_ARGS)
 	LWLockAcquire(&lease->lock, LW_SHARED);
 	token = lease->token;
 	deadline = lease->deadline;
+	deadlineElapsed = lease->deadlineElapsed;
 	root = lease->root.checkpoint;
 	memcpy(gc, lease->gcPublished, sizeof(gc));
 	LWLockRelease(&lease->lock);
@@ -2208,7 +2289,8 @@ orioledb_s3_status(PG_FUNCTION_ARGS)
 	if (orioledb_s3_reader || deadline == 0)
 		nulls[2] = true;
 	else
-		values[2] = Float8GetDatum((double) (deadline - GetCurrentTimestamp()) / 1000000.0);
+		values[2] = Float8GetDatum((double) (lease_deadline_of(deadline, deadlineElapsed) -
+											 GetCurrentTimestamp()) / 1000000.0);
 	values[3] = Int64GetDatum(root);
 	values[4] = LSNGetDatum(flush);
 	if (shipped == InvalidXLogRecPtr)

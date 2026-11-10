@@ -746,6 +746,23 @@ gc_manifest_fetch(uint32 chkpNum)
 	return m;
 }
 
+/* A tree's state with nothing folded: no part, no block size known. */
+static void
+tree_start_over(GcTree *tree)
+{
+	HASHCTL		ctl;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(uint64);
+	ctl.entrysize = sizeof(GcPart);
+	ctl.hcxt = tree->cxt;
+	tree->blocksPerPart = 0;
+	tree->skip = false;
+	tree->changed = false;
+	tree->parts = hash_create("orioledb s3 gc parts", 64, &ctl,
+							  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
 static GcTree *
 get_tree(HTAB *trees, S3ManifestTree *t)
 {
@@ -754,19 +771,9 @@ get_tree(HTAB *trees, S3ManifestTree *t)
 
 	if (!found)
 	{
-		HASHCTL		ctl;
-
-		memset(&ctl, 0, sizeof(ctl));
-		ctl.keysize = sizeof(uint64);
-		ctl.entrysize = sizeof(GcPart);
-		ctl.hcxt = CurrentMemoryContext;
 		tree->spcoid = t->spcoid;
-		tree->blocksPerPart = 0;
-		tree->skip = false;
-		tree->changed = false;
 		tree->cxt = CurrentMemoryContext;
-		tree->parts = hash_create("orioledb s3 gc parts", 64, &ctl,
-								  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		tree_start_over(tree);
 		state_load(tree);
 	}
 	return tree;
@@ -1536,6 +1543,129 @@ collect_abandoned_trees(uint32 r, uint32 committed)
 }
 
 /*
+ * The copies builds put of their maps (s3_note_map_copy()): each goes once
+ * the checkpoint it is numbered with is collected.  A writer that takes over
+ * starts from a checkpoint the GC keeps, and looks for a built tree's map
+ * under that number only.  The list is taken aside first, as the dropped
+ * trees' is; what cannot go yet is noted again.
+ */
+static void
+collect_map_copies(uint32 collected)
+{
+	char	   *taken = psprintf("%s.gc", S3_MAP_COPIES_FILE);
+	int			fd;
+	struct stat st;
+	char	   *data;
+	S3Manifest *rm = NULL;
+	bool		fetched = false;
+
+	if (stat(taken, &st) != 0)
+	{
+		int			lock = s3_local_lists_lock();
+		bool		renamed = rename(S3_MAP_COPIES_FILE, taken) == 0;
+
+		s3_local_lists_unlock(lock);
+		if (!renamed)
+		{
+			pfree(taken);
+			return;
+		}
+	}
+	fd = BasicOpenFile(taken, O_RDONLY | PG_BINARY);
+	if (fd < 0 || fstat(fd, &st) != 0)
+	{
+		if (fd >= 0)
+			close(fd);
+		pfree(taken);
+		return;
+	}
+	data = palloc(st.st_size + 1);
+	if (read(fd, data, st.st_size) != st.st_size)
+	{
+		close(fd);
+		pfree(data);
+		pfree(taken);
+		return;
+	}
+	close(fd);
+
+	for (off_t pos = 0; pos + (off_t) sizeof(S3MapCopy) <= st.st_size;
+		 pos += sizeof(S3MapCopy))
+	{
+		S3MapCopy	rec;
+		char	   *key;
+		S3ManifestTreeKey tkey;
+		S3ManifestTree *named;
+
+		memset(&tkey, 0, sizeof(tkey));
+		memcpy(&rec, data + pos, sizeof(rec));
+		gc_check_stop();
+		if (collected <= rec.chkp)
+		{
+			/* a start may still be from its checkpoint */
+			int			lock = s3_local_lists_lock();
+
+			fd = BasicOpenFile(S3_MAP_COPIES_FILE,
+							   O_WRONLY | O_CREAT | O_APPEND | PG_BINARY);
+			if (fd < 0 || write(fd, &rec, sizeof(rec)) != sizeof(rec) ||
+				pg_fsync(fd) != 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not write file \"%s\": %m",
+								S3_MAP_COPIES_FILE)));
+			close(fd);
+			s3_local_lists_unlock(lock);
+			continue;
+		}
+
+		/*
+		 * Not one a start took as its tree's own map: recovery does that
+		 * with the map of a tree built after the checkpoint it started from
+		 * (s3_adopt_built_tree_map()), and the manifests then name the tree
+		 * with that number.  The copy is their reference from there on, and
+		 * goes as any map does once the reference moves off it.
+		 */
+		if (!fetched)
+		{
+			rm = gc_manifest_fetch(collected);
+			fetched = true;
+		}
+		if (rm == NULL)
+		{
+			/* cannot tell: next pass */
+			int			lock = s3_local_lists_lock();
+
+			fd = BasicOpenFile(S3_MAP_COPIES_FILE,
+							   O_WRONLY | O_CREAT | O_APPEND | PG_BINARY);
+			if (fd < 0 || write(fd, &rec, sizeof(rec)) != sizeof(rec) ||
+				pg_fsync(fd) != 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not write file \"%s\": %m",
+								S3_MAP_COPIES_FILE)));
+			close(fd);
+			s3_local_lists_unlock(lock);
+			continue;
+		}
+		tkey.datoid = rec.datoid;
+		tkey.relnode = rec.relnode;
+		named = hash_search(rm->trees, &tkey, HASH_FIND, NULL);
+		if (named != NULL && named->map == rec.chkp)
+			continue;
+		key = psprintf("trees/%u/%u/maps/" UINT64_FORMAT "-%u",
+					   rec.datoid, rec.relnode, rec.token, rec.chkp);
+		gc_delete(key);
+		pfree(key);
+	}
+	if (rm != NULL)
+		s3_manifest_free(rm);
+	gc_flush();
+	(void) unlink(taken);
+	pfree(data);
+	pfree(taken);
+}
+
+/*
  * The oldest checkpoint from `retain` back that was published within
  * orioledb.s3_gc_keep_time.  A manifest does not change, so the times read
  * are kept for the next passes.  One without a time (published before
@@ -1663,6 +1793,82 @@ skipped_lines(void)
 	return out.data;
 }
 
+/* the trees whose state the fold let go this pass, at their drop */
+static List *gcFoldDropped = NIL;
+
+static bool
+fold_dropped(S3ManifestTreeKey *key)
+{
+	ListCell   *lc;
+
+	foreach(lc, gcFoldDropped)
+	{
+		S3ManifestTreeKey *k = lfirst(lc);
+
+		if (k->datoid == key->datoid && k->relnode == key->relnode)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Before the lists of checkpoint k are folded: a tree the manifest before k
+ * names and k's does not was dropped, and its state goes here, at its drop.
+ * A tree made later under the same relnode (OIDs wrapped around) has the
+ * dropped one's keys, and its lists are folded into the state those keys
+ * name: left to the pass's end, the dropped tree's dead bits and part ends
+ * were still there when the new tree's lists were ORed in, and a part of
+ * the new tree whose live blocks the old bits covered was removed in that
+ * same pass, before the dropped tree was looked at.  The dropped tree's own
+ * parts need no state: they go with everything under its prefix once the
+ * manifests that named it are collected.  With no manifest for k (not
+ * published) the next one there is stands for it, as it does for the fold.
+ */
+static void
+fold_drop_states(HTAB *trees, uint32 k, uint32 collected, uint32 committed)
+{
+	ManifestTrees *cur = NULL,
+			   *prev = NULL;
+	HTAB	   *named;
+	HASHCTL		ctl;
+
+	for (uint32 n = k; n <= committed && cur == NULL; n++)
+		cur = manifest_trees(n);
+	for (uint32 n = k - 1; n >= Max(collected, 1) && prev == NULL; n--)
+		prev = manifest_trees(n);
+	if (cur == NULL || prev == NULL)
+		return;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(S3ManifestTreeKey);
+	ctl.entrysize = sizeof(S3ManifestTreeKey);
+	ctl.hcxt = CurrentMemoryContext;
+	named = hash_create("orioledb s3 gc named trees", Max(64, cur->count),
+						&ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	for (int i = 0; i < cur->count; i++)
+		(void) hash_search(named, &cur->keys[i], HASH_ENTER, NULL);
+	for (int i = 0; i < prev->count; i++)
+	{
+		S3ManifestTreeKey *key = &prev->keys[i];
+		S3ManifestTreeKey *noted;
+		GcTree	   *tree;
+
+		if (key->datoid == SYS_TREES_DATOID ||
+			hash_search(named, key, HASH_FIND, NULL) != NULL)
+			continue;
+		elog(DEBUG1, "S3 GC lets the state of tree %u/%u go: dropped by checkpoint %u",
+			 key->datoid, key->relnode, k);
+		state_drop(key->datoid, key->relnode);
+		tree = hash_search(trees, key, HASH_FIND, NULL);
+		if (tree != NULL)
+			tree_start_over(tree);
+		noted = palloc(sizeof(S3ManifestTreeKey));
+		*noted = *key;
+		gcFoldDropped = lappend(gcFoldDropped, noted);
+	}
+	hash_destroy(named);
+}
+
 /*
  * One pass.  Returns the number of parts removed.
  */
@@ -1690,6 +1896,7 @@ s3_gc_cycle(void)
 	gcFailed = NULL;
 	gc_parts = NIL;
 	gc_pending = NIL;
+	gcFoldDropped = NIL;
 	initStringInfo(&skippedBefore);
 	if (committed < (uint32) s3_gc_keep_checkpoints ||
 		!s3_gc_progress(&published, &folded, &collected, &skippedBefore))
@@ -1741,6 +1948,7 @@ s3_gc_cycle(void)
 		S3Manifest *m;
 
 		gc_check_stop();
+		fold_drop_states(trees, k, collected, committed);
 		m = gc_manifest_fetch(k);
 
 		if (m == NULL)
@@ -1795,12 +2003,19 @@ s3_gc_cycle(void)
 		/*
 		 * R's manifest has to know every reference of its checkpoint, or an
 		 * object R reads would look unreferenced; an older complete one does
-		 * as well, as references only move forward.
+		 * as well, as references only move forward.  It has to be one that
+		 * was published, too: a manifest prepared for a checkpoint the bucket
+		 * never committed (the shipper was away) says it is complete but has
+		 * no REDO, and the WAL below R is deleted by R's REDO.  Taken as R,
+		 * it deleted no segment and moved the collected mark past them: the
+		 * segments up to the next R's REDO were never looked at again.
 		 */
 		for (rk = r; rk > collected && rm == NULL; rk--)
 		{
 			rm = gc_manifest_fetch(rk);
-			if (rm != NULL && !rm->complete)
+			if (rm != NULL &&
+				(!rm->complete || rm->redoLsn == InvalidXLogRecPtr ||
+				 rm->timeline == 0))
 			{
 				s3_manifest_free(rm);
 				rm = NULL;
@@ -1848,17 +2063,20 @@ s3_gc_cycle(void)
 				if (tree_named(&d->key, rk + 1, committed))
 				{
 					/*
-					 * A new tree under the dropped one's keys.  The dropped
-					 * tree's dead bits would OR into the new tree's parts,
-					 * and a live part would go: the state starts over.  Its
-					 * lists up to r are folded already, so nothing of the
-					 * dropped tree comes back; a list of the new tree folded
-					 * this pass (r past R') is lost with it, a leak only.
+					 * A new tree under the dropped one's keys: the dropped
+					 * tree's objects are left, as the keys are the new
+					 * tree's now.  Its state went when the fold got to its
+					 * drop (fold_drop_states()), before any list of the new
+					 * tree was folded.  A drop folded past by a pass before
+					 * this one is not known here: the state starts over
+					 * once more then, and what the new tree had folded into
+					 * it since is lost with it, a leak only.
 					 */
 					ereport(LOG,
 							(errmsg("S3 GC leaves dropped tree %u/%u: a tree has its relnode again, its GC state starts over",
 									d->key.datoid, d->key.relnode)));
-					state_drop(d->key.datoid, d->key.relnode);
+					if (!fold_dropped(&d->key))
+						state_drop(d->key.datoid, d->key.relnode);
 					continue;
 				}
 				removed += collect_dropped_tree(&d->key);
@@ -1922,6 +2140,7 @@ s3_gc_cycle(void)
 	}
 
 	removed += collect_abandoned_trees(r, committed);
+	collect_map_copies(collected);
 	gc_flush();
 	if (removed > 0)
 		ereport(LOG,

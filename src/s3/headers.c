@@ -553,6 +553,18 @@ s3_header_compare_and_swap_extended(S3HeaderTag tag, int index,
 				}
 				else
 				{
+					/*
+					 * The word the exchange found may be another file's: the
+					 * buffer was given to it since the checks above (its
+					 * words then carry another change count).  Handed back
+					 * as this part's value, a caller acted on it: a seal saw
+					 * no dirty flag and left the part unsealed and never
+					 * uploaded, under a map that names its blocks.  Look the
+					 * tag up again.
+					 */
+					if (S3_PART_GET_CHANGE_COUNT(fullValue) != changeCount)
+						break;
+
 					*oldValue = S3_PART_GET_LOWER(fullValue);
 					return false;
 				}
@@ -606,6 +618,14 @@ s3_header_wait_part_settled(S3HeaderTag tag, int index, bool interruptible)
 			(void) ConditionVariableTimedSleep(&meta->partSettledCV, 100,
 											   PG_WAIT_EXTENSION);
 		slept = true;
+
+		/*
+		 * A reader waits with the page's I/O lock held, under which the
+		 * sleep's own interrupt check does nothing: the process it waits for
+		 * may be waiting out the store.
+		 */
+		if (interruptible)
+			s3_reader_wait_check_cancel();
 		value = s3_header_read_value(tag, index);
 	}
 	if (slept)
@@ -697,7 +717,17 @@ s3_header_load_part(S3HeaderTag tag, int index)
 				long		code;
 
 				pg_atomic_fetch_add_u64(&meta->numberOfLoadedParts, 1);
-				code = s3_load_file_part_here(tag.key, tag.segNum, index);
+				/* a cancel ends the wait for the store, see there */
+				s3_request_for_reader = true;
+				PG_TRY();
+				{
+					code = s3_load_file_part_here(tag.key, tag.segNum, index);
+				}
+				PG_FINALLY();
+				{
+					s3_request_for_reader = false;
+				}
+				PG_END_TRY();
 				if (code == S3_RESPONSE_OK)
 					s3_header_mark_part_loaded(tag, index);
 				else
@@ -1822,6 +1852,9 @@ eviction_callback(S3HeaderTag tag)
 	int			i;
 	int			numParts;
 	bool		coldNext = false;
+	int			evicting[S3_HEADER_NUM_VALUES];
+	int			numEvicting = 0;
+	bool		headerSynced = true;
 
 	if (evictionPhase == EvictionSeekingHand)
 	{
@@ -1953,26 +1986,62 @@ eviction_callback(S3HeaderTag tag)
 					S3_PART_GET_STATUS(newValue) == S3PartStatusEvicting)
 				{
 					off_t		offset = (off_t) i * (off_t) ORIOLEDB_S3_PART_SIZE + (off_t) ORIOLEDB_BLCKSZ;
-					uint64		punched = Min(offset + ORIOLEDB_S3_PART_SIZE, fileSize) - offset;
-					uint64		result;
 
-					elog(DEBUG1, "S3 evict %u %u %d %d",
-						 tag.key.oids.datoid, tag.key.oids.relnode,
-						 tag.segNum, i);
-					punch_fd_hole(fd, offset, punched, filename);
-					evictionBytes -= Min(evictionBytes, punched);
-					occupied_evicted(tag, punched);
-					partsEvicted++;
-
-					result = pg_atomic_fetch_sub_u64(&meta->numberOfLoadedParts, 1);
-					elog(DEBUG1, "eviction_callback(%llu 1)",
-						 (unsigned long long) result);
-
-					s3_header_mark_not_loaded(tag, i);
+					/* punched below, once the header is on disk */
+					evicting[numEvicting++] = i;
+					evictionBytes -= Min(evictionBytes,
+										 Min(offset + ORIOLEDB_S3_PART_SIZE, fileSize) - offset);
 				}
 				break;
 			}
 		}
+	}
+
+	/*
+	 * The header that calls these parts evicting was written when each was
+	 * marked (sync_buffer()); it is synced here, as the fsync setting has
+	 * it, before the first hole is punched.  A hole that reached the disk
+	 * under a header still calling the part loaded was, after a crash of
+	 * the machine, read as the part's pages and never fetched again.  One
+	 * sync for the file's parts of this cycle; who reads one of them
+	 * meanwhile waits for it to settle, as it did for the punch.
+	 */
+	if (numEvicting > 0 && pg_fsync(fd) != 0)
+	{
+		/*
+		 * No hole without the header on disk.  The parts are given up as not
+		 * loaded all the same, their bytes left where they are: fetched
+		 * again when needed, over the same bytes.
+		 */
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not fsync file \"%s\": %m", filename),
+				 errdetail("Its parts are not evicted.")));
+		headerSynced = false;
+	}
+
+	for (i = 0; i < numEvicting; i++)
+	{
+		int			part = evicting[i];
+		off_t		offset = (off_t) part * (off_t) ORIOLEDB_S3_PART_SIZE + (off_t) ORIOLEDB_BLCKSZ;
+		uint64		punched = Min(offset + ORIOLEDB_S3_PART_SIZE, fileSize) - offset;
+		uint64		result;
+
+		elog(DEBUG1, "S3 evict %u %u %d %d",
+			 tag.key.oids.datoid, tag.key.oids.relnode,
+			 tag.segNum, part);
+		if (headerSynced)
+		{
+			punch_fd_hole(fd, offset, punched, filename);
+			occupied_evicted(tag, punched);
+		}
+		partsEvicted++;
+
+		result = pg_atomic_fetch_sub_u64(&meta->numberOfLoadedParts, 1);
+		elog(DEBUG1, "eviction_callback(%llu 1)",
+			 (unsigned long long) result);
+
+		s3_header_mark_not_loaded(tag, part);
 	}
 
 	if (coldNext && evictionColdLimit == 0)

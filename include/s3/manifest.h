@@ -107,6 +107,23 @@ typedef struct
 } S3DroppedTree;
 
 extern void s3_note_dropped_tree(Oid datoid, Oid relnode);
+
+/*
+ * The copies builds put of their maps under the committed checkpoint's number
+ * (s3_schedule_map_copy_write()), for the GC to remove once that checkpoint
+ * is collected.
+ */
+#define S3_MAP_COPIES_FILE	ORIOLEDB_DATA_DIR "/s3_map_copies"
+
+typedef struct
+{
+	uint32		chkp;			/* the number the copy is under */
+	Oid			datoid;
+	Oid			relnode;
+	uint64		token;			/* the run that put it */
+} S3MapCopy;
+
+extern void s3_note_map_copy(Oid datoid, Oid relnode, uint32 chkp);
 extern void s3_tree_parts_gone(Oid datoid, Oid relnode, uint64 floor);
 extern void s3_build_part_end(Oid datoid, Oid relnode, Oid spcoid,
 							  uint64 blocksPerPart, uint64 *ends, int nends);

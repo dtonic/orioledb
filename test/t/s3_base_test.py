@@ -234,21 +234,30 @@ class FailingGet:
 class FailingDelete:
 	"""
 	A delete_object() that answers the first `failures` DELETEs of keys
-	holding `contains` with 503, removing nothing.
+	holding `contains` with 503, removing nothing.  With `once_a_key`, the
+	first DELETE of each of the first `failures` keys: a key is then put
+	again once, whatever the number of keys the first batch holds (one key
+	alone would otherwise take every failure, each retry twice as long
+	after the one before).
 	"""
 
-	def __init__(self, failures, contains='/parts/'):
+	def __init__(self, failures, contains='/parts/', once_a_key=False):
 		self.failures = failures
 		self.contains = contains
+		self.once_a_key = once_a_key
 		self.failed = 0
+		self.keys = set()
 		self.lock = threading.Lock()
 
 	def __call__(self, response) -> TYPE_RESPONSE:
-		if self.contains in response.parse_key_name():
+		key = response.parse_key_name()
+		if self.contains in key:
 			with self.lock:
-				fail = self.failed < self.failures
+				fail = self.failed < self.failures and \
+				    not (self.once_a_key and key in self.keys)
 				if fail:
 					self.failed += 1
+					self.keys.add(key)
 			if fail:
 				raise TransientServerError()
 		return orig_delete_object(response)

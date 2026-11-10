@@ -120,6 +120,15 @@ The defaults suit most installations.
 | `orioledb.s3_reader` | `off` | restart | Runs the instance as a reader, see [S3 reader](#s3-reader). |
 | `orioledb.s3_reader_pin_ttl` | `10min` | restart | How long a reader's pin keeps its checkpoint from the garbage collector without renewal. |
 
+### Durability
+
+Two settings decide different things, and neither stands in for the other.
+
+- **What a commit waits for.** With `synchronous_standby_names = 's3'` and `synchronous_commit` at `on`, `remote_write` or `remote_apply`, a commit returns once its WAL is in the bucket. With `synchronous_commit = local` (or without `'s3'`) it returns once the WAL is flushed locally, and the bucket follows a moment later; a commit not yet in the bucket is lost if the local disk is lost or another instance takes the bucket over. `synchronous_commit` can be set per transaction.
+- **Whether local writes are synced: `fsync`.** With `fsync = on` (the default) what the server takes to be on the local disk is there after a crash of the host, and the instance restarts in place. With `fsync = off` nothing is synced: commits that waited for the bucket are safe there, but after a crash of the host (power loss, kernel panic) the data directory must be loaded from the bucket again, without `--keep-parts`. The server cannot tell that this happened, so it is the operator's rule to keep. A crash of the server processes alone (out of memory, a restarted container) leaves local files as they were with either setting.
+
+A commit acknowledged from the bucket is as durable as the store makes an acknowledged PUT. A self-hosted store has to sync before it answers.
+
 ### Notes
 
 In S3 mode, OrioleDB tables and materialized views are synchronized with S3 incrementally: only modified blocks are uploaded. For tables and materialized views not created `USING orioledb`, background workers compute file checksums at each checkpoint, so S3 mode works best when most of the data is stored with the OrioleDB engine.

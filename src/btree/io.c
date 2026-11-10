@@ -876,7 +876,16 @@ btree_smgr_sync(BTreeDescr *desc, uint32 chkpNum, off_t length)
 	if (use_mmap || use_device)
 		return;
 
-	for (num = 0; num < length / ORIOLEDB_SEGMENT_SIZE; num++)
+	/*
+	 * Every segment that holds some of the length, the last one too.  The
+	 * count used to be the number of whole segments: a tree shorter than one
+	 * segment synced nothing, and a longer one never its last segment, so
+	 * what a checkpoint wrote there reached the disk only when the kernel
+	 * got to it.  After a crash of the machine the checkpoint's own pages
+	 * could be missing from the file (in S3 mode from the local copy only:
+	 * the bucket's parts are put from what was written).
+	 */
+	for (num = 0; (off_t) num * ORIOLEDB_SEGMENT_SIZE < length; num++)
 	{
 		File		file;
 
@@ -2033,6 +2042,98 @@ write_page_to_disk_internal(BTreeDescr *desc, FileExtent *extent,
 }
 
 /*
+ * Re-find the parent page of a page load_page() reads, and in it the downlink
+ * the read marked as an I/O in progress: the parent was unlocked for the
+ * read, and might have changed due to concurrent operations (an item put
+ * before the downlink moves it, a split may move it to another page).  The
+ * downlink is the one whose page ends at target_hikey (rightmost when that is
+ * null).  The parent comes back locked, at context->items[context->index].
+ *
+ * That descent is a scratch use of the caller's context: it needs its own
+ * flags, and nothing it does to them may be visible to the caller afterwards
+ * -- find_page() maintains parentImg for a KEEP_PARENT caller, clears the
+ * LOKEY_* results a KEEP_LOKEY caller is about to read, and leaves
+ * refind_page() handing back a parent slot that belongs to neither descent.
+ *
+ * So save the whole flags word and put it back, rather than listing the flags
+ * to preserve one by one: that list is what went wrong here, and a flag added
+ * later would silently join the ones already missing from it.
+ */
+static void
+load_page_refind_parent(OBTreeFindPageContext *context, OFixedKey *target_hikey,
+						int target_level, OInMemoryBlkno parent_blkno,
+						uint32 parent_change_count)
+{
+	uint16		saved_flags = context->flags;
+	CommitSeqNo csn = context->csn;
+	OFindPageResult result PG_USED_FOR_ASSERTS_ONLY;
+
+	if (!BTREE_PAGE_FIND_IS(context, MODIFY))
+	{
+		Assert(BTREE_PAGE_FIND_IS(context, FETCH) ||
+			   BTREE_PAGE_FIND_IS(context, IMAGE));
+		BTREE_PAGE_FIND_UNSET(context, FETCH);
+		BTREE_PAGE_FIND_SET(context, MODIFY);
+	}
+	BTREE_PAGE_FIND_UNSET(context, IMAGE);
+	BTREE_PAGE_FIND_UNSET(context, KEEP_LOKEY);
+	BTREE_PAGE_FIND_UNSET(context, KEEP_PARENT);
+	BTREE_PAGE_FIND_SET(context, DOWNLINK_LOCATION);
+	context->csn = COMMITSEQNO_INPROGRESS;
+
+	if (O_TUPLE_IS_NULL(target_hikey->tuple))
+		result = refind_page(context, NULL, BTreeKeyRightmost,
+							 target_level + 1, parent_blkno,
+							 parent_change_count);
+	else
+		result = refind_page(context, &target_hikey->tuple, BTreeKeyPageHiKey,
+							 target_level + 1, parent_blkno,
+							 parent_change_count);
+	Assert(result == OFindPageResultSuccess);
+
+	/* restore context state */
+	context->csn = csn;
+	context->flags = saved_flags;
+}
+
+/*
+ * A read load_page() started did not give the page: put the on-disk downlink
+ * back in place of the I/O one, so that the next reader starts the read
+ * again, and let the I/O go.  The parent is found again first.  Written
+ * through the pointer taken before the parent was unlocked, the downlink
+ * went wherever that address had come to be -- over another item's downlink
+ * when one was put before it meanwhile, or into a page it had left -- and the
+ * I/O downlink itself stayed, with every later reader waiting on an I/O
+ * nobody runs.  In S3 mode the read may wait on the store for long, and ends
+ * in an error for a part the bucket lacks or a query that is cancelled.
+ */
+static void
+load_page_put_downlink_back(OBTreeFindPageContext *context, uint64 downlink,
+							int ionum, OFixedKey *target_hikey,
+							int target_level, OInMemoryBlkno parent_blkno,
+							uint32 parent_change_count)
+{
+	BTreePageItemLocator *parent_loc;
+	BTreeNonLeafTuphdr *int_hdr;
+	Page		parent_page;
+
+	load_page_refind_parent(context, target_hikey, target_level,
+							parent_blkno, parent_change_count);
+
+	parent_blkno = context->items[context->index].blkno;
+	parent_loc = &context->items[context->index].locator;
+	page_block_reads(parent_blkno);
+	parent_page = O_GET_IN_MEMORY_PAGE(parent_blkno);
+	int_hdr = (BTreeNonLeafTuphdr *) BTREE_PAGE_LOCATOR_GET_ITEM(parent_page, parent_loc);
+	Assert(int_hdr->downlink == MAKE_IO_DOWNLINK(ionum));
+	int_hdr->downlink = downlink;
+	PAGE_INC_N_ONDISK(parent_page);
+	unlock_page(parent_blkno);
+
+	unlock_io(ionum);
+}
+
+/*
  * Load the page where context is pointing from disk to memory, assuming parent
  * page is locked.
  */
@@ -2044,7 +2145,6 @@ load_page(OBTreeFindPageContext *context)
 	OInMemoryBlkno parent_blkno;
 	Page		parent_page;
 	BTreePageItemLocator *parent_loc;
-	CommitSeqNo csn;
 	uint64		downlink;
 	int			context_index,
 				ionum;
@@ -2055,7 +2155,6 @@ load_page(OBTreeFindPageContext *context)
 	int			target_level;
 	Page		page;
 	char		pg_attribute_aligned(sizeof(uint32)) buf[ORIOLEDB_BLCKSZ];
-	uint16		saved_flags;
 	OReadPageResult read_result;
 	uint32		chkpNum = 0;
 
@@ -2117,9 +2216,9 @@ load_page(OBTreeFindPageContext *context)
 	{
 		/* errfinish zeroed the holdoff count the held lock stands for */
 		HOLD_INTERRUPTS();
-		int_hdr->downlink = downlink;
-		PAGE_INC_N_ONDISK(parent_page);
-		unlock_io(ionum);
+		load_page_put_downlink_back(context, downlink, ionum, &target_hikey,
+									target_level, parent_blkno,
+									parent_change_count);
 		/* Hand the page back, as a failed read does below */
 		ppool_free_page(desc->ppool, blkno, true);
 		PG_RE_THROW();
@@ -2127,9 +2226,9 @@ load_page(OBTreeFindPageContext *context)
 	PG_END_TRY();
 	if (read_result != OReadPageResultOk)
 	{
-		int_hdr->downlink = downlink;
-		PAGE_INC_N_ONDISK(parent_page);
-		unlock_io(ionum);
+		load_page_put_downlink_back(context, downlink, ionum, &target_hikey,
+									target_level, parent_blkno,
+									parent_change_count);
 
 		/*
 		 * Nothing refers to the page taken for the read, so hand it back.
@@ -2202,34 +2301,6 @@ load_page(OBTreeFindPageContext *context)
 		STOPEVENT(STOPEVENT_LOAD_PAGE_REFIND, params);
 	}
 
-	/*
-	 * Re-find the parent page (it might have changed due to concurrent
-	 * operations).  That descent is a scratch use of the caller's context: it
-	 * needs its own flags, and nothing it does to them may be visible to the
-	 * caller afterwards -- find_page() maintains parentImg for a KEEP_PARENT
-	 * caller, clears the LOKEY_* results a KEEP_LOKEY caller is about to
-	 * read, and leaves refind_page() handing back a parent slot that belongs
-	 * to neither descent.
-	 *
-	 * So save the whole flags word and put it back, rather than listing the
-	 * flags to preserve one by one: that list is what went wrong here, and a
-	 * flag added later would silently join the ones already missing from it.
-	 */
-	saved_flags = context->flags;
-	csn = context->csn;
-
-	if (!BTREE_PAGE_FIND_IS(context, MODIFY))
-	{
-		Assert(BTREE_PAGE_FIND_IS(context, FETCH) ||
-			   BTREE_PAGE_FIND_IS(context, IMAGE));
-		BTREE_PAGE_FIND_UNSET(context, FETCH);
-		BTREE_PAGE_FIND_SET(context, MODIFY);
-	}
-	BTREE_PAGE_FIND_UNSET(context, IMAGE);
-	BTREE_PAGE_FIND_UNSET(context, KEEP_LOKEY);
-	BTREE_PAGE_FIND_UNSET(context, KEEP_PARENT);
-	BTREE_PAGE_FIND_SET(context, DOWNLINK_LOCATION);
-	context->csn = COMMITSEQNO_INPROGRESS;
 	if (PAGE_GET_LEVEL(page) != target_level)
 		ereport(PANIC, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						errmsg("error reading downlink %X/%X in relfile (%u, %u)",
@@ -2240,23 +2311,16 @@ load_page(OBTreeFindPageContext *context)
 
 	if (O_PAGE_IS(page, RIGHTMOST))
 	{
-		OFindPageResult result PG_USED_FOR_ASSERTS_ONLY;
-
 		if (!O_TUPLE_IS_NULL(target_hikey.tuple))
 			ereport(PANIC, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("error reading downlink %X/%X in relfile (%u, %u)",
 								   (uint32) (downlink >> 32), (uint32) (downlink),
 								   desc->oids.datoid, desc->oids.relnode),
 							errdetail("Hikeys don't match.")));
-		result = refind_page(context, NULL, BTreeKeyRightmost,
-							 PAGE_GET_LEVEL(page) + 1,
-							 parent_blkno, parent_change_count);
-		Assert(result == OFindPageResultSuccess);
 	}
 	else
 	{
 		OTuple		hikey;
-		OFindPageResult result PG_USED_FOR_ASSERTS_ONLY;
 
 		BTREE_PAGE_GET_HIKEY(hikey, page);
 
@@ -2267,15 +2331,14 @@ load_page(OBTreeFindPageContext *context)
 								   (uint32) (downlink >> 32), (uint32) (downlink),
 								   desc->oids.datoid, desc->oids.relnode),
 							errdetail("Hikeys don't match.")));
-		result = refind_page(context, &hikey, BTreeKeyPageHiKey,
-							 PAGE_GET_LEVEL(page) + 1, parent_blkno,
-							 parent_change_count);
-		Assert(result == OFindPageResultSuccess);
 	}
 
-	/* restore context state */
-	context->csn = csn;
-	context->flags = saved_flags;
+	/*
+	 * Re-find the parent page (it might have changed due to concurrent
+	 * operations), by the hikey the page read was checked against above.
+	 */
+	load_page_refind_parent(context, &target_hikey, target_level,
+							parent_blkno, parent_change_count);
 
 	context_index = context->index;
 	parent_blkno = context->items[context_index].blkno;

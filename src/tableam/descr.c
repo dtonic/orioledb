@@ -29,6 +29,7 @@
 #include "postgres_ext.h"
 #include "recovery/recovery.h"
 #include "s3/manifest.h"
+#include "s3/queue.h"
 #include "tableam/handler.h"
 #include "tableam/toast.h"
 #include "tableam/tree.h"
@@ -1541,12 +1542,43 @@ cleanup_btree_extended(OIndexKey ix_key, bool files, bool fsync,
 	SharedRootInfoKey key;
 	SharedRootInfo *shared = NULL;
 	uint64		next = 0;
+	S3TaskLocation uploads = 0;
 
 	key.datoid = ix_key.oids.datoid;
 	key.relnode = ix_key.oids.relnode;
 	key.tablespace = ix_key.oids.spcoid;
 
 	shared = o_find_shared_root_info(&key);
+
+	/*
+	 * The last upload queued for the tree: the parts a checkpoint sealed,
+	 * its map and its list of dead extents.  The checkpoint lets go of the
+	 * tree once they are queued, and names them in its manifest; with the
+	 * files removed before an S3 worker got to them, the worker found no
+	 * file and went on, and the checkpoint committed naming a map (and
+	 * parts) the bucket never got: a data directory loaded from it failed.
+	 */
+	if (files && S3_WRITER_MODE)
+	{
+		if (shared && !shared->placeholder)
+		{
+			BTreeMetaPage *metaPage = (BTreeMetaPage *) O_GET_IN_MEMORY_PAGE(shared->rootInfo.metaPageBlkno);
+
+			uploads = Max(metaPage->partsInfo[0].writeMaxLocation,
+						  metaPage->partsInfo[1].writeMaxLocation);
+		}
+		else if (!shared)
+		{
+			EvictedTreeData *evicted = read_evicted_data(key.datoid, key.relnode,
+														 key.tablespace, false);
+
+			if (evicted)
+			{
+				uploads = Max(evicted->maxLocation[0], evicted->maxLocation[1]);
+				pfree(evicted);
+			}
+		}
+	}
 
 	if (keepPartFloor && orioledb_s3_mode)
 	{
@@ -1570,6 +1602,8 @@ cleanup_btree_extended(OIndexKey ix_key, bool files, bool fsync,
 								  shared->rootInfo.rootPageChangeCount);
 		pfree(shared);
 	}
+	if (uploads > 0)
+		s3_queue_wait_for_location(uploads);
 	if (files)
 		cleanup_btree_files(ix_key, fsync);
 	if (files && keepPartFloor && orioledb_s3_mode)
