@@ -11,7 +11,7 @@ from testgres.exceptions import QueryException
 from moto.s3.exceptions import S3ClientError, MissingKey, InvalidRequest
 
 from .s3_base_test import S3BaseTest, orig_get_object, orig_put_object, \
- AccessDenied
+ AccessDenied, TransientServerError
 
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
@@ -125,6 +125,46 @@ class S3DatapathTest(S3BaseTest):
 			                    f"SELECT length(value) FROM o_test "
 			                    f"WHERE id IN (2000, 10000, 20000, 30000, 38000)")
 		return e.exception.message, time.time() - started
+
+	def test_s3_a_query_waiting_out_the_store_can_be_cancelled(self):
+		"""
+		A request the store fails is tried again without end, and a backend
+		downloading the part its page read needs does so with the page's
+		I/O lock held, where no interrupt is taken: while the store was
+		down the query took no cancel and no statement_timeout, and a
+		shutdown waited for it.  A pending cancel ends the wait.
+		"""
+		node = self.node
+		self.conf('8MB')
+		node.start()
+		self.evicted_table()
+
+		def down(response):
+			if '/parts/' in response.parse_key_name():
+				raise TransientServerError()
+			return orig_get_object(response)
+
+		result = {}
+
+		def lookup():
+			result['message'], result['took'] = self.lookup_error('3s')
+
+		query = Thread(target=lookup)
+		with patch('moto.s3.responses.S3Response.get_object', new=down):
+			query.start()
+			query.join(30)
+			cancelled = not query.is_alive()
+		# the store is back: a query the outage held goes through and fails
+		# its assertion in the thread, which is not this test's
+		query.join(120)
+		self.assertTrue(cancelled, "the query waited out the store")
+		self.assertIn("canceling the wait for an S3 part", result['message'])
+		self.assertLess(result['took'], 20)
+		self.assertEqual(
+		    [(5, )],
+		    node.execute("SELECT count(*) FROM o_test WHERE id IN "
+		                 "(2000, 10000, 20000, 30000, 38000)"))
+		node.stop()
 
 	def test_s3_a_part_missing_from_the_bucket_is_an_error(self):
 		"""

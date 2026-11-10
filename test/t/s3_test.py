@@ -22,6 +22,7 @@ import testgres
 from testgres.defaults import default_dbname
 from testgres.enums import NodeStatus
 from testgres.exceptions import StartNodeException, QueryException
+from moto.s3.exceptions import MissingKey
 
 from .base_test import wait_checkpointer_stopevent
 from .s3_base_test import S3BaseTest, s3_test_attrs, mock_put_object, \
@@ -2356,6 +2357,99 @@ class S3Test(S3BaseTest):
 			    "SELECT count(*) FROM o_test").decode().strip())
 			self.assertEqual("0", new_node.safe_psql(
 			    "SELECT count(*) FROM pg_class WHERE relname = 'o_gone'"
+			).decode().strip())
+			new_node.stop()
+			new_node.cleanup()
+
+	def test_s3_failed_read_finds_its_downlink_in_a_parent_that_changed(self):
+		"""A page read marks its downlink in the parent as an I/O in progress
+		and lets the parent go; in S3 mode the read may wait on the store,
+		and end in an error (here a part the bucket does not have).  The
+		downlink is put back where it is then, not where it was: a split of
+		another child meanwhile puts a downlink before it, and written to
+		its old place the on-disk downlink went over its neighbour's, with
+		the I/O downlink left for every later reader to wait on."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_lease_duration = 30
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, v text) USING orioledb;
+			INSERT INTO o_test SELECT g * 100, repeat(md5(g::text), 6)
+				FROM generate_series(1, 12000) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+		datoid = node.execute("SELECT oid FROM pg_database "
+		                      "WHERE datname = current_database()")[0][0]
+		relnode = node.execute("SELECT relfilenode FROM pg_class "
+		                       "WHERE relname = 'o_test_pkey'")[0][0]
+		node.stop()
+		parts = f"trees/{datoid}/{relnode}/parts/"
+
+		fetched = set()
+		armed = []
+		held = []
+		entered = threading.Event()
+		release = threading.Event()
+
+		def held_then_missing(response):
+			key = response.parse_key_name()
+			if key.startswith(parts):
+				if armed and not held and key not in fetched:
+					held.append(key)
+					entered.set()
+					release.wait(60)
+					raise MissingKey(key=key)
+				fetched.add(key)
+			return orig_get_object(response)
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			new_node.start()
+			errors = []
+
+			def reader():
+				# the first of these whose leaf is in a part not fetched yet
+				for key in (600000, 900000, 300000, 1200000):
+					try:
+						new_node.safe_psql("SELECT length(v) FROM o_test "
+						                   f"WHERE id = {key}")
+					except QueryException as e:
+						errors.append((key, e.message))
+						return
+
+			with patch('moto.s3.responses.S3Response.get_object',
+			           new=held_then_missing):
+				# the first leaf and the pages above it are in memory
+				new_node.safe_psql("SELECT length(v) FROM o_test WHERE id = 100")
+				armed.append(True)
+				read = Thread(target=reader)
+				read.start()
+				self.assertTrue(entered.wait(60), "no read waited for a part")
+				# the first leaf splits: its new sibling's downlink goes
+				# into the parent, before the one being read
+				new_node.safe_psql("SET statement_timeout = '30s'; "
+				                   "INSERT INTO o_test SELECT g, repeat('x', 200) "
+				                   "FROM generate_series(101, 199) g")
+				release.set()
+				read.join(60)
+				self.assertFalse(read.is_alive())
+			self.assertEqual(1, len(errors), errors)
+			self.assertIn("is not in the S3 bucket", errors[0][1])
+			# the part is there again: every row is read, by key and in order
+			self.assertEqual("1", new_node.safe_psql(
+			    "SET statement_timeout = '60s'; SELECT count(*) FROM o_test "
+			    f"WHERE id = {errors[0][0]}").decode().strip())
+			self.assertEqual("12099", new_node.safe_psql(
+			    "SET statement_timeout = '120s'; SET enable_seqscan = off; "
+			    "SELECT count(*) FROM o_test WHERE id > 0").decode().strip())
+			self.assertEqual("12099", new_node.safe_psql(
+			    "SET statement_timeout = '120s'; SELECT count(*) FROM o_test"
 			).decode().strip())
 			new_node.stop()
 			new_node.cleanup()

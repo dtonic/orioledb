@@ -553,6 +553,18 @@ s3_header_compare_and_swap_extended(S3HeaderTag tag, int index,
 				}
 				else
 				{
+					/*
+					 * The word the exchange found may be another file's: the
+					 * buffer was given to it since the checks above (its
+					 * words then carry another change count).  Handed back
+					 * as this part's value, a caller acted on it: a seal saw
+					 * no dirty flag and left the part unsealed and never
+					 * uploaded, under a map that names its blocks.  Look the
+					 * tag up again.
+					 */
+					if (S3_PART_GET_CHANGE_COUNT(fullValue) != changeCount)
+						break;
+
 					*oldValue = S3_PART_GET_LOWER(fullValue);
 					return false;
 				}
@@ -606,6 +618,14 @@ s3_header_wait_part_settled(S3HeaderTag tag, int index, bool interruptible)
 			(void) ConditionVariableTimedSleep(&meta->partSettledCV, 100,
 											   PG_WAIT_EXTENSION);
 		slept = true;
+
+		/*
+		 * A reader waits with the page's I/O lock held, under which the
+		 * sleep's own interrupt check does nothing: the process it waits for
+		 * may be waiting out the store.
+		 */
+		if (interruptible)
+			s3_reader_wait_check_cancel();
 		value = s3_header_read_value(tag, index);
 	}
 	if (slept)
@@ -697,7 +717,17 @@ s3_header_load_part(S3HeaderTag tag, int index)
 				long		code;
 
 				pg_atomic_fetch_add_u64(&meta->numberOfLoadedParts, 1);
-				code = s3_load_file_part_here(tag.key, tag.segNum, index);
+				/* a cancel ends the wait for the store, see there */
+				s3_request_for_reader = true;
+				PG_TRY();
+				{
+					code = s3_load_file_part_here(tag.key, tag.segNum, index);
+				}
+				PG_FINALLY();
+				{
+					s3_request_for_reader = false;
+				}
+				PG_END_TRY();
 				if (code == S3_RESPONSE_OK)
 					s3_header_mark_part_loaded(tag, index);
 				else

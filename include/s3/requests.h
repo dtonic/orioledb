@@ -49,6 +49,8 @@ extern long s3_get_object_etag(char *objectname, StringInfo str,
 extern void s3_delete_object(char *objectname);
 extern bool s3_object_exists(char *objectname);
 extern void (*s3_request_wait_hook) (void);
+extern bool s3_request_for_reader;
+extern void s3_reader_wait_check_cancel(void);
 extern int	s3_auth_retry_time;
 extern bool s3_keep_connections;
 extern bool s3_postmaster_retries;

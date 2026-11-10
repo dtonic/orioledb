@@ -372,6 +372,41 @@ request_wait_reload(void)
 	}
 }
 
+/*
+ * The request under way is a backend's own download of a part a page read
+ * needs (s3_header_load_part()).
+ */
+bool		s3_request_for_reader = false;
+
+/*
+ * A backend reading a page waits here for the store, or for another process
+ * that downloads the part, with the page's I/O lock held: an LWLock, under
+ * which CHECK_FOR_INTERRUPTS() does nothing.  A request that fails is tried
+ * again without end, so while the store was down the backend took no query
+ * cancel, no statement_timeout and no termination, every reader of the same
+ * downlink queued behind its lock, and a fast shutdown waited the outage out.
+ * A cancel or a termination that is pending ends the wait with an ERROR
+ * instead: load_page() puts the downlink back and error recovery releases
+ * the lock.  Only a client backend's, outside a critical section: any other
+ * process reading a page has no query to cancel, and its ERROR is not one
+ * its caller is ready for.
+ */
+void
+s3_reader_wait_check_cancel(void)
+{
+	if (MyBackendType != B_BACKEND || CritSectionCount > 0 ||
+		InterruptHoldoffCount == 0)
+		return;
+	if (ProcDiePending)
+		ereport(ERROR,
+				(errcode(ERRCODE_ADMIN_SHUTDOWN),
+				 errmsg("canceling the wait for an S3 part due to administrator command")));
+	if (QueryCancelPending)
+		ereport(ERROR,
+				(errcode(ERRCODE_QUERY_CANCELED),
+				 errmsg("canceling the wait for an S3 part due to user request")));
+}
+
 static void
 s3_request_backoff(int attempt, long http_code)
 {
@@ -395,6 +430,8 @@ s3_request_backoff(int attempt, long http_code)
 							 slice, PG_WAIT_EXTENSION);
 			ResetLatch(MyLatch);
 			CHECK_FOR_INTERRUPTS();
+			if (s3_request_for_reader)
+				s3_reader_wait_check_cancel();
 			request_wait_reload();
 			delay -= slice;
 			if (s3_request_wait_hook)

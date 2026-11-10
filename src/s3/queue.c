@@ -178,18 +178,32 @@ lane_put_task(S3TaskQueueLane *lane, Pointer data, uint32 len)
 
 	Assert(totallen == INTALIGN(totallen));
 
-	/* Pick the insert location */
-	insertLocation = pg_atomic_fetch_add_u64(&meta->insertLocation, totallen);
-
 	/*
-	 * Check that circular buffer of tasks didn't wraparound.  Wait the
-	 * overlapping tasks to be erased before we continue.
+	 * Pick the insert location, once the ring has room for the task: the
+	 * tasks it would overlap have to be erased first.  The wait is before the
+	 * location is taken, not after.  A location taken and then waited on was
+	 * left for good by a producer whose wait an interrupt ended (a cancelled
+	 * query putting a read-ahead hint or a build's part into a full ring):
+	 * its length word stayed zero, no worker ever picked past it, and the
+	 * erased location stopped there, with the checkpointer waiting on it and
+	 * every later producer on the ring.  From the location taken to the
+	 * length written nothing can raise an error.
 	 */
-	while (insertLocation + totallen > pg_atomic_read_u64(&meta->erasedLocation) + size)
+	for (;;)
 	{
-		(void) ConditionVariableTimedSleep(&meta->erasedLocationCV,
-										   1000, WAIT_EVENT_MQ_PUT_MESSAGE);
-		slept = true;
+		insertLocation = pg_atomic_read_u64(&meta->insertLocation);
+		if (insertLocation + totallen > pg_atomic_read_u64(&meta->erasedLocation) + size)
+		{
+			(void) ConditionVariableTimedSleep(&meta->erasedLocationCV,
+											   1000, WAIT_EVENT_MQ_PUT_MESSAGE);
+			slept = true;
+			continue;
+		}
+		/* the erased location only moves on: the room is still there */
+		if (pg_atomic_compare_exchange_u64(&meta->insertLocation,
+										   &insertLocation,
+										   insertLocation + totallen))
+			break;
 	}
 	if (slept)
 		ConditionVariableCancelSleep();
