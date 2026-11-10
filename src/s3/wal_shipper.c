@@ -365,6 +365,7 @@ typedef struct
 	XLogSegNo	segno;			/* the archived segment in seg, if any */
 	StringInfoData seg;
 	bool		haveSeg;
+	bool		chunksOnly;		/* no archived segment is looked at */
 	XLogRecPtr	chunksFrom;		/* the chunks read back: [chunksFrom, end) */
 	StringInfoData chunks;
 	uint64		chunksSeq;		/* the next chunk to read back */
@@ -383,7 +384,7 @@ bucket_wal_bytes(BucketWal *bw, XLogRecPtr lsn, char *dst, Size n)
 		XLByteToSeg(lsn, segno, wal_segment_size);
 		off = XLogSegmentOffset(lsn, wal_segment_size);
 		take = Min(n, wal_segment_size - off);
-		if (!bw->haveSeg || bw->segno != segno)
+		if (!bw->chunksOnly && (!bw->haveSeg || bw->segno != segno))
 		{
 			char		name[MAXFNAMELEN];
 			char	   *key;
@@ -518,7 +519,7 @@ typedef enum
  */
 static ReplayCheck
 chunks_pass_replay(TimeLineID tli, uint64 nextSeq, XLogRecPtr end,
-				   XLogRecPtr replayEnd)
+				   XLogRecPtr replayEnd, bool chunksOnly)
 {
 	BucketWal	bw;
 	XLogRecPtr	pos;
@@ -529,6 +530,7 @@ chunks_pass_replay(TimeLineID tli, uint64 nextSeq, XLogRecPtr end,
 
 	memset(&bw, 0, sizeof(bw));
 	bw.tli = tli;
+	bw.chunksOnly = chunksOnly;
 	bw.nextSeq = nextSeq;
 	bw.end = end;
 	bw.chunksFrom = end;
@@ -1574,7 +1576,8 @@ walk:
 	}
 	if (!XLogRecPtrIsInvalid(replayEnd) && replayEnd < checkEnd)
 	{
-		ReplayCheck check = chunks_pass_replay(tli, nextSeq, checkEnd, replayEnd);
+		ReplayCheck check = chunks_pass_replay(tli, nextSeq, checkEnd, replayEnd,
+											   false);
 
 		if (check == REPLAY_PASSED)
 			s3_stop_instance("the S3 bucket has WAL past this data directory",
@@ -1852,6 +1855,7 @@ s3_wal_ship_rest(TimeLineID tli)
 	uint64		nextSeq;
 	XLogRecPtr	start,
 				end = GetFlushRecPtr(NULL);
+	XLogRecPtr	replayEnd;
 	ChunkHeader existing;
 	char	   *buf;
 
@@ -1869,6 +1873,16 @@ s3_wal_ship_rest(TimeLineID tli)
 			segno++;
 		XLogSegNoOffsetToRecPtr(segno, 0, wal_segment_size, start);
 		nextSeq = chunks_end(tli, 0);
+
+		/*
+		 * A timeline this instance switched to goes up with its history, as
+		 * the shipper puts it before the timeline's first chunk.  The hint
+		 * written below tells the next start's shipper the timeline is under
+		 * way, and it puts no history then: with archiving off the bucket
+		 * had the timeline's chunks and nothing that leads to them.
+		 */
+		if (tli > 1 && existsTimeLineHistory(tli))
+			put_history(tli);
 	}
 	while (read_chunk_header(tli, nextSeq, &existing) &&
 		   s3_lease_own_token(existing.token) &&
@@ -1877,6 +1891,46 @@ s3_wal_ship_rest(TimeLineID tli)
 		if (existing.magic == CHUNK_MAGIC)
 			start = existing.endLsn;
 		nextSeq++;
+	}
+
+	/*
+	 * Where recovery found the WAL to end, when no shipper of this run has
+	 * started from it (the instance stops before its shipper got that far,
+	 * or the shipper could not connect).  The chunks before may end inside a
+	 * record the crash cut, past that point, and the WAL this run wrote
+	 * starts there: ship from there, as the shipper does, after the same
+	 * check that no other copy of this data directory wrote on.  Shipped from
+	 * the chunks' end instead, the bucket kept the cut record's bytes where
+	 * this run's records are, the shutdown checkpoint's own among them when
+	 * the run wrote little: root then named a checkpoint record the bucket
+	 * could not give.
+	 */
+	replayEnd = pg_atomic_read_u64(&shipper->replayEndLsn);
+	if (!XLogRecPtrIsInvalid(replayEnd) && replayEnd < start)
+	{
+		/*
+		 * The chunks alone are asked: with archiving on the stop switches
+		 * the segment, and the archiver may have put it up by now, with this
+		 * run's own records where recovery ended.
+		 */
+		ReplayCheck check = chunks_pass_replay(tli, nextSeq, start, replayEnd,
+											   true);
+
+		if (check == REPLAY_PASSED)
+			s3_stop_instance("the S3 bucket has WAL past this data directory",
+							 psprintf("The bucket's WAL of timeline %u holds a whole record "
+									  "at %X/%08X, where recovery of this data directory "
+									  "ended: another copy of it went on writing.  Load "
+									  "the data directory from the bucket again.",
+									  tli, LSN_FORMAT_ARGS(replayEnd)));
+		if (check == REPLAY_UNKNOWN)
+			s3_stop_instance("could not check the S3 bucket's WAL against this data directory",
+							 psprintf("Neither an archived segment nor the WAL chunks of "
+									  "timeline %u have the WAL at %X/%08X, where recovery "
+									  "of this data directory ended.  Load the data "
+									  "directory from the bucket again.",
+									  tli, LSN_FORMAT_ARGS(replayEnd)));
+		start = replayEnd;
 	}
 
 	buf = palloc(CHUNK_MAX_BYTES);

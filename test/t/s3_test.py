@@ -2360,6 +2360,106 @@ class S3Test(S3BaseTest):
 			new_node.stop()
 			new_node.cleanup()
 
+	def test_s3_stop_before_the_shipper_ships_from_where_recovery_ended(self):
+		"""A crash leaves the last chunk ending inside a record: recovery
+		stops at that record's start, and the WAL the next run writes starts
+		there.  The shipper ships again from there; a run that stops before
+		its shipper got that far (here it cannot connect) has to do the same
+		with the WAL its stop leaves.  Shipped from the chunks' end instead,
+		the bucket kept the cut record's bytes where the run's records are,
+		the shutdown checkpoint's among them: root named a checkpoint record
+		the bucket could not give, and a load from it did not start."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		# no archived segment: the chunks are all the bucket has of the WAL
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.s3_lease_duration = 15
+			archive_mode = off
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			CREATE TABLE o_wide (id int PRIMARY KEY, v text) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 100);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		# one long record, the last of the run
+		node.safe_psql("INSERT INTO o_wide SELECT 1, string_agg(md5(g::text), '') "
+		               "FROM generate_series(1, 1000) g;")
+		os.kill(node.pid, signal.SIGKILL)
+		time.sleep(2)
+		node.is_started = False
+
+		# the long record, and the chunk it is in
+		segment_size = 16 * 1024 * 1024
+		ranges = self.chunk_ranges()
+		last_key = max(ranges, key=lambda k: ranges[k][1])
+		end = ranges[last_key][1]
+		segno = (end - 1) // segment_size
+		name = f"00000001{segno >> 8:08X}{segno & 0xFF:08X}"
+		wal_path = os.path.join(node.data_dir, 'pg_wal', name)
+		dump = subprocess.run(['pg_waldump', wal_path], capture_output=True,
+		                      text=True).stdout
+		records = [(int(m.group(2), 16) << 32 | int(m.group(3), 16),
+		            int(m.group(1)))
+		           for m in re.finditer(
+		               r"len \(rec/tot\): *\d+/ *(\d+),.*?lsn: ([0-9A-F]+)/([0-9A-F]+)",
+		               dump)]
+		long_ones = [(lsn, tot) for lsn, tot in records if tot > 4000]
+		self.assertTrue(long_ones, "no long record in the last segment")
+		start, tot = long_ones[-1]
+		cut = start + tot - 64
+		key = next(k for k in ranges if ranges[k][0] <= start < ranges[k][1])
+		self.assertGreater(ranges[key][1], cut)
+		# the crash as it would have been: the chunk ends inside the record,
+		# and the local WAL has nothing of it
+		body = self.s3_object(key)
+		magic, pad, token, chunk_start, _ = struct.unpack('<IIQQQ', body[:32])
+		for k in ranges:
+			if ranges[k][0] > start:
+				self.client.delete_object(Bucket=self.bucket_name, Key=k)
+		self.client.put_object(
+		    Bucket=self.bucket_name, Key=key,
+		    Body=struct.pack('<IIQQQ', magic, pad, token, chunk_start, cut) +
+		    body[32:32 + cut - chunk_start])
+		with open(wal_path, 'r+b') as f:
+			f.seek(start - segno * segment_size)
+			f.write(bytes((segno + 1) * segment_size - start))
+		seq = int(key.rsplit('/', 1)[1])
+		with open(os.path.join(node.data_dir, 'orioledb_data', 's3_wal_seq'),
+		          'w') as f:
+			f.write(f"1 {seq + 1} {cut}\n")
+
+		# the next run's shipper never connects; its stop ships what it wrote
+		node.append_conf("orioledb.s3_wal_conninfo = 'host=127.0.0.1 port=1'")
+		node.start(wait=False)
+		deadline = time.time() + 120
+		ready = False
+		while time.time() < deadline and not ready:
+			with open(node.pg_log_file) as f:
+				# the first run's line, and this one's
+				ready = f.read().count(
+				    "database system is ready to accept connections") == 2
+			time.sleep(0.5)
+		self.assertTrue(ready)
+		node.is_started = True
+		node.stop()
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as new_node:
+			self.loader.download(new_node.data_dir)
+			new_node.append_conf(port=new_node.port)
+			# the checkpoint put the configuration up too
+			new_node.append_conf("orioledb.s3_wal_conninfo = ''")
+			new_node.start()
+			self.assertEqual("100", new_node.safe_psql(
+			    "SELECT count(*) FROM o_test").decode().strip())
+			self.assertEqual("0", new_node.safe_psql(
+			    "SELECT count(*) FROM o_wide").decode().strip())
+			new_node.stop()
+			new_node.cleanup()
+
 	def test_s3_takeover_reads_what_came_after_the_load(self):
 		"""A data directory loaded while the writer still committed is behind
 		the bucket: the writer it starts as puts a terminator after the last
