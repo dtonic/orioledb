@@ -12,7 +12,7 @@ from testgres.enums import NodeStatus
 from testgres.exceptions import StartNodeException
 
 from .s3_base_test import S3BaseTest, HoldWrites, FlakyPutObject, \
- orig_list_objects_v2
+ orig_list_objects_v2, mock_put_object, TransientServerError
 
 orig_head_object = S3Response.head_object
 
@@ -353,6 +353,59 @@ class S3LeaseTest(S3BaseTest):
 		self.assertIn('no usable Date', self.log(node))
 		node.start()
 		self.assertEqual([(1, )], node.execute("SELECT 1"))
+		node.stop()
+
+	def test_s3_start_that_waited_writes_a_whole_lease(self):
+		"""A start waits for the lease its own token still holds (the run
+		before it was killed) to run out, then takes it.  The lease it
+		writes runs a whole duration from then: the store's clock was read
+		before the wait and our own after it, so expires_at came out short
+		by the time waited, a lease all but run out as it was written, and
+		so was its first renewal."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("SELECT 1")
+		# killed: a stop, an immediate one too, gives the lease back
+		os.kill(node.pid, signal.SIGKILL)
+		time.sleep(2)
+		node.is_started = False
+		node.start()
+		log = self.log(node)
+		waited = re.search(r"it has (\d+) seconds left", log)
+		self.assertIsNotNone(waited, "the start did not wait for the lease")
+		self.assertGreater(int(waited.group(1)), 5)
+		left = int(self.kv('writer')['expires_at']) - time.time()
+		self.assertGreater(left, 9)
+		node.stop()
+
+	def test_s3_start_goes_on_past_a_put_that_did_not_land(self):
+		"""A start replaces the "writer" and "root" objects of the run
+		before it.  A put of those that the store answers 503 did not land;
+		read back, the object is still that run's, which was taken for
+		another writer having replaced it: the start ended in FATAL on one
+		503.  The object under the ETag the put was to replace is nobody's
+		loss: the start tries again."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("SELECT 1")
+		node.stop()
+		failed = {'writer': 0, 'root': 0}
+
+		def failing_once(response):
+			key = response.parse_key_name()
+			if key in failed and failed[key] == 0:
+				failed[key] += 1
+				raise TransientServerError()
+			return mock_put_object(response)
+
+		with patch('moto.s3.responses.S3Response.put_object',
+		           new=failing_once):
+			node.start()
+		self.assertEqual({'writer': 1, 'root': 1}, failed)
+		self.assertNotIn("another writer replaced", self.log(node))
+		node.safe_psql("CHECKPOINT")
 		node.stop()
 
 	def test_s3_invalidated_slot_stops_the_instance(self):

@@ -7234,7 +7234,9 @@ class S3Test(S3BaseTest):
 				    f.read())
 
 		# The lease is taken with conditional writes: a refused one on a node
-		# whose data directory matches its bucket
+		# whose data directory matches its bucket.  The object is still the
+		# one the put was to replace, so no other writer took it: the start
+		# tries again, and gives up on the store, not on a writer
 		new_node.append_conf("orioledb.s3_prefix = 'temp_prefix'")
 		with patch("moto.s3.responses.S3Response.put_object",
 		           new=mock_put_object_conflict):
@@ -7244,9 +7246,9 @@ class S3Test(S3BaseTest):
 			self.assertEqual(e.exception.message, "Cannot start node")
 
 			with open(new_node.pg_log_file) as f:
-				self.assertIn(
-				    'FATAL:  another writer replaced "writer" in the S3 bucket while this instance was starting',
-				    f.read())
+				log = f.read()
+			self.assertIn('FATAL:  could not put object to S3', log)
+			self.assertNotIn('another writer replaced', log)
 
 		# Test unknown error handling
 		with patch("moto.s3.responses.S3Response.put_object",
@@ -7367,7 +7369,7 @@ class S3Test(S3BaseTest):
 		second = int(self.s3_body('writer')['token'])
 		self.assertEqual(second, first + 1)
 		self.assertEqual(int(self.s3_body('root')['token']), second)
-		# A crash leaves the lease to run out; the restart waits for it
+		# an immediate stop gives the lease back too: the restart does not wait
 		node.stop(['-m', 'immediate'])
 		node.start()
 		self.assertEqual(int(self.s3_body('writer')['token']), second + 1)
