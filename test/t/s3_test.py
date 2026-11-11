@@ -4428,7 +4428,9 @@ class S3Test(S3BaseTest):
 			with open(reader.pg_log_file) as f:
 				self.assertIn(f"took over the S3 pin of the load, checkpoint {pinned}",
 				              f.read())
-			self.assertFalse(os.path.exists(pin_file))
+			# the pin's name stays for the next start of this directory
+			with open(pin_file) as f:
+				self.assertEqual(handed, f.read().split())
 			deadline = time.time() + 60
 			count = None
 			while time.time() < deadline and count != [(30000, 30000 * v)]:
