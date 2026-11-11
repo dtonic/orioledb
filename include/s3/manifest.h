@@ -109,9 +109,10 @@ typedef struct
 extern void s3_note_dropped_tree(Oid datoid, Oid relnode);
 
 /*
- * The copies builds put of their maps under the committed checkpoint's number
- * (s3_schedule_map_copy_write()), for the GC to remove once that checkpoint
- * is collected.
+ * The maps builds put: each under its own checkpoint number and, where that
+ * is not the committed one, a copy under the committed checkpoint's number
+ * (s3_schedule_map_copy_write()).  The GC removes one once its checkpoint is
+ * collected, unless the manifests name the tree with it.
  */
 #define S3_MAP_COPIES_FILE	ORIOLEDB_DATA_DIR "/s3_map_copies"
 

@@ -1543,7 +1543,7 @@ collect_abandoned_trees(uint32 r, uint32 committed)
 }
 
 /*
- * The copies builds put of their maps (s3_note_map_copy()): each goes once
+ * The maps builds put, and their copies (s3_note_map_copy()): each goes once
  * the checkpoint it is numbered with is collected.  A writer that takes over
  * starts from a checkpoint the GC keeps, and looks for a built tree's map
  * under that number only.  The list is taken aside first, as the dropped
@@ -1652,6 +1652,23 @@ collect_map_copies(uint32 collected)
 		named = hash_search(rm->trees, &tkey, HASH_FIND, NULL);
 		if (named != NULL && named->map == rec.chkp)
 			continue;
+		if (named != NULL && named->map == 0)
+		{
+			/* no map known for the tree yet: this may be the one, later */
+			int			lock = s3_local_lists_lock();
+
+			fd = BasicOpenFile(S3_MAP_COPIES_FILE,
+							   O_WRONLY | O_CREAT | O_APPEND | PG_BINARY);
+			if (fd < 0 || write(fd, &rec, sizeof(rec)) != sizeof(rec) ||
+				pg_fsync(fd) != 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not write file \"%s\": %m",
+								S3_MAP_COPIES_FILE)));
+			close(fd);
+			s3_local_lists_unlock(lock);
+			continue;
+		}
 		key = psprintf("trees/%u/%u/maps/" UINT64_FORMAT "-%u",
 					   rec.datoid, rec.relnode, rec.token, rec.chkp);
 		gc_delete(key);

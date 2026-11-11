@@ -490,6 +490,16 @@ btree_write_file_header(BTreeDescr *desc, CheckpointFileHeader *file_header)
 
 			uint32		committed = s3_lease_root_checkpoint();
 
+			/*
+			 * The map is noted for the GC, before it is put: one of a build
+			 * that ended behind a checkpoint in progress is named by no
+			 * manifest (that checkpoint's has no line for the tree, and the
+			 * next names the map it writes itself), so no reference ever
+			 * moves off it and it stayed until the tree was dropped.  One
+			 * the manifests do name is left to them.
+			 */
+			s3_note_map_copy(desc->oids.datoid, desc->oids.relnode,
+							 checkpoint_number);
 			result = s3_schedule_map_file_write(checkpoint_number, key);
 
 			/*
