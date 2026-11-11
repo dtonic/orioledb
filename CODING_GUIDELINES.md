@@ -48,7 +48,10 @@ General, repo-agnostic rules for how a coding agent should behave on this projec
 - When a change alters what a repo doc states (README, spec, ADR, AGENTS.md), update that doc in the same change. Link to the file that holds a fact (an ADR, a lock file, a config) rather than restating it; copies drift.
 - Keep agent rule files within their budget (§ Agent rule files).
 - Before opening a PR, run the repo's checks and list each command with its result in the PR description (the template's Test Plan where it has one); for a check you skipped, say why.
-- When a decision is needed (method, framework/library, architecture, tooling, etc.), research industry best practices and present 2–3 options with trade-offs so the user can make an informed choice. Do not pick for the user unless asked to recommend.
+- When a decision is needed (method, framework/library, architecture, tooling, etc.), research industry best practices and present 2–3 options with trade-offs so the user can make an informed choice.
+  - Before proposing a plan or a decision that meets a condition of § Plan requirement, or a design, review verdict or root cause the user must decide on, find how others solved the same problem: the official docs, and two or three well-known products or open-source projects, read in their docs or source, not recalled. The `workflow` plugin's `prior-art` skill holds the procedure; a simple fix skips it.
+  - For each option, name who uses it, with a link to what shows it, and what in this repository (its ADRs, constraints, scale, operations) makes it fit or not; precedent alone is not a reason. Where nothing applies, say what was searched. A claim from memory is marked unverified.
+  - Mark each option a root fix or a workaround, and recommend one, the root fix by default; offer a workaround only as a step toward it, with what it leaves and the condition that removes it.
 
 ## Agent rule files
 
