@@ -813,11 +813,17 @@ standby 다.
   핀을 넘어 접고 거두지 않는다). Guard: `test_s3_reader_whose_pin_lapsed_stops`. 그래서 오래 도는 reader 는 커밋된 체크포인트보다
   대략 `s3_gc_max_pin_lag` 의 4분의 3 뒤처지기 전에 다시 받아야 한다. Guard: `test_s3_reader_too_far_behind_stops`.
 - 정지하는 reader 는 그 데이터 디렉터리로 다시 뜰 수 없을 때(load 뒤 restartpoint 를 만들었을 때) 자기 핀을 `readers` 에서
-  뺀다(`s3_reader_pin_release`, postmaster 의 정상 종료). 만료되게 두면 reader 를 갈아 끼울 때마다 그 핀이 TTL(10분) 동안
+  뺀다(`s3_reader_pin_release`, postmaster 가 끝날 때: 종료 코드가 아니라 데이터 디렉터리가 정한다). 만료되게 두면 reader 를 갈아 끼울 때마다 그 핀이 TTL(10분) 동안
   GC 를 reader 의 체크포인트에 붙잡았다(2026-11-11 eksmvp 에서 reader 를 다시 받은 뒤 GC 가 그만큼 멈췄다). 다시 뜰 수 있는
   reader 는 핀을 둔다: 시작할 체크포인트가 남아 있어야 한다. 핀의 이름은 데이터 디렉터리에 적어 두어(`s3_reader_pin`, loader 가
-  넘겨주는 그 파일) 같은 디렉터리의 다음 시작이 같은 줄을 이어 쓴다: 시작마다 새 이름이면 앞의 핀들이 남았다. 크래시로 끝난
-  reader 의 핀은 전처럼 만료된다. Guard: `test_s3_reader_that_stops_for_good_takes_its_pin_out`.
+  넘겨주는 그 파일) 같은 디렉터리의 다음 시작이 같은 줄을 이어 쓴다: 시작마다 새 이름이면 앞의 핀들이 남았다. postmaster 가
+  죽은(kill -9, OOM) reader 의 핀은 전처럼 만료된다. Guard: `test_s3_reader_that_stops_for_good_takes_its_pin_out`.
+- 대기 서버의 `restore_command` 는 SIGTERM 에 신호로 죽지 않고 1 로 끝난다(셸의 `trap`, 스크립트의 `leave_on_sigterm`). fast
+  shutdown 에서 startup 은 바로 끝나고 postmaster 가 그 프로세스 그룹에 SIGTERM 을 보내는데, 고아가 된 `restore_command` 를
+  PID 1 인 postmaster(컨테이너)가 거두면 신호로 죽은 모르는 자식을 백엔드 크래시로 본다. 그래서 reader 의 정지는 매번
+  "abnormal database system shutdown" 이었고, 정상 정지의 restartpoint 도 핀을 빼는 일도 없었다(2026-11-11 eksmvp: 지운 reader
+  의 핀이 남았다). writer 의 복원은 그대로다: 거기서 1 은 "WAL 의 끝"이라 신호에 그렇게 답하면 안 된다.
+  Guard: `test_s3_reader_restore_command_leaves_on_sigterm`.
 - reader 를 writer 로 바꾸는 길은 승격이 아니라 다시 받기다: reader 를 멈추고 같은 디렉터리에 `--keep-parts` 로 받아 writer
   로 띄운다(이어받기). Guard: `test_s3_reader_becomes_the_writer`.
 

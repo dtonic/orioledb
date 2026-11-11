@@ -2001,8 +2001,11 @@ orioledb_on_shmem_exit(int code, Datum arg)
 	/* the postmaster at a clean stop; a crash restart passes code 1 */
 	if (S3_WRITER_MODE && !IsUnderPostmaster && code == 0)
 		s3_lease_release();
-	/* a reader that will not start here again leaves no pin behind */
-	if (orioledb_s3_mode && orioledb_s3_reader && !IsUnderPostmaster && code == 0)
+	/*
+	 * A reader that will not start here again leaves no pin behind, however
+	 * the postmaster ends: the data directory decides, not the exit code.
+	 */
+	if (orioledb_s3_mode && orioledb_s3_reader && !IsUnderPostmaster)
 		s3_reader_pin_release();
 }
 

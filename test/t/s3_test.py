@@ -1955,6 +1955,78 @@ class S3Test(S3BaseTest):
 			reader.cleanup()
 		node.stop()
 
+	def test_s3_reader_restore_command_leaves_on_sigterm(self):
+		"""At a fast shutdown the startup process exits at once and the
+		postmaster signals the group of its restore_command, which is then an
+		orphan.  A postmaster that is PID 1 (a container) reaps it, and took
+		one killed by the signal for a crashed backend: every stop of a
+		reader ended as an abnormal shutdown, without the restartpoint a
+		clean stop makes and with the reader's pin left behind.  A standby's
+		restore_command, shell and script, exits 1 on SIGTERM instead."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.main_buffers = 8MB
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 100);
+		""")
+		node.safe_psql("CHECKPOINT;")
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as reader:
+			self.loader.download(reader.data_dir)
+			reader.append_conf(port=reader.port)
+			reader.append_conf("""
+				orioledb.s3_reader = on
+				hot_standby = on
+				orioledb.main_buffers = 8MB
+			""")
+			open(os.path.join(reader.data_dir, "standby.signal"), "w").close()
+			reader.start()
+			deadline = time.time() + 60
+			got = None
+			while time.time() < deadline and got != 100:
+				try:
+					got = reader.execute("SELECT count(*) FROM o_test")[0][0]
+				except Exception:
+					pass
+				time.sleep(0.5)
+			self.assertEqual(100, got)
+			command = None
+			with open(os.path.join(reader.data_dir,
+			                       'postgresql.auto.conf')) as f:
+				for line in f:
+					m = re.match(r"restore_command = '(.*)'$", line.strip())
+					if m:
+						command = m.group(1).replace("''", "'")
+			self.assertIsNotNone(command)
+			# the segment the reader is at: the restore server holds the
+			# request while it polls for more WAL
+			segment = node.execute(
+				"SELECT pg_walfile_name(pg_current_wal_lsn())")[0][0]
+			command = command.replace('%f', segment).replace('%p', 'restored.tmp')
+			signalled = 0
+			for attempt in range(20):
+				proc = subprocess.Popen(['sh', '-c', command],
+				                        cwd=reader.data_dir,
+				                        start_new_session=True,
+				                        stderr=subprocess.DEVNULL)
+				time.sleep(0.3)
+				if proc.poll() is not None:
+					continue
+				os.killpg(proc.pid, signal.SIGTERM)
+				self.assertEqual(1, proc.wait(timeout=30))
+				signalled += 1
+				if signalled >= 3:
+					break
+			self.assertGreaterEqual(signalled, 1)
+			reader.stop()
+			reader.cleanup()
+		node.stop()
+
 	def test_s3_reader_past_its_load_does_not_start_again(self):
 		"""A reader's own pages go to local parts, which a start drops: the
 		bucket holds the writer's other pages under the same numbers.  Once a

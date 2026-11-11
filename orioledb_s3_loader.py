@@ -24,6 +24,7 @@ def restore_through_server(argv):
 	if len(argv) < i + 3:
 		return None
 	fname, path = argv[i + 1], argv[i + 2]
+	leave_on_sigterm()
 	for started in (False, True):
 		conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 		try:
@@ -49,6 +50,19 @@ def restore_through_server(argv):
 		finally:
 			conn.close()
 	return None
+
+
+def leave_on_sigterm():
+	"""A standby's restore_command ends with status 1 on SIGTERM, not by the
+	signal.  At a fast shutdown the startup process exits at once and the
+	postmaster signals its process group: this command is then an orphan,
+	and where the postmaster is PID 1 (a container) it is the one to reap
+	it.  It takes an untracked child killed by a signal for a crashed
+	backend: every stop of a reader was an "abnormal database system
+	shutdown", without the restartpoint and the exit a clean stop makes.
+	The restore_command this script writes has the shell do the same."""
+	import signal
+	signal.signal(signal.SIGTERM, lambda signum, frame: os._exit(1))
 
 
 def start_restore_server(argv, i):
@@ -577,7 +591,9 @@ class OrioledbS3ObjectLoader:
 			# that cannot run at all (no interpreter, no module) stops
 			# recovery instead of ending the WAL where it is
 			# a standby (a reader) asks again later rather than stop
-			command = (' '.join(shlex.quote(x) for x in cmd) +
+			# on SIGTERM a standby's command exits 1 (see leave_on_sigterm)
+			command = ("trap '[ -f standby.signal ] && exit 1' TERM; " +
+			           ' '.join(shlex.quote(x) for x in cmd) +
 			           ' --restore %f %p; rc=$?; [ $rc -eq 0 ] && exit 0; '
 			           f'[ $rc -eq {RESTORE_NOT_FOUND} ] && exit 1; '
 			           '[ -f standby.signal ] && exit 1; exit 128')
