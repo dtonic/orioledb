@@ -43,6 +43,7 @@ extern bool s3_gc_progress(uint32 *retain, uint32 *folded, uint32 *collected,
 						   StringInfo skipped);
 extern uint32 s3_reader_pins_min(uint32 upper, uint32 floor, uint32 pinFloor);
 extern void s3_reader_pin_renew(void);
+extern void s3_reader_pin_release(void);
 extern bool s3_lease_own_token(uint64 token);
 extern void s3_lease_loaded_done(void);
 extern void s3_stop_instance(const char *message, const char *detail);

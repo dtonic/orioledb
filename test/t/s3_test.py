@@ -1887,6 +1887,74 @@ class S3Test(S3BaseTest):
 			self.assertEqual({'readers'}, changed)
 			reader.cleanup()
 
+	def test_s3_reader_that_stops_for_good_takes_its_pin_out(self):
+		"""A reader's pin holds the GC at the checkpoint the reader was
+		loaded at.  A reader that stops after a restartpoint past its load
+		cannot start on its data directory again, and takes its pin out as
+		it stops: left to run out, the pin held the GC for its ten minutes
+		every time a reader was replaced.  One that can still start keeps
+		its pin."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.main_buffers = 8MB
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY, pad text) USING orioledb;
+			INSERT INTO o_test SELECT g, repeat('x', 500) FROM generate_series(1, 2000) g;
+		""")
+		node.safe_psql("CHECKPOINT;")
+
+		def pins():
+			return [l for l in self.s3_object('readers').decode().splitlines()
+			        if l.strip()]
+
+		def count_on(reader, want):
+			deadline = time.time() + 60
+			got = None
+			while time.time() < deadline and got != want:
+				try:
+					got = reader.execute("SELECT count(*) FROM o_test")[0][0]
+				except Exception:
+					pass
+				time.sleep(0.5)
+			self.assertEqual(want, got)
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as reader:
+			self.loader.download(reader.data_dir)
+			reader.append_conf(port=reader.port)
+			reader.append_conf("""
+				orioledb.s3_reader = on
+				hot_standby = on
+				orioledb.main_buffers = 8MB
+			""")
+			open(os.path.join(reader.data_dir, "standby.signal"), "w").close()
+			reader.start()
+			count_on(reader, 2000)
+			self.assertEqual(1, len(pins()))
+			# at its load still: it can start again, and keeps the pin
+			reader.stop()
+			self.assertEqual(1, len(pins()))
+			# started again, it keeps the one pin under its name
+			reader.start()
+			count_on(reader, 2000)
+			self.assertEqual(1, len(pins()))
+			# a restartpoint past the load
+			node.safe_psql("INSERT INTO o_test SELECT g, 'y' "
+			               "FROM generate_series(2001, 2100) g;")
+			node.safe_psql("CHECKPOINT;")
+			count_on(reader, 2100)
+			reader.safe_psql("CHECKPOINT;")
+			reader.stop()
+			self.assertEqual([], pins())
+			with open(reader.pg_log_file) as f:
+				self.assertIn("took the S3 reader pin of checkpoint", f.read())
+			reader.cleanup()
+		node.stop()
+
 	def test_s3_reader_past_its_load_does_not_start_again(self):
 		"""A reader's own pages go to local parts, which a start drops: the
 		bucket holds the writer's other pages under the same numbers.  Once a
@@ -4360,7 +4428,9 @@ class S3Test(S3BaseTest):
 			with open(reader.pg_log_file) as f:
 				self.assertIn(f"took over the S3 pin of the load, checkpoint {pinned}",
 				              f.read())
-			self.assertFalse(os.path.exists(pin_file))
+			# the pin's name stays for the next start of this directory
+			with open(pin_file) as f:
+				self.assertEqual(handed, f.read().split())
 			deadline = time.time() + 60
 			count = None
 			while time.time() < deadline and count != [(30000, 30000 * v)]:
@@ -4642,20 +4712,52 @@ class S3Test(S3BaseTest):
 		                       "WHERE relname = 'o_test_u'")[0][0]
 		maps = f"trees/{datoid}/{relnode}/maps/"
 		copy = f"{maps}{self.kv('root')['token']}-{committed}"
+		# the build's own map, under the checkpoint that was in progress:
+		# that checkpoint's manifest has no line for the tree, and the next
+		# names the map it writes itself, so no manifest ever names this one
+		own = f"{maps}{self.kv('root')['token']}-{committed + 1}"
 		self.assertIn(copy, self.all_keys(maps))
+		self.assertIn(own, self.all_keys(maps))
 
 		for v in range(2, 5):
 			node.safe_psql(f"UPDATE o_test SET v = {v} WHERE id <= 1000;")
 			node.safe_psql("CHECKPOINT;")
-		self.assertTrue(self.wait_for_collected(committed + 1))
+		self.assertTrue(self.wait_for_collected(committed + 2))
 		deadline = time.time() + 30
-		while copy in self.all_keys(maps) and time.time() < deadline:
+		while {copy, own} & set(self.all_keys(maps)) and time.time() < deadline:
 			time.sleep(1)
 		self.assertNotIn(copy, self.all_keys(maps))
+		self.assertNotIn(own, self.all_keys(maps))
 		# the index's own map is there: the index reads whole from the bucket
 		self.assert_bucket_restores(
 		    node, [(30000, )],
 		    query="SELECT count(*) FROM o_test WHERE (id, v) >= (0, 0)")
+
+	def test_s3_gc_keeps_the_map_of_a_build_the_manifests_name(self):
+		"""A build's map is noted for the GC, which removes it once its
+		checkpoint is collected.  Not while the manifests name the tree with
+		it: an index nothing writes to is read from its build's map for as
+		long as it lives."""
+		node = self.gc_world()
+		committed = int(self.kv('root')['checkpoint'])
+		node.safe_psql("CREATE INDEX o_test_pad ON o_test (pad);")
+		datoid = node.execute("SELECT oid FROM pg_database "
+		                      "WHERE datname = current_database()")[0][0]
+		relnode = node.execute("SELECT relfilenode FROM pg_class "
+		                       "WHERE relname = 'o_test_pad'")[0][0]
+		maps = f"trees/{datoid}/{relnode}/maps/"
+		own = f"{maps}{self.kv('root')['token']}-{committed}"
+		self.assertIn(own, self.all_keys(maps))
+		# pad does not change: the index is not written again
+		for v in range(1, 5):
+			node.safe_psql(f"UPDATE o_test SET v = {v} WHERE id <= 1000;")
+			node.safe_psql("CHECKPOINT;")
+		self.assertTrue(self.wait_for_collected(committed + 2))
+		time.sleep(5)
+		self.assertEqual([own], self.all_keys(maps))
+		self.assert_bucket_restores(
+		    node, [(30000, )],
+		    query="SELECT count(*) FROM o_test WHERE pad >= ''")
 
 	def test_s3_gc_removes_old_checkpoints(self):
 		"""Once a checkpoint is no longer retained, its manifest goes, and so

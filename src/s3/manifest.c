@@ -250,13 +250,15 @@ s3_note_dropped_tree(Oid datoid, Oid relnode)
 }
 
 /*
- * A build puts a copy of its map under the checkpoint the bucket has
- * committed, for a writer that takes over from that checkpoint.  The copy is
- * no line of any manifest, so no reference ever moves off it: it is noted
- * here, and the GC removes it once that checkpoint is collected, when no
- * start can be from it any more.  The note is local: after a takeover the
- * copy is either the new writer's reference (it took the map as the tree's
- * own, and the GC follows that) or stays until the tree is dropped.
+ * A build puts its map under the number of its checkpoint, and a copy under
+ * the checkpoint the bucket has committed when that is another, for a writer
+ * that takes over from there.  The copy is no line of any manifest, and
+ * neither is the map itself when the build ended behind a checkpoint in
+ * progress, so no reference ever moves off them: each is noted here, and the
+ * GC removes it once its checkpoint is collected, when no start can be from
+ * it any more, unless the manifests name the tree with that number (then it
+ * goes as any map does).  The note is local: after a takeover a map is
+ * either the new writer's reference or stays until the tree is dropped.
  */
 void
 s3_note_map_copy(Oid datoid, Oid relnode, uint32 chkp)
