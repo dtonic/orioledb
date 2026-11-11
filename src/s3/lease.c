@@ -2106,6 +2106,23 @@ reader_pin_and_check(uint32 chkp)
 	}
 	reader_checkpoint = chkp;
 	reader_pin(reader_id, chkp);
+
+	/*
+	 * The pin's name stays with the data directory, as the loader hands its
+	 * own over: a start of this directory again takes the same line, so it
+	 * replaces its pin instead of adding one, and the stop that ends the
+	 * directory's use takes out the only one there is.  Under a new name
+	 * every start, the earlier pins were left to run out.
+	 */
+	{
+		FILE	   *f = AllocateFile(READER_PIN_FILENAME, "w");
+
+		if (f != NULL)
+		{
+			fprintf(f, "%s %u\n", reader_id, chkp);
+			FreeFile(f);
+		}
+	}
 	kept = adopted ? gc_removed() : gc_kept();
 	if (chkp < kept)
 		ereport(FATAL,
@@ -2116,6 +2133,82 @@ reader_pin_and_check(uint32 chkp)
 	if (adopted)
 		ereport(LOG,
 				(errmsg("took over the S3 pin of the load, checkpoint %u", chkp)));
+}
+
+/*
+ * A reader that stops takes its pin out of the readers object when it cannot
+ * start again on its data directory: one that made a restartpoint past its
+ * load, as a clean stop after any checkpoint of the writer does
+ * (reader_check_restartable()).  Its next start is a new load with a pin of
+ * its own.  Left to run out, the pin held the GC at the reader's checkpoint
+ * for orioledb.s3_reader_pin_ttl after the reader was gone, every time a
+ * reader was replaced.  A reader that can start again keeps its pin: the
+ * checkpoint it would start from has to stay.  Best effort, a few attempts:
+ * a pin not taken out runs out as before.
+ */
+void
+s3_reader_pin_release(void)
+{
+	CheckpointControl control;
+	uint32		loaded = loaded_checkpoint();
+
+	if (!reader_id[0] || loaded == 0 ||
+		!get_checkpoint_control_data(&control) ||
+		control.lastCheckpointNumber <= loaded)
+		return;
+
+	for (int attempt = 0; attempt < 5; attempt++)
+	{
+		StringInfoData body,
+					next,
+					resp;
+		char		etag[S3_ETAG_LEN];
+		long		code;
+		bool		mine = false;
+		const char *line;
+
+		initStringInfo(&body);
+		initStringInfo(&next);
+		initStringInfo(&resp);
+		code = lease_get(READERS_KEY, &body, etag, NULL);
+		if (code == S3_RESPONSE_OK)
+		{
+			for (line = body.data; line && *line;)
+			{
+				char		other[64];
+				const char *end = strchr(line, '\n');
+
+				if (sscanf(line, "%63s", other) == 1 &&
+					strcmp(other, reader_id) == 0)
+					mine = true;
+				else
+				{
+					appendBinaryStringInfo(&next, line,
+										   end ? end - line : strlen(line));
+					appendStringInfoChar(&next, '\n');
+				}
+				line = end ? end + 1 : NULL;
+			}
+			if (mine)
+				code = s3_request_once("PUT", READERS_KEY, next.data, next.len,
+									   etag, false, LEASE_REQUEST_TIMEOUT,
+									   &resp, NULL, NULL);
+		}
+		pfree(body.data);
+		pfree(next.data);
+		pfree(resp.data);
+		if (code == S3_RESPONSE_NOT_FOUND)
+			return;
+		if (code == S3_RESPONSE_OK)
+		{
+			if (mine)
+				ereport(LOG,
+						(errmsg("took the S3 reader pin of checkpoint %u out: this data directory does not start again",
+								reader_checkpoint)));
+			return;
+		}
+		pg_usleep(200000L * (1 + attempt));
+	}
 }
 
 /*
