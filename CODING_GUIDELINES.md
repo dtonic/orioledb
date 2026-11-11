@@ -42,6 +42,7 @@ General, repo-agnostic rules for how a coding agent should behave on this projec
   - For large repos, also read enough adjacent code to understand call sites and invariants.
 - Run formatting/linting after major changes (and after changing config), on the files you changed rather than a whole directory. Edit structured files (JSON, YAML) in place; loading and re-serializing one rewrites lines you did not touch.
 - Break large or vague tasks into smaller steps; push back and ask to narrow scope when needed.
+- When a fix or a hardening addresses a kind of defect, not just one place, look for the same kind where it can recur (other roles, modules, services, clusters, distributions, repositories, copies of a file) with a search that names its pattern. Report each hit as affected, not affected (why) or unverified, with the search and how many places it covered; a place the search could not reach is unverified, not clean. The same pattern does not always cause the same failure: check that the fix's premise holds at each hit. Fix other hits in this change only when the user agrees; record the rest where § Issues puts them, and list them in the PR (the template's Out of Scope where it has one).
 - UI/UX work (when applicable): follow established design system and UX best practices.
 - Run commands yourself when your tools allow it; give the user the exact command only for a step that needs them, such as an interactive login.
   - Before a command that changes a shared or production environment (a deploy, rollout, migration or data delete), name its target explicitly (context, account, inventory), dry-run first where the tool can, act on the narrowest target, and get the user's go-ahead.
@@ -83,13 +84,13 @@ A change that meets none of the conditions above proceeds directly, however many
 
 ## Commits
 
-- Do not create commits unless the user explicitly asks, or you have confirmed a milestone with the user.
-- If the user wants milestone commits: commit after each confirmed checkpoint.
+- Commit on your own branch, push that branch and open a pull request for it without asking: these are authorized in advance.
+- Push to `main` or `master`, or merge a pull request, only when the user asks for it in this conversation.
+- Apart from that pull request and its title and body, ask before posting anything others see outside git: filing, commenting on, labeling or closing an issue; a comment or review reply on a pull request; a review request, a bot's included. Show the text and post only what the user approves.
 - One commit per logical change.
 - Conventional Commits: `type(scope): subject`, with `type` and `scope` in lowercase English, using the types the repository's commitlint config allows where it has one. Write the subject and body in Korean or English; an English subject is imperative, lowercase, with no final period.
 - The subject names the code change, not the review. "address review feedback" or "fix Codex P2" tells a reader of `git log` nothing: say what was wrong. A review round, a finding number or a bot's name lives only on its PR.
 - Subject only by default. Add a body only when the diff cannot show why: what was wrong before and why this fix. Not a list of the files touched. A squash merge's body says what the PR changed and why.
-- Show the message to the user and commit only once they approve it.
 - Do not skip hooks with `--no-verify`. A failed pre-commit or commit-msg hook means the commit did not happen: fix the cause and commit again, without `--amend`, which would rewrite the previous commit. A failed pre-push hook leaves the commit in place and stops only the push: fix the cause, in a new commit when it is in the code, and push again.
 
 ## Issues
