@@ -1,0 +1,16 @@
+# Once per clone: uv tool install pre-commit && pre-commit install
+repos:
+  # Codex reads the AGENTS.md files from the root down to its working
+  # directory, up to 32 KiB together, and cuts the rest unannounced
+  # (CODING_GUIDELINES.md § Agent rule files). Commit-time only, no CI.
+  # types: [] lets a symlinked AGENTS.md reach the check, which refuses it.
+  - repo: local
+    hooks:
+      - id: agents-md-budget
+        name: AGENTS.md chains fit Codex's 32 KiB
+        language: python
+        entry: python scripts/check_agents_md.py
+        files: (^|/)AGENTS(\.override)?\.md$
+        types: []
+        pass_filenames: false
+        stages: [pre-commit]
