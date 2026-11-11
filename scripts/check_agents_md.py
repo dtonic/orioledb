@@ -44,9 +44,12 @@ def _staged_sizes() -> dict[str, int]:
             blobs[name] = meta.split()[1]
     if not blobs:
         return {}
-    request = "".join(f"{sha} {name}\n" for name, sha in blobs.items())
+    # Send each path's position, not the path itself:
+    # cat-file drops leading whitespace from %(rest).
+    names = list(blobs)
+    request = "".join(f"{blobs[name]} {i}\n" for i, name in enumerate(names))
     answer = _git("cat-file", "--batch-check=%(objectsize) %(rest)", stdin=request)
-    return {name: int(size) for size, name in (line.split(" ", 1) for line in answer.splitlines())}
+    return {names[int(i)]: int(size) for size, i in (line.split() for line in answer.splitlines())}
 
 
 def chains() -> list[tuple[int, list[tuple[str, int]]]]:
