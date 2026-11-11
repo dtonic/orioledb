@@ -3,12 +3,13 @@ repos:
   # Codex reads the AGENTS.md files from the root down to its working
   # directory, up to 32 KiB together, and cuts the rest unannounced
   # (CODING_GUIDELINES.md § Agent rule files). Commit-time only, no CI.
+  # always_run: a symlinked AGENTS.md grows when only its target changes.
   - repo: local
     hooks:
       - id: agents-md-budget
         name: AGENTS.md chains fit Codex's 32 KiB
         language: python
         entry: python scripts/check_agents_md.py
-        files: (^|/)AGENTS(\.override)?\.md$
+        always_run: true
         pass_filenames: false
         stages: [pre-commit]
