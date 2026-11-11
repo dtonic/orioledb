@@ -1,4 +1,4 @@
-# Install once per clone: pre-commit install
+# Once per clone: uv tool install pre-commit && pre-commit install
 repos:
   # Codex reads the AGENTS.md files from the root down to its working
   # directory, up to 32 KiB together, and cuts the rest unannounced
