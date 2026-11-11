@@ -9,6 +9,6 @@ repos:
         name: AGENTS.md chains fit Codex's 32 KiB
         language: python
         entry: python scripts/check_agents_md.py
-        files: (^|/)AGENTS\.md$
+        files: (^|/)AGENTS(\.override)?\.md$
         pass_filenames: false
         stages: [pre-commit]
