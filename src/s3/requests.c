@@ -407,6 +407,24 @@ s3_reader_wait_check_cancel(void)
 				 errmsg("canceling the wait for an S3 part due to user request")));
 }
 
+/*
+ * The same inside one attempt.  The check above runs between attempts, and
+ * an attempt against a store that takes the connection and then says nothing
+ * (or one the network swallows the packets of) lasts until the transfer is
+ * given up as stalled, S3_LOW_SPEED_TIME: a statement_timeout of five seconds
+ * was not taken for as long as that, and a writer cut off its store lost its
+ * lease before the query ended.  curl asks here about once a second during a
+ * transfer, and a pending cancel or termination ends it; the request loop
+ * then raises the error.  Nothing is raised from inside curl.
+ */
+static int
+request_progress(void *clientp, curl_off_t dltotal, curl_off_t dlnow,
+				 curl_off_t ultotal, curl_off_t ulnow)
+{
+	return s3_request_for_reader && MyBackendType == B_BACKEND &&
+		CritSectionCount == 0 && (QueryCancelPending || ProcDiePending);
+}
+
 static void
 s3_request_backoff(int attempt, long http_code)
 {
@@ -713,6 +731,11 @@ s3_request_ext(const char *method, char *objectname,
 		curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
 		curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, S3_LOW_SPEED_TIME);
 		curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+		if (s3_request_for_reader)
+		{
+			curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, request_progress);
+			curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+		}
 		if (timeout > 0)
 			curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
 		if (requestDeadline != 0)
@@ -734,6 +757,18 @@ s3_request_ext(const char *method, char *objectname,
 		pfree(datestring);
 		pfree(datetimestring);
 		pfree(signature);
+
+		/*
+		 * A reader's attempt its cancel ended (request_progress()): the
+		 * interrupt is taken here, with the handle and the request's memory
+		 * given back.  Under the page's I/O lock the plain check does
+		 * nothing, and the reader's own raises the error.
+		 */
+		if (sc == CURLE_ABORTED_BY_CALLBACK)
+		{
+			CHECK_FOR_INTERRUPTS();
+			s3_reader_wait_check_cancel();
+		}
 
 		if (resp.overflow)
 			ereport(ERROR,

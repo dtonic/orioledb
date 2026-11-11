@@ -166,6 +166,50 @@ class S3DatapathTest(S3BaseTest):
 		                 "(2000, 10000, 20000, 30000, 38000)"))
 		node.stop()
 
+	def test_s3_a_query_waiting_on_a_silent_store_can_be_cancelled(self):
+		"""
+		The cancel was taken between the attempts of a request only.  A
+		store that takes the request and says nothing (a network that
+		swallows the packets) holds one attempt until the transfer is given
+		up as stalled, a minute: a statement_timeout was not taken for as
+		long, and on a writer cut off its bucket the lease ran out first.
+		A pending cancel ends the attempt itself.
+		"""
+		node = self.node
+		self.conf('8MB')
+		node.start()
+		self.evicted_table()
+		release = threading.Event()
+
+		def silent(response):
+			if '/parts/' in response.parse_key_name():
+				release.wait(50)
+			return orig_get_object(response)
+
+		result = {}
+
+		def lookup():
+			result['message'], result['took'] = self.lookup_error('3s')
+
+		query = Thread(target=lookup)
+		try:
+			with patch('moto.s3.responses.S3Response.get_object', new=silent):
+				query.start()
+				query.join(25)
+				cancelled = not query.is_alive()
+				release.set()
+				query.join(120)
+		finally:
+			release.set()
+		self.assertTrue(cancelled, "the query waited for the silent store")
+		self.assertIn("canceling the wait for an S3 part", result['message'])
+		self.assertLess(result['took'], 15)
+		self.assertEqual(
+		    [(5, )],
+		    node.execute("SELECT count(*) FROM o_test WHERE id IN "
+		                 "(2000, 10000, 20000, 30000, 38000)"))
+		node.stop()
+
 	def test_s3_a_part_missing_from_the_bucket_is_an_error(self):
 		"""
 		A part the bucket does not hold hung the query: the backend's own
