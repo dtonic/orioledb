@@ -5,7 +5,8 @@ directory together, up to ``project_doc_max_bytes`` (32,768 bytes by default), a
 cuts the rest without telling the model. A chain is the root file plus every nested
 one on the way to a nested file, so the deepest chains are the ones that overflow.
 In each directory Codex reads ``AGENTS.override.md`` instead of ``AGENTS.md`` when
-both exist, and the file a symlink points to.
+both exist. A symlinked one is refused: Codex reads its target, which a commit can
+grow without touching the link, so the hook would not run.
 Sizes are those of the staged blobs, so what is checked is what gets committed, a
 file a sparse checkout leaves out included, and a copy under a virtualenv or
 ``node_modules`` does not count.
@@ -17,7 +18,6 @@ Usage::
 
 from __future__ import annotations
 
-import posixpath
 import subprocess
 from pathlib import Path, PurePosixPath
 
@@ -48,21 +48,14 @@ def _git(*args: str, stdin: str | None = None) -> str:
 
 
 def _staged_sizes() -> dict[str, int]:
-    index = {}
+    blobs = {}
     for entry in filter(None, _git("ls-files", "-s", "-z").split("\0")):
         meta, name = entry.split("\t", 1)
-        mode, sha = meta.split()[:2]
-        index[name] = (mode, sha)
-    blobs = {}
-    for name, (mode, sha) in index.items():
         if PurePosixPath(name).name not in NAMES:
             continue
+        mode, sha = meta.split()[:2]
         if mode == SYMLINK:
-            link = _git("cat-file", "blob", sha)
-            target = posixpath.normpath(posixpath.join(posixpath.dirname(name), link))
-            mode, sha = index.get(target, (SYMLINK, ""))
-            if mode == SYMLINK:
-                raise SystemExit(f"error: {name} links to {link}, not a tracked file")
+            raise SystemExit(f"error: {name} is a symlink; commit the file itself")
         blobs[name] = sha
     if not blobs:
         return {}
