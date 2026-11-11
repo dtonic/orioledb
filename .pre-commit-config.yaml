@@ -1,0 +1,14 @@
+# Install once per clone: pre-commit install
+repos:
+  # Codex reads the AGENTS.md files from the root down to its working
+  # directory, up to 32 KiB together, and cuts the rest unannounced
+  # (CODING_GUIDELINES.md § Agent rule files). Commit-time only, no CI.
+  - repo: local
+    hooks:
+      - id: agents-md-budget
+        name: AGENTS.md chains fit Codex's 32 KiB
+        language: python
+        entry: python scripts/check_agents_md.py
+        files: (^|/)AGENTS\.md$
+        pass_filenames: false
+        stages: [pre-commit]
