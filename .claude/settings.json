@@ -1,0 +1,11 @@
+{
+  "extraKnownMarketplaces": {
+    "dtonic-skills": {
+      "source": { "source": "github", "repo": "dtonic/skills" }
+    }
+  },
+  "enabledPlugins": {
+    "workflow@dtonic-skills": true,
+    "git@dtonic-skills": true
+  }
+}
