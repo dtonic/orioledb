@@ -9,17 +9,23 @@
 name: dtonic-check
 
 on:
+  # `paths` with `!` rather than `paths-ignore`, so the other workflows can be
+  # left out while this file still runs the check: a later positive pattern
+  # includes a path again. Nothing under ci/ reads a Markdown file.
   push:
     branches: ["main"]
-    paths-ignore:
-      - "test/antithesis/**"
-      - "test/integration/**"
-      - "doc/**"
+    paths: &check-paths
+      - "**"
+      - "!test/antithesis/**"
+      - "!test/integration/**"
+      - "!doc/**"
+      - "!**/*.md"
+      - "!.claude/**"
+      - "!.pre-commit-config.yaml"
+      - "!.github/workflows/**"
+      - ".github/workflows/dtonic-check.yml"
   pull_request:
-    paths-ignore:
-      - "test/antithesis/**"
-      - "test/integration/**"
-      - "doc/**"
+    paths: *check-paths
   workflow_dispatch:
 
 concurrency:
