@@ -1,4 +1,5 @@
 import collections
+import fcntl
 import logging
 import os
 import time
@@ -2024,6 +2025,23 @@ class S3Test(S3BaseTest):
 					break
 			self.assertGreaterEqual(signalled, 1)
 			reader.stop()
+			# the restore server goes on with the request it held for a
+			# command killed above, and writes its answer into the data
+			# directory after the stop, which cleanup() was removing; it
+			# holds restore.lock while it runs
+			with open(
+			    os.path.join(reader.data_dir, 'pg_wal', 'orioledb_s3_chunks',
+			                 'restore.lock'), 'a') as lock:
+				deadline = time.time() + 30
+				while True:
+					try:
+						fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+						break
+					except BlockingIOError:
+						self.assertLess(
+						    time.time(), deadline,
+						    "the restore server outlived the reader")
+						time.sleep(0.2)
 			reader.cleanup()
 		node.stop()
 
@@ -6028,9 +6046,13 @@ class S3Test(S3BaseTest):
 			                       'postgresql.auto.conf')) as f:
 				line = [l for l in f if l.startswith('restore_command')][-1]
 			command = line.split('=', 1)[1].strip()[1:-1].replace("''", "'")
-			# the loader's own answer, without the wrapper's mapping
-			command = command.split(';')[0].replace('%f', segment).replace(
-			    '%p', os.path.join(new_node.base_dir, 'seg'))
+			# the loader's own answer, without the wrapper's mapping: the
+			# command between the SIGTERM trap before it and the mapping
+			# after it (taking the first one ran the trap alone, which
+			# answers 0 and asks the store nothing)
+			command = next(c for c in command.split(';')
+			               if '--restore' in c).replace('%f', segment).replace(
+			                   '%p', os.path.join(new_node.base_dir, 'seg'))
 			shutil.rmtree(os.path.join(new_node.data_dir, 'pg_wal',
 			                           'orioledb_s3_chunks'), ignore_errors=True)
 			failing = FailingGet('/chunks/')

@@ -487,8 +487,16 @@ class S3DatapathTest(S3BaseTest):
 				checkpoint.join(45)
 				self.assertFalse(checkpoint.is_alive(),
 				                 "the checkpoint waited for the workers")
-				self.assertLess(refused[0], 40,
-				                f"refused hints were retried {refused[0]} times")
+				# a refused hint is not asked again.  How many hints the
+				# scans make depends on the runner (18 to 60 refusals, all
+				# within 4 s of the first); a 403 retried for
+				# s3_auth_retry_time comes back within its backoff (0.1 s,
+				# doubling), so the refusals would go on past the checkpoint
+				refused_then = refused[0]
+				time.sleep(6)
+				self.assertEqual(
+				    refused_then, refused[0], "a refused hint was asked again "
+				    f"({refused[0] - refused_then} after the checkpoint)")
 		finally:
 			if checkpoint is not None and checkpoint.is_alive():
 				node.stop(['-m', 'immediate'])
