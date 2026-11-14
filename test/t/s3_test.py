@@ -1,4 +1,5 @@
 import collections
+import fcntl
 import logging
 import os
 import time
@@ -2024,6 +2025,23 @@ class S3Test(S3BaseTest):
 					break
 			self.assertGreaterEqual(signalled, 1)
 			reader.stop()
+			# the restore server goes on with the request it held for a
+			# command killed above, and writes its answer into the data
+			# directory after the stop, which cleanup() was removing; it
+			# holds restore.lock while it runs
+			with open(
+			    os.path.join(reader.data_dir, 'pg_wal', 'orioledb_s3_chunks',
+			                 'restore.lock'), 'a') as lock:
+				deadline = time.time() + 30
+				while True:
+					try:
+						fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+						break
+					except BlockingIOError:
+						self.assertLess(
+						    time.time(), deadline,
+						    "the restore server outlived the reader")
+						time.sleep(0.2)
 			reader.cleanup()
 		node.stop()
 
