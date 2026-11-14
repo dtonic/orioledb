@@ -272,10 +272,20 @@ class BaseTest(unittest.TestCase):
 		names.sort()
 		return names.index(os.path.basename(testFullName))
 
+	# The ports a test file owns, from getBasePort(): each initNode() takes
+	# its base_port or the next one, and the S3 tests run nodes up to
+	# getBasePort() + 4 (S3Test.assert_bucket_restores, which other files
+	# borrow).  The files run side by side under make -j, so a node past
+	# the block takes a port of the file after it: a start that waited for
+	# the S3 lease and then found its port gone was started again on the
+	# next one and took the lease a second time.
+	PORTS_PER_FILE = 6
+
 	def getBasePort(self):
 		if self.basePort is None:
-			self.basePort = int(os.getenv('TESTGRES_BASE_PORT',
-			                              '20000')) + self.getTestNum() * 2
+			self.basePort = int(
+			    os.getenv('TESTGRES_BASE_PORT',
+			              '20000')) + self.getTestNum() * self.PORTS_PER_FILE
 		return self.basePort
 
 	def getReplica(self,
@@ -346,6 +356,12 @@ class BaseTest(unittest.TestCase):
 			                       self.myName + '_' + suffix)
 			if os.path.exists(baseDir):
 				shutil.rmtree(baseDir)
+		block = self.getBasePort()
+		if not block <= base_port <= block + self.PORTS_PER_FILE - 2:
+			raise AssertionError(
+			    f"port {base_port} (and {base_port + 1}) is outside this "
+			    f"file's {block}..{block + self.PORTS_PER_FILE - 1}: raise "
+			    "BaseTest.PORTS_PER_FILE")
 		port_manager = TestPortManager(
 		    PostgresNode._get_os_ops(ConnectionParams()), base_port)
 		node = testgres.get_new_node('test',
