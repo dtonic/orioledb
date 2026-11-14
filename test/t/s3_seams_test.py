@@ -3,6 +3,7 @@
 
 import glob
 import os
+import resource
 import time
 
 from .s3_base_test import S3BaseTest
@@ -85,7 +86,14 @@ class S3SeamsTest(S3BaseTest):
 		node.stop()
 		with open(floor, 'w') as f:
 			f.write(f"{1 << 41}\n")
-		node.start()
+		# the PANIC below is what this test waits for: the server started
+		# for it dumps no core, which ci/check_output.sh takes for a crash
+		soft, hard = resource.getrlimit(resource.RLIMIT_CORE)
+		resource.setrlimit(resource.RLIMIT_CORE, (0, hard))
+		try:
+			node.start()
+		finally:
+			resource.setrlimit(resource.RLIMIT_CORE, (soft, hard))
 		# the write that meets the guard is the page's, at the checkpoint or
 		# an eviction before it: the server stops there, so the statements
 		# may or may not come back
