@@ -19,6 +19,40 @@ def connect(node):
 	                        user=os.environ.get('USER') or None)
 
 
+def describe_difference(base_rows, rows_got):
+	"""
+	How a read differs from the snapshot's first one.  Rows are (id, ...) in
+	ascending id order.  Values alone do not tell a scan that gave a row
+	twice or out of order from one that read another version of it, so the
+	ids are compared as a sequence too.
+	"""
+	base = dict((k, v) for k, *v in base_rows)
+	got = dict((k, v) for k, *v in rows_got)
+	ids = [row[0] for row in rows_got]
+	parts = [f"{len(base_rows)} rows -> {len(rows_got)}"]
+	repeated = sorted(set(k for k in ids if ids.count(k) > 1))
+	if repeated:
+		parts.append(f"ids given twice: {repeated}")
+	missing = sorted(set(base) - set(got))
+	if missing:
+		parts.append(f"ids left out: {missing}")
+	added = sorted(set(got) - set(base))
+	if added:
+		parts.append(f"ids added: {added}")
+	unordered = [(i, a, b) for i, (a, b) in enumerate(zip(ids, ids[1:]))
+	             if a >= b]
+	if unordered:
+		parts.append("not ascending at (position, id, next id): "
+		             f"{unordered}")
+	changed = [
+	    f"id {k}: {base[k]} -> {got[k]}" for k in sorted(set(base) & set(got))
+	    if base[k] != got[k]
+	]
+	if changed:
+		parts.append("values changed: " + "; ".join(changed))
+	return "; ".join(parts)
+
+
 class SnapshotRaceTest(BaseTest):
 	"""
 	A REPEATABLE READ snapshot reads the same rows, TOASTed values and all,
@@ -140,16 +174,12 @@ class SnapshotRaceTest(BaseTest):
 				except Exception as e:
 					errors.append(f"reader {r}: {e!r}")
 					return
-				base = dict((k, v) for k, *v in got[0][1])
 				for i, (name, rows_got) in enumerate(got[1:], 1):
 					if rows_got == got[0][1]:
 						continue
-					b = dict((k, v) for k, *v in rows_got)
-					errors.append(f"reader {r}, read {i} ({name}): " +
-					              "; ".join(
-					                  f"id {k}: {base.get(k)} -> {b.get(k)}"
-					                  for k in sorted(set(base) | set(b))
-					                  if base.get(k) != b.get(k)))
+					errors.append(
+					    f"reader {r}, read {i} ({name}): " +
+					    describe_difference(got[0][1], rows_got))
 					return
 
 		def checkpointer():
