@@ -1736,6 +1736,18 @@ reconstruct_merge_diff_half(BTreeDescr *desc, UndoLocation undoLocation,
 	else
 		O_TUPLE_SET_NULL(rightHikey.tuple);
 
+	/*
+	 * A `dest` that ends at or before the boundary lies in the left half,
+	 * whatever half was asked for.  find_left_page() reads a left sibling
+	 * with BTreeKeyRightmost and no key: the right half of it was then an
+	 * empty page with the boundary, past its own hikey, for a low key, and
+	 * the backward scan stepped right, to rows it had returned.
+	 */
+	if (wantRight && !O_PAGE_IS(dest, RIGHTMOST) &&
+		o_btree_cmp(desc, &rightHikey.tuple, BTreeKeyNonLeafKey,
+					&boundary.tuple, BTreeKeyNonLeafKey) <= 0)
+		wantRight = false;
+
 	/* Collect the items of the requested half (M is sorted by key). */
 	BTREE_PAGE_FOREACH_ITEMS(dest, &loc)
 	{
