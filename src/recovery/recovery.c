@@ -26,9 +26,11 @@
 #include "catalog/o_sys_cache.h"
 #include "catalog/o_tables.h"
 #include "checkpoint/checkpoint.h"
+#include "checkpoint/control.h"
 #include "recovery/recovery.h"
 #include "recovery/internal.h"
 #include "recovery/wal.h"
+#include "recovery/wal_partial.h"
 #include "recovery/wal_reader.h"
 #include "replication/walreceiver.h"
 #include "storage/itemptr.h"
@@ -104,6 +106,7 @@ static void recovery_send_leader_oids(ORelOids oids, OIndexNumber ix_num,
 									  bool isrebuild);
 static void workers_send_finish(bool send_to_idx_pool);
 static XLogRecPtr recovery_get_current_ptr(void);
+static XLogRecPtr recovery_get_retain_ptr(void);
 
 /*
  * Recovery worker state in pool.
@@ -516,6 +519,64 @@ record_pending_sk_fixup(OXid oxid, UndoLocation firstLocation,
 }
 
 /*
+ * Rebuild the version of the row an update undo record holds, by following
+ * the undo chain of the row from the page down to the record at target.
+ * The record may hold a difference from the version above it, and the page
+ * may have moved on since.  Returns false if the chain doesn't lead there.
+ */
+static bool
+rebuild_version_from_undo(BTreeDescr *desc, Page page,
+						  BTreePageItemLocator *loc, UndoLocation target,
+						  OTuple *result)
+{
+	BTreeLeafTuphdr *pageTuphdr,
+				tuphdr;
+	OTuple		tuple;
+	bool		allocated = false;
+
+	BTREE_PAGE_READ_LEAF_ITEM(pageTuphdr, tuple, page, loc);
+	tuphdr = *pageTuphdr;
+	(void) find_non_lock_only_undo_record(desc->undoType, &tuphdr);
+
+	while (UndoLocationIsValid(tuphdr.undoLocation) &&
+		   tuphdr.undoLocation >= target &&
+		   UNDO_REC_EXISTS(desc->undoType, tuphdr.undoLocation))
+	{
+		bool		isTarget = tuphdr.undoLocation == target;
+
+		if (tuphdr.deleted != BTreeLeafTupleNonDeleted ||
+			XACT_INFO_IS_LOCK_ONLY(tuphdr.xactInfo))
+		{
+			if (isTarget)
+				break;
+			get_prev_leaf_header_from_undo(desc->undoType, &tuphdr, false);
+		}
+		else
+		{
+			OTuple		newer = tuple;
+
+			get_prev_leaf_header_and_tuple_from_undo(desc->undoType, &tuphdr,
+													 &tuple,
+													 o_btree_len(desc, newer,
+																 OTupleLength),
+													 0);
+			if (allocated)
+				pfree(newer.data);
+			allocated = true;
+			if (isTarget)
+			{
+				*result = tuple;
+				return true;
+			}
+		}
+	}
+
+	if (allocated)
+		pfree(tuple.data);
+	return false;
+}
+
+/*
  * Apply the fix-up owed by one PK undo record at itemLoc: read the record
  * back, locate the current PK tuple, and for every secondary index whose
  * key differs between the pre-image and the post-image, dispatch a
@@ -549,6 +610,7 @@ apply_one_pending_sk_fixup(OXid entryOxid, UndoLocation itemLoc,
 	LocationIndex newTupleLen;
 	TupleTableSlot *newSlot;
 	TupleTableSlot *oldSlot;
+	bool		isDiff;
 	int			i;
 
 	*prevLoc = InvalidUndoLocation;
@@ -568,8 +630,10 @@ apply_one_pending_sk_fixup(OXid entryOxid, UndoLocation itemLoc,
 	 */
 	undo_read(UndoLogRegular, itemLoc, sizeof(header), (Pointer) &header);
 	*prevLoc = header.prev;
-	if (header.type != ModifyUndoItemType)
+	if (header.type != ModifyUndoItemType &&
+		header.type != UpdateDiffUndoItemType)
 		return true;
+	isDiff = header.type == UpdateDiffUndoItemType;
 
 	undo_read(UndoLogRegular, itemLoc, sizeof(item), (Pointer) &item);
 
@@ -600,16 +664,37 @@ apply_one_pending_sk_fixup(OXid entryOxid, UndoLocation itemLoc,
 		return true;
 	primary = GET_PRIMARY(descr);
 
-	/* The undo entry stores the pre-image tuple right after the header. */
-	oldTupleSize = validate_undo_item_size(item.header.itemSize);
-	if (oldTupleSize == 0)
-		return true;
-	oldTuple.formatFlags = item.tuphdr.formatFlags;
-	oldTuple.data = palloc(oldTupleSize);
-	undo_read(UndoLogRegular,
-			  itemLoc + sizeof(BTreeModifyUndoStackItem),
-			  oldTupleSize,
-			  oldTuple.data);
+	if (isDiff)
+	{
+		BTreeUpdateDiffUndoStackItem diffItem;
+
+		/*
+		 * The pre-image is a difference from the version that replaced it,
+		 * and is rebuilt below.  Find the row by the key the record keeps.
+		 */
+		undo_read(UndoLogRegular, itemLoc, sizeof(diffItem),
+				  (Pointer) &diffItem);
+		if (diffItem.keyLen == 0 ||
+			diffItem.keyLen > item.header.itemSize - sizeof(diffItem))
+			return true;
+		oldTuple.formatFlags = diffItem.keyFormatFlags;
+		oldTuple.data = palloc(diffItem.keyLen);
+		undo_read(UndoLogRegular, itemLoc + sizeof(diffItem),
+				  diffItem.keyLen, oldTuple.data);
+	}
+	else
+	{
+		/* The undo entry stores the pre-image tuple right after the header. */
+		oldTupleSize = validate_undo_item_size(item.header.itemSize);
+		if (oldTupleSize == 0)
+			return true;
+		oldTuple.formatFlags = item.tuphdr.formatFlags;
+		oldTuple.data = palloc(oldTupleSize);
+		undo_read(UndoLogRegular,
+				  itemLoc + sizeof(BTreeModifyUndoStackItem),
+				  oldTupleSize,
+				  oldTuple.data);
+	}
 
 	o_btree_load_shmem(&primary->desc);
 	O_TUPLE_SET_NULL(newTuple);
@@ -628,7 +713,7 @@ apply_one_pending_sk_fixup(OXid entryOxid, UndoLocation itemLoc,
 	 * For DELETE the on-page row is the row to be removed; we copy it back
 	 * into oldTuple so the SK loop can derive the SK key from full attrs.
 	 */
-	if (item.action == BTreeOperationDelete)
+	if (item.action == BTreeOperationDelete || isDiff)
 	{
 		OTuple		keyTuple;
 
@@ -701,6 +786,23 @@ apply_one_pending_sk_fixup(OXid entryOxid, UndoLocation itemLoc,
 		newTuple.formatFlags = pkOnPage.formatFlags;
 		newTuple.data = palloc(newTupleLen);
 		memcpy(newTuple.data, pkOnPage.data, newTupleLen);
+	}
+
+	if (isDiff)
+	{
+		OTuple		preImage;
+
+		if (!rebuild_version_from_undo(&primary->desc, pkPage, &pageLoc,
+									   itemLoc + offsetof(BTreeModifyUndoStackItem, tuphdr),
+									   &preImage))
+		{
+			unlock_page(context.items[context.index].blkno);
+			pfree(oldTuple.data);
+			pfree(newTuple.data);
+			return true;
+		}
+		pfree(oldTuple.data);
+		oldTuple = preImage;
 	}
 
 	unlock_page(context.items[context.index].blkno);
@@ -1061,6 +1163,8 @@ static inline bool apply_sys_tree_modify_record(int sys_tree_num, uint16 type,
 static inline void spread_idx_modify(BTreeDescr *desc,
 									 RecoveryMsgType recType,
 									 OTuple rec);
+static void spread_partial_update(BTreeDescr *desc, OTuple payload,
+								  int length);
 
 static inline RecoveryMsgType recovery_msg_from_wal_record(WalRecordType rec_type);
 static void recovery_send_init(int worker_num);
@@ -1487,6 +1591,20 @@ o_recovery_start_hook(void)
 		elog(LOG, "orioledb recovery started.");
 	}
 
+	{
+		CheckpointControl control;
+
+		if (get_checkpoint_control_data(&control) &&
+			UNPACK_CHECKPOINT_VERSION(control.binaryVersion) > ORIOLEDB_CHECKPOINT_VERSION)
+			ereport(FATAL,
+					(errmsg("database files are incompatible with server"),
+					 errdetail("OrioleDB cluster has checkpoint version %d,"
+							   " but the extension supports checkpoint version %d.",
+							   UNPACK_CHECKPOINT_VERSION(control.binaryVersion),
+							   ORIOLEDB_CHECKPOINT_VERSION),
+					 errhint("Upgrade the OrioleDB extension.")));
+	}
+
 	startup_chkp_num = checkpoint_state->lastCheckpointNumber;
 	recovery_cleanup_old_files(startup_chkp_num, true);
 
@@ -1691,6 +1809,66 @@ orioledb_redo(XLogReaderState *record)
 	}
 }
 
+/*
+ * Synchronize recovery workers without finalizing transactions.
+ *
+ * Called at a recovery-target pause so the replica can serve queries.
+ * Workers drain their queues and stay alive, so if recovery resumes
+ * via pg_wal_replay_resume() they continue processing new WAL.
+ * In-flight transactions are left INPROGRESS: if the replica
+ * restarts, the shutdown checkpoint preserves them and the next
+ * recovery resolves them when the commit/abort WAL arrives.
+ */
+void
+o_recovery_pause_sync(void)
+{
+	int			i;
+	XLogRecPtr	ptr;
+	XLogRecPtr	current_ptr;
+	XLogRecPtr	retain_ptr;
+
+	if (!*recovery_single_process)
+	{
+		workers_synchronize(GetXLogReplayRecPtr(NULL), true);
+
+		if (unexpected_worker_detach)
+			elog(ERROR, "orioledb recovery worker died.");
+
+		for (i = 0; i < recovery_pool_size_guc; i++)
+		{
+			BgwHandleStatus status;
+			pid_t		pid;
+
+			status = GetBackgroundWorkerPid(workers_pool[i].handle, &pid);
+			if (status != BGWH_STARTED && status != BGWH_NOT_YET_STARTED)
+				elog(ERROR, "orioledb recovery worker died.");
+		}
+
+		for (i = 0; i < recovery_pool_size_guc; i++)
+			pg_atomic_write_u64(&worker_ptrs[i].retainPtr,
+								pg_atomic_read_u64(&worker_ptrs[i].commitPtr));
+	}
+
+	update_proc_retain_undo_location(-1);
+
+	ptr = pg_atomic_read_u64(recovery_ptr);
+	if (XLogRecPtrIsValid(ptr))
+	{
+		current_ptr = recovery_get_current_ptr();
+		retain_ptr = recovery_get_retain_ptr();
+
+		if (current_ptr != ptr)
+			elog(WARNING, "orioledb recovery pause sync: "
+				 "current_ptr %X/%X != recovery_ptr %X/%X",
+				 LSN_FORMAT_ARGS(current_ptr), LSN_FORMAT_ARGS(ptr));
+		if (retain_ptr != ptr)
+			elog(WARNING, "orioledb recovery pause sync: "
+				 "retain_ptr %X/%X != recovery_ptr %X/%X",
+				 LSN_FORMAT_ARGS(retain_ptr), LSN_FORMAT_ARGS(ptr));
+	}
+
+}
+
 void
 o_recovery_finish_hook(bool cleanup)
 {
@@ -1705,9 +1883,7 @@ o_recovery_finish_hook(bool cleanup)
 	{
 		workers_send_finish(false);
 		for (i = 0; i < num_workers; i++)
-		{
 			worker_wait_shutdown(&workers_pool[i]);
-		}
 	}
 
 	update_proc_retain_undo_location(-1);
@@ -1728,9 +1904,8 @@ o_recovery_finish_hook(bool cleanup)
 	LockReleaseCurrentOwner(NULL, 0);
 
 	/*
-	 * No sense to check recovery_internal_error state, because shm_mq_sendv()
-	 * can return SHM_MQ_DETACHED even if finish message was successfully
-	 * sent.
+	 * No sense to check worker error state, because shm_mq_sendv() can return
+	 * SHM_MQ_DETACHED even if finish message was successfully sent.
 	 */
 	if (!recovery_single && pg_atomic_read_u32(worker_finish_count) != num_workers)
 	{
@@ -3440,7 +3615,7 @@ update_run_xmin(void)
 		/*
 		 * walk_checkpoint_stacks() clobbers recovery_oxid /
 		 * curUndoLocations[] / oxid_needs_wal_flush, but update_run_xmin()
-		 * can be re-entered from inside apply_wal_record() (via the
+		 * can be re-entered from inside orioledb_redo() (via the
 		 * o_handle_startup_proc_interrupts_hook ->
 		 * update_proc_retain_undo_location -> check_delete_xid_state path)
 		 * while another oxid is being applied -- so save those globals around
@@ -4150,10 +4325,20 @@ recovery_on_proc_exit(int code, Datum arg)
 static void
 o_handle_startup_proc_interrupts_hook(void)
 {
+	static bool version_file_written = false;
+
 	if (is_recovery_in_progress())
 		update_proc_retain_undo_location(-1);
 
 	update_recovery_undo_loc_flush(*recovery_single_process, -1);
+
+	/* One-shot: this hook fires repeatedly, avoid re-writing each time. */
+	if (!version_file_written && reachedConsistency)
+	{
+		write_orioledb_version_file();
+		version_file_written = true;
+	}
+
 	serve_workers_sync_request();
 }
 
@@ -4743,13 +4928,13 @@ recovery_workers_alive_range(int first, int lastInclusive)
  *
  * Call from inside _o_index_begin_parallel (which runs in the
  * index_build_leader worker process): the leader sends the DSM segment
- * handle to each idx_build_first..idx_build_last worker via
+ * handle to each index_build_first_worker..index_build_last_worker via
  * recovery_send_worker_oids and then waits for each to increment
  * nrecoveryworkersjoined.  If any of those workers has exited
  * (BGW_NEVER_RESTART means the postmaster won't bring them back), that
  * increment is never going to arrive and the leader hangs forever.
  *
- * Returns true if every idx_build_first..idx_build_last worker has a
+ * Returns true if every index_build_first_worker..index_build_last_worker has a
  * live pid; false if any of them is missing or has stopped.
  */
 bool
@@ -5289,6 +5474,9 @@ handle_movedb(Oid dbOid, Oid src_tblspcoid, Oid dst_tblspcoid)
 		EvictedTreeData *evicted_data = NULL;
 		Oid			relnode = lfirst_oid(lc);
 
+		/* Clean trees may have only a checkpoint map, not evicted data. */
+		o_move_latest_chkp_num(dbOid, relnode, src_tblspcoid, dst_tblspcoid);
+
 		evicted_data = read_evicted_data(dbOid, relnode, src_tblspcoid, true);
 
 		if (evicted_data != NULL)
@@ -5474,6 +5662,7 @@ replay_on_record(WalReaderState *r, WalRecord *rec)
 			break;
 
 		case WAL_REC_SWITCH_LOGICAL_XID:
+		case WAL_REC_SUBXACT_ABORT:
 			/* Ignore */
 			break;
 
@@ -5746,9 +5935,9 @@ replay_on_record(WalReaderState *r, WalRecord *rec)
 				 * sysTreesStartPtr that is past some window's META_LOCK (a
 				 * window whose sys-tree changes are already fully in the
 				 * checkpoint image).  We then see its UNLOCK with no matching
-				 * META_LOCK; handle_o_tables_ meta_unlock() returns early in
+				 * META_LOCK; handle_o_tables_meta_unlock() returns early in
 				 * that case (nothing to reconcile).  The old exact-cut
-				 * invariant that a UNLOCK always had its META_LOCK no longer
+				 * invariant that an UNLOCK always had its META_LOCK no longer
 				 * holds.
 				 */
 				handle_o_tables_meta_unlock(rec->u.unlock.oids, rec->u.unlock.oldRelnode);
@@ -5861,6 +6050,7 @@ replay_on_record(WalReaderState *r, WalRecord *rec)
 		case WAL_REC_UPDATE:
 		case WAL_REC_DELETE:
 		case WAL_REC_REINSERT:
+		case WAL_REC_UPDATE_PARTIAL:
 			{
 				OFixedTuple tuple1,
 							tuple2;
@@ -6017,7 +6207,19 @@ replay_on_record(WalReaderState *r, WalRecord *rec)
 					if (ctx->single)
 					{
 						recovery_switch_to_oxid(rec->oxid, -1);
+						if (type == RecoveryMsgTypeUpdatePartial)
+						{
+							ctx->descr = recovery_partial_update_descr(ctx->descr,
+																	   tuple1.tuple);
+							ctx->indexDescr = GET_PRIMARY(ctx->descr);
+						}
 						apply_modify_record(ctx->descr, ctx->indexDescr, type, tuple1.tuple);
+					}
+					else if (type == RecoveryMsgTypeUpdatePartial)
+					{
+						spread_partial_update(&ctx->indexDescr->desc,
+											  tuple1.tuple,
+											  rec->u.modify.len1);
 					}
 					else
 					{
@@ -6293,6 +6495,7 @@ worker_send_modify(int worker_id, BTreeDescr *desc,
 
 	Assert(recType == RecoveryMsgTypeInsert ||
 		   recType == RecoveryMsgTypeUpdate ||
+		   recType == RecoveryMsgTypeUpdatePartial ||
 		   recType == RecoveryMsgTypeDelete ||
 		   recType == RecoveryMsgTypeBridgeErase);
 
@@ -6791,6 +6994,23 @@ spread_idx_modify(BTreeDescr *desc, RecoveryMsgType recType, OTuple rec)
 }
 
 /*
+ * Sends a WAL_REC_UPDATE_PARTIAL payload to the worker owning its key.
+ */
+static void
+spread_partial_update(BTreeDescr *desc, OTuple payload, int length)
+{
+	OTuple		key;
+	uint32		hash;
+
+	Assert(desc->type == oIndexPrimary);
+	key = o_wal_partial_update_get_key(payload.data);
+	hash = o_btree_hash(desc, key, BTreeKeyNonLeafKey);
+	pfree(key.data);
+	worker_send_modify(GET_WORKER_ID(hash), desc,
+					   RecoveryMsgTypeUpdatePartial, payload, length);
+}
+
+/*
  * Converts wal record type to recovery message type.
  */
 static inline RecoveryMsgType
@@ -6804,6 +7024,8 @@ recovery_msg_from_wal_record(WalRecordType rec_type)
 			return RecoveryMsgTypeDelete;
 		case WAL_REC_UPDATE:
 			return RecoveryMsgTypeUpdate;
+		case WAL_REC_UPDATE_PARTIAL:
+			return RecoveryMsgTypeUpdatePartial;
 		case WAL_REC_BRIDGE_ERASE:
 			return RecoveryMsgTypeBridgeErase;
 		case WAL_REC_REINSERT:

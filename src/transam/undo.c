@@ -189,6 +189,11 @@ static UndoItemTypeDescr undoItemTypeDescrs[] = {
 		.callback = lock_dispatch_undo_callback,
 		.callOnCommit = false
 	},
+	{
+		.type = UpdateDiffUndoItemType,
+		.callback = modify_undo_callback,
+		.callOnCommit = false
+	},
 };
 
 
@@ -950,7 +955,7 @@ o_slot_retain_location(ReplicationSlot *slot)
 	UndoLocation result;
 	int			i;
 
-	if (wal_level < WAL_LEVEL_LOGICAL || oProcData == NULL)
+	if (!XLogLogicalInfoActive() || oProcData == NULL)
 		return 0;
 
 #if PG_VERSION_NUM >= 170000
@@ -1047,7 +1052,7 @@ get_current_replication_catalog_retain_undo_location(void)
 	UndoMeta   *meta = get_undo_meta_by_type(UndoLogSystem);
 	uint64		location;
 
-	if (wal_level < WAL_LEVEL_LOGICAL)
+	if (!XLogLogicalInfoActive())
 		return InvalidUndoLocation;
 
 	location = ReplicationSlotsComputeMinExtRetainLocation();
@@ -2384,8 +2389,8 @@ reserve_undo_size_extended(UndoLogType undoType, Size size,
 									  waitForUndoLocation))
 	{
 		/*
-		 * we add size to reserver_undo_size and meta->advanceReservedLocation
-		 * and must revert this action
+		 * we add size to reserved_undo_sizes and
+		 * meta->advanceReservedLocation and must revert this action
 		 */
 		pg_atomic_fetch_sub_u64(&meta->advanceReservedLocation, size);
 		reserved_undo_sizes[(int) undoType] -= size;
@@ -3505,6 +3510,14 @@ undo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	LogicalXidCtx logicalXidContext;
 
 	/*
+	 * No subtransaction starts inside an autonomous transaction.  The
+	 * released xid bookkeeping in oxid_subxact_callback() relies on it: it
+	 * belongs to the outer transaction and would mix two subid spaces
+	 * otherwise.
+	 */
+	Assert(GET_CUR_PROCDATA()->autonomousNestingLevel == 0);
+
+	/*
 	 * Cleanup EXPLAIN ANALYZE counters pointer to handle case when execution
 	 * of node was interrupted by exception.
 	 */
@@ -3565,6 +3578,7 @@ undo_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				{
 					if (!RecoveryInProgress())
 					{
+						log_released_xids_abort(mySubid);
 						add_rollback_to_savepoint_wal_record(parentSubid);
 					}
 				}

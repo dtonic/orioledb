@@ -110,7 +110,7 @@ EXPLAIN SELECT * FROM blog_post WHERE id = 1;
 
 ### Use OrioleDB tables by default
 
-If you want all your created tables use `orioledb` access method without explicitly specifying this each time at `CREATE
+If you want all your created tables to use `orioledb` access method without explicitly specifying this each time at `CREATE
 TABLE`, add in your PostgreSQL config file:
 
 `default_table_access_method = 'orioledb'`
@@ -122,17 +122,17 @@ retain their previous access method.
 
 OrioleDB tables support ICU, C, POSIX, and PostgreSQL 17 or later builtin collations. Make sure the cluster or database is set up with a default collation that uses one of those providers; otherwise, specify `COLLATE` for every `text` field of the table.
 
-ALTER COLLATION REFRESH VERSION is also disabled for collations that used for fields and indexes of orioledb tables.
+ALTER COLLATION REFRESH VERSION is also disabled for collations that are used for fields and indexes of orioledb tables.
 
 ### Block-level data compression
 
-OrioleDB implements block-level compression. Compression levels are integer values from `-1` to `22`. Value of `-1` means no compression (default), values between 0 and 22 specified compression levels of zstd library.
+OrioleDB implements block-level compression. Compression levels are integer values from `-1` to `22`. Value of `-1` means no compression (default), values between 0 and 22 specify compression levels of zstd library.
 
 The following options control the compression level of a table:
 
 - `compress` – compression level for all table data structures (value of `-1` disables compression for the table, non-specifying makes `orioledb.default_compress` to be used),
-- `primary_compress` – compression level for the table primary key (in case of `-1` it's inherited from `compress` value for the table if it's positive, otherwise `orioledb.default_primary_compress` is used),
-- `toast_compress` – compression level for the table TOASTed values. (in case of `-1` it's inherited from `compress` value for the table if it's positive, otherwise `orioledb.default_toast_compress` is used)
+- `primary_compress` – compression level for the table primary key; if omitted, uses `orioledb.default_primary_compress`. If the resulting value is `-1`, it inherits the table-level compression value (`compress`, or `orioledb.default_compress` if omitted) when that value is not `-1`; otherwise compression is disabled,
+- `toast_compress` – compression level for the table TOASTed values; if omitted, uses `orioledb.default_toast_compress`. If the resulting value is `-1`, it inherits the table-level compression value (`compress`, or `orioledb.default_compress` if omitted) when that value is not `-1`; otherwise compression is disabled.
 
 Individual indexes also have the `compress` option, which controls the compression level of a particular index, overriding the value of the table `compress` option.
 
@@ -147,11 +147,11 @@ CREATE TABLE compression_test
    WITH (compress = 5, toast_compress = 10, primary_compress = -1);
 
 CREATE INDEX compression_test_value1_idx ON compression_test(value1)
-    WITH (compress = 22)
+    WITH (compress = 22);
 CREATE INDEX compression_test_value2_idx ON compression_test(value2);
 ```
 
-In this example primary key of `compression_test` table uses compression as specified by `orioledb.default_primary_compress` value, TOAST values are compressed with level of `10`, `compression_test_value1_idx` index is compressed with level of `22`, index `compression_test_value2_idx` is compressed with level of `5`.
+In this example primary key of `compression_test` table is compressed with level of `5` (inherited from `compress`), TOAST values are compressed with level of `10`, `compression_test_value1_idx` index is compressed with level of `22`, index `compression_test_value2_idx` is compressed with level of `5`.
 
 ### Fillfactor
 
@@ -244,13 +244,13 @@ OrioleDB has its own recovery mechanism: copy-on-write checkpoints and row-level
 
 Recovery using row-level WAL records might require significant CPU resources. Therefore parallel recovery of OrioleDB's tables is implemented. OrioleDB launches its own pool of recovery workers, each of them responsible for replaying a particular part of WAL records.
 
-OrioleDB has its own pool background writer processes (the `orioledb.bgwriter_num_workers` GUC parameter defines the pool size). Usage of multiple background writers increases the effectiveness of IO-utilization on modern hardware.
+OrioleDB has its own pool of background writer processes (the `orioledb.bgwriter_num_workers` GUC parameter defines the pool size). Usage of multiple background writers increases the effectiveness of IO-utilization on modern hardware.
 
 ### Experimental support of the block devices
 
 OrioleDB implements experimental support of direct interaction with block devices mode. This mode removes the overhead of the filesystem.
 
-In this mode, the main part of table data is stored in the filesystem, but small metadata is still stored in the data directory.
+In this mode, the main part of table data is stored on the block device, but small metadata is still stored in the data directory.
 
 The current implementation of block devices support contains memory leaks, resulting in the error message `device file overflow` even if the actual data size is much less than block device size. In this case, only the re-initialization of the data directory could help.
 
@@ -286,22 +286,23 @@ CREATE INDEX blog_post_title_idx ON blog_post USING btree(title) with (orioledb_
 OrioleDB is currently in the development stage. Therefore it has the following temporary limitations.
 
 1.  `pg_rewind` copies OrioleDB tables completely. Shortly OrioleDB will implement incremental copying of OrioleDB tables using `pg_rewind`.
-2.  OrioleDB supports parallel sequential scan and parallel index scan, but not other types of scan.
+2.  OrioleDB supports parallel sequential scan, parallel index scan and parallel bitmap heap scan, but not other types of scan.
 3.  OrioleDB doesn't support prepared transactions.
 4.  OrioleDB support of non-btree indexes is experimental yet.
-5.  OrioleDB supports bitmap scan only for int4, int8 and ctid primary keys.
+5.  Bitmap scans are supported for single-column `int4`, `int8` or `ctid` primary keys. They are also supported when all primary key columns are ascending, have one of the types `bool`, `"char"`, `int2`, `int4`, `int8`, `oid`, `float4`, `float8`, `date`, `time`, `timestamp`, `timestamptz`, `money`, `macaddr`, `macaddr8` or `uuid`, and total at most 24 bytes.
 6.  Row-level concurrency in OrioleDB has some [differences](../architecture/row-level-concurrency.mdx).
-7.  OrioleDB doesn't support `CLUSTER` and `VACUUM FULL` commands yet, because we don't implement rewrite of the tables for these commands. And also `CLUSTER` doesn't really makes much sense for index-organized tables.
+7.  OrioleDB doesn't support `CLUSTER` and `VACUUM FULL` commands yet, because we don't implement rewrite of the tables for these commands. And also `CLUSTER` doesn't really make much sense for index-organized tables.
 8.  `CREATE INDEX/REINDEX CONCURRENTLY` are supported with [limitations](../architecture/concurrent-index.mdx).
 9.  OrioleDB tables don't support `Sample Scans` yet.
 10. OrioleDB does not implement true SERIALIZABLE Snapshot Isolation. The `orioledb.serializable` GUC controls how SERIALIZABLE transactions are handled:
     - `error` (default): reject SERIALIZABLE transactions with `ERRCODE_FEATURE_NOT_SUPPORTED`.
     - `table_lock`: every relation a SERIALIZABLE transaction touches is protected by a coarse heavyweight `ExclusiveLock`. It does not prevent write skew: the lock is taken after the transaction's snapshot.
     - `repeatable_read`: treat SERIALIZABLE as `REPEATABLE READ` for OrioleDB tables only — no extra locks are taken, OrioleDB's CSN snapshot already provides per-transaction stable reads. Heap tables in the same transaction continue to use PG's SSI as usual.
-11. Backward fetches from a cursor is supported only when the cursor is declared with `SCROLL`.
+11. Backward fetches from a cursor are supported only when the cursor is declared with `SCROLL`.
 12. OrioleDB always uses checksums on data pages and initializing a database cluster without data checksums doesn't have effect on OrioleDB tables.
 13. PostgreSQL sequences are backed by heap relations. Accessing them (e.g., via `nextval()`) forces full PostgreSQL Transaction ID (XID) allocation, bypassing OrioleDB's optimized transaction mechanics unless sequence caching is utilized.
 14. Logical decoding doesn't stream in-progress transactions. This applies to all logical replication slots in the cluster, including databases without OrioleDB tables. Subscriptions with `streaming = on` or `streaming = parallel` still work, but large transactions are spilled to disk and sent at commit.
+15. With `wal_level = logical`, a released subtransaction holds a logical transaction ID until its top-level transaction ends. One transaction that releases more subtransactions than [`orioledb.logical_xid_buffers`](configuration.mdx#orioledblogical_xid_buffers) holds (4 million by default) fails with `not enough logical xids`; from a PL/pgSQL `EXCEPTION` block the error is FATAL and ends the session.
 
 ## Links
 

@@ -85,6 +85,16 @@
  * will check if current ORIOLEDB_BINARY_VERSION is equal to what is in the control file. Otherwise
  * the cluster will refuse to start. (We don't go to the following versions checks in this case)
  *
+ * - ORIOLEDB_CHECKPOINT_VERSION - Version of checkpoint-related formats
+ *   (undo log, xid files, etc.).
+ *
+ * Bump ORIOLEDB_CHECKPOINT_VERSION every time the checkpoint on-disk format changes (e.g. undo
+ * log layout, xid file format). The version is stored in the checkpoint control file. At recovery,
+ * if the stored checkpointVersion is greater than the compiled ORIOLEDB_CHECKPOINT_VERSION, the
+ * cluster will refuse to start (old binary can't recover a newer cluster's checkpoint data). If the
+ * stored version is lower (including 0 from old clusters that didn't have this field), recovery
+ * proceeds normally.
+ *
  * - ORIOLEDB_SYS_TREE_VERSION - Version of OrioleDB system trees format
  * - ORIOLEDB_PAGE_VERSION - Version of OrioleDB page format
  * - ORIOLEDB_COMPRESS_VERSION - Version of OrioleDB page compression format
@@ -99,6 +109,8 @@
  */
 #define ORIOLEDB_VERSION "OrioleDB beta 19"
 #define ORIOLEDB_BINARY_VERSION 10
+#define ORIOLEDB_CHECKPOINT_VERSION	1	/* Version of checkpoint format; bump
+										 * on any checkpoint on-disk change */
 #define ORIOLEDB_SYS_TREE_VERSION	1	/* Version of system catalog */
 #define ORIOLEDB_PAGE_VERSION		1	/* Version of binary page format */
 #define ORIOLEDB_COMPRESS_VERSION	1	/* Version of page compression (only
@@ -106,6 +118,7 @@
 
 #define ORIOLEDB_DATA_DIR "orioledb_data"
 #define ORIOLEDB_UNDO_DIR "orioledb_undo"
+#define ORIOLEDB_VERSION_FILENAME ORIOLEDB_DATA_DIR "/ORIOLEDB_VERSION"
 #define ORIOLEDB_RMGR_ID (129)
 #define ORIOLEDB_XLOG_CONTAINER (0x00)
 
@@ -518,6 +531,7 @@ extern OrioleDBPageDesc *page_descs;
 extern OrioleDBPageDesc *local_ppool_page_descs;
 extern bool remove_old_checkpoint_files;
 extern bool orioledb_debug_disable_multi_insert;
+extern bool orioledb_debug_disable_toast_multi_insert;
 extern bool orioledb_debug_disable_downlink_fastpath;
 extern bool skip_unmodified_trees;
 extern bool debug_disable_bgwriter;
@@ -652,7 +666,7 @@ extern void o_page_desc_init(OrioleDBPageDesc *desc);
 
 extern CheckPoint_hook_type next_CheckPoint_hook;
 
-/* tableam_handler.c */
+/* tableam/handler.c */
 extern bool is_orioledb_rel(Relation rel);
 
 typedef struct OTableDescr OTableDescr;

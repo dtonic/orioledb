@@ -21,6 +21,7 @@
 #include "btree/io.h"
 #include "checkpoint/control.h"
 
+#include "storage/fd.h"
 #include "utils/wait_event.h"
 
 /*
@@ -110,12 +111,13 @@ check_checkpoint_control(CheckpointControl *control)
 	if (crc != control->crc)
 		elog(ERROR, "Wrong CRC in control file");
 
-	if (control->binaryVersion != ORIOLEDB_BINARY_VERSION)
+	if (UNPACK_BINARY_VERSION(control->binaryVersion) != ORIOLEDB_BINARY_VERSION)
 		ereport(FATAL,
 				(errmsg("database files are incompatible with server"),
 				 errdetail("OrioleDB was initialized with binary version %d,"
 						   " but the extension is compiled with binary version %d.",
-						   control->binaryVersion, ORIOLEDB_BINARY_VERSION),
+						   UNPACK_BINARY_VERSION(control->binaryVersion),
+						   ORIOLEDB_BINARY_VERSION),
 				 errhint("It looks like you need to initdb.")));
 
 	if (control->s3Mode != orioledb_s3_mode)
@@ -158,4 +160,38 @@ write_checkpoint_control(CheckpointControl *control)
 						errmsg("could not write checkpoint control to file %s: %m", CONTROL_FILENAME)));
 
 	FileClose(controlFile);
+}
+
+#define ORIOLEDB_VERSION_TMP_FILENAME	ORIOLEDB_VERSION_FILENAME ".tmp"
+
+void
+write_orioledb_version_file(void)
+{
+	FILE	   *f;
+
+	f = AllocateFile(ORIOLEDB_VERSION_TMP_FILENAME, "w");
+	if (f == NULL)
+	{
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not open file \"%s\" for writing: %m",
+						ORIOLEDB_VERSION_TMP_FILENAME)));
+		return;
+	}
+
+	fprintf(f, "%s\n", ORIOLEDB_VERSION);
+
+	if (fflush(f) || fsync(fileno(f)))
+	{
+		FreeFile(f);
+		ereport(WARNING,
+				(errcode_for_file_access(),
+				 errmsg("could not flush file \"%s\": %m",
+						ORIOLEDB_VERSION_TMP_FILENAME)));
+		return;
+	}
+	FreeFile(f);
+
+	durable_rename(ORIOLEDB_VERSION_TMP_FILENAME,
+				   ORIOLEDB_VERSION_FILENAME, WARNING);
 }

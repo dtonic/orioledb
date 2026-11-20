@@ -35,6 +35,9 @@ concurrency:
   group: sqlsmith-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   sqlsmith:
     # A fork syncing main should not spend four jobs on it; its own pull
@@ -83,7 +86,7 @@ jobs:
           path: postgresql
 
       - name: Setup prerequisites
-        run: bash ./orioledb/ci/prerequisites.sh
+        run: bash ./orioledb/ci/setup/prerequisites.sh
 
       - name: Install sqlsmith build dependencies
         run: |
@@ -96,10 +99,10 @@ jobs:
             libpqxx-dev libboost-dev libboost-regex-dev g++
 
       - name: Build
-        run: bash ./orioledb/ci/build.sh
+        run: bash ./orioledb/ci/setup/build.sh
 
       - name: Install post build prerequisites
-        run: bash ./orioledb/ci/post_build_prerequisites.sh
+        run: bash ./orioledb/ci/setup/post_build_prerequisites.sh
 
       - name: Fuzz with sqlsmith
         timeout-minutes: 45

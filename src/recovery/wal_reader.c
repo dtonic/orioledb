@@ -42,6 +42,7 @@ static WalParseResult wal_parse_rec_joint_commit(WalReaderState *r, WalRecord *r
 static WalParseResult wal_parse_rec_truncate(WalReaderState *r, WalRecord *rec);
 static WalParseResult wal_parse_rec_bridge_erase(WalReaderState *r, WalRecord *rec);
 static WalParseResult wal_parse_rec_switch_logical_xid(WalReaderState *r, WalRecord *rec);
+static WalParseResult wal_parse_rec_subxact_abort(WalReaderState *r, WalRecord *rec);
 static WalParseResult wal_parse_rec_relreplident(WalReaderState *r, WalRecord *rec);
 static WalParseResult wal_parse_rec_modify(WalReaderState *r, WalRecord *rec);
 static WalParseResult wal_parse_rec_dbcopy(WalReaderState *r, WalRecord *rec);
@@ -276,6 +277,18 @@ wal_parse_rec_rollback_to_savepoint(WalReaderState *r, WalRecord *rec)
 	return WALPARSE_OK;
 }
 
+/* Parser for WAL_REC_SUBXACT_ABORT */
+static WalParseResult
+wal_parse_rec_subxact_abort(WalReaderState *r, WalRecord *rec)
+{
+	Assert(r);
+	Assert(rec);
+
+	WR_PARSE(r, &rec->u.subxact_abort.logicalXid);
+
+	return WALPARSE_OK;
+}
+
 /* Parser for WAL_REC_TRUNCATE */
 static WalParseResult
 wal_parse_rec_truncate(WalReaderState *r, WalRecord *rec)
@@ -487,7 +500,9 @@ build_fixed_tuples(const WalRecord *rec, OFixedTuple *tuple1, OFixedTuple *tuple
 	Assert(rec);
 	Assert(tuple1);
 	Assert(tuple2);
-	Assert(rec->type == WAL_REC_INSERT || rec->type == WAL_REC_UPDATE || rec->type == WAL_REC_DELETE || rec->type == WAL_REC_REINSERT);
+	Assert(rec->type == WAL_REC_INSERT || rec->type == WAL_REC_UPDATE ||
+		   rec->type == WAL_REC_DELETE || rec->type == WAL_REC_REINSERT ||
+		   rec->type == WAL_REC_UPDATE_PARTIAL);
 
 	if (bigTupleCxt == NULL)
 		bigTupleCxt = AllocSetContextCreate(TopMemoryContext,

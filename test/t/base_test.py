@@ -221,7 +221,7 @@ class TestPortManager(PortManager__Generic):
 			with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
 				s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 				try:
-					s.bind(("", port))
+					s.bind(("127.0.0.1", port))
 					return True
 				except OSError:
 					return False
@@ -820,7 +820,7 @@ def tbl_structure_to_json(structure: str) -> dict[str, dict[int, Any]]:
 	cur_index = None
 	cur_page = None
 
-	# TODO Currently limited information is parsed from the ouput of the
+	# TODO Currently limited information is parsed from the output of the
 	# orioledb_tbl_structure() function. Add more information to the output
 	# JSON object.
 

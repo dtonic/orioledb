@@ -123,7 +123,7 @@ typedef struct oIdxLeader
 /*
  * Working state for parallel build used only for leader. It is used
  * to fill oIdxShared for workers in shmem or recovery_shmem and
- * a oIdxLeader for leader participation in parallel scan.
+ * an oIdxLeader for leader participation in parallel scan.
  */
 typedef struct oIdxBuildState
 {
@@ -660,17 +660,144 @@ o_define_index(Relation heap, Relation index, Oid indoid, bool reindex,
 		bool		is_temp = o_table->persistence == RELPERSISTENCE_TEMP;
 
 		fill_current_oxid_osnapshot(&oxid, &oSnapshot);
-		o_tables_update(o_table, oxid, oSnapshot.csn);
-		if (!reuse_relnode)
-		{
-			OIndexKey	key = {.oids = table_index->oids};
 
-			add_undo_create_relnode(o_table->oids, &key, 1, !is_temp);
+		if (!reuse_relnode && ix_type != oIndexPrimary)
+		{
+			OTable	   *cur;
+			OIndexKey	key = {.oids = table_index->oids};
+			bool		retry = false;
+
+			STOPEVENT(STOPEVENT_DEFINE_INDEX_BEFORE_UPDATE, NULL);
+
+			/*
+			 * Re-read the OTable under oSysTreesLock, append our index, and
+			 * write.  o_tables_update_locked may release oSysTreesLock while
+			 * waiting for a conflicting transaction, letting another backend
+			 * overwrite our entry.  Loop until our index is durably present.
+			 */
+			for (;;)
+			{
+				systrees_modify_start();
+				cur = o_tables_get(oids);
+
+				if (retry)
+				{
+					bool		found_ours = false;
+					int			si;
+
+					for (si = 0; si < cur->nindices; si++)
+					{
+						if (ORelOidsIsEqual(cur->indices[si].oids,
+											table_index->oids))
+						{
+							found_ours = true;
+							ix_num = si;
+							break;
+						}
+					}
+
+					if (found_ours)
+					{
+						systrees_modify_end(false);
+						o_table_free(cur);
+						break;
+					}
+				}
+
+				cur->indices = (OTableIndex *)
+					repalloc(cur->indices, sizeof(OTableIndex) *
+							 (cur->nindices + 1));
+				memcpy(&cur->indices[cur->nindices],
+					   table_index,
+					   sizeof(OTableIndex));
+				cur->indices[cur->nindices].index_mctx = NULL;
+				ix_num = cur->nindices;
+				cur->nindices++;
+				o_tables_update_locked(cur, oxid, oSnapshot.csn, retry);
+				if (!retry)
+					add_undo_create_relnode(o_table->oids, &key, 1,
+											!is_temp);
+				systrees_modify_end(!is_temp);
+				o_table_free(cur);
+				retry = true;
+			}
 		}
+		else
+		{
+			o_tables_update(o_table, oxid, oSnapshot.csn);
+		}
+
 		recreate_table_descr_by_oids(oids);
 	}
 
 	descr = o_fetch_table_descr(o_table->oids);
+
+	/*
+	 * A concurrent backend may have appended its uncommitted index to the
+	 * OTable and then aborted, leaving a stale entry in the sys tree.
+	 * recreate_table_descr may filter the stale index in-memory, so the
+	 * descriptor can be valid but ix_num wrong.  Detect either case and
+	 * repair the sys tree.
+	 */
+	{
+		bool		need_repair = (descr == NULL);
+
+		if (!need_repair)
+		{
+			int			desc_ix = o_table->has_primary ? ix_num : ix_num + 1;
+
+			need_repair = (desc_ix >= descr->nIndices ||
+						   !ORelOidsIsEqual(descr->indices[desc_ix]->oids,
+											table_index->oids));
+		}
+		if (need_repair)
+		{
+			OTable	   *clean;
+			OSnapshot	fixSnap;
+			OXid		fixOxid;
+			int			si,
+						di;
+			int			ctid_off = o_table->has_primary ? 0 : 1;
+
+			fill_current_oxid_osnapshot(&fixOxid, &fixSnap);
+			systrees_modify_start();
+			clean = o_tables_get(oids);
+			di = 0;
+			for (si = 0; si < clean->nindices; si++)
+			{
+				OIndex	   *idx = o_indices_get(clean->indices[si].oids,
+												clean->indices[si].type);
+
+				if (idx != NULL)
+				{
+					free_o_index(idx);
+					if (di != si)
+						clean->indices[di] = clean->indices[si];
+					di++;
+				}
+			}
+			clean->nindices = di;
+			o_tables_update_locked(clean, fixOxid, fixSnap.csn, true);
+			systrees_modify_end(clean->persistence != RELPERSISTENCE_TEMP);
+			o_table_free(clean);
+
+			recreate_table_descr_by_oids(oids);
+			descr = o_fetch_table_descr(o_table->oids);
+
+			if (descr == NULL)
+				elog(ERROR, "unable to rebuild table descriptor after "
+					 "stale index repair");
+
+			for (ix_num = ctid_off; ix_num < descr->nIndices; ix_num++)
+			{
+				if (ORelOidsIsEqual(descr->indices[ix_num]->oids,
+									table_index->oids))
+					break;
+			}
+			ix_num -= ctid_off;
+		}
+	}
+
 	ResourceOwnerRememberOTableDescr(CurrentResourceOwner, descr);
 
 	if (!reuse_relnode && is_build && !skip_build)
@@ -861,6 +988,9 @@ o_define_index_concurrent_finish(Relation heap, Relation index)
 	idx = descr->indices[o_table->has_primary ? ix_num : ix_num + 1];
 
 	/* Phase-2 build under the BUILDING state.  Concurrent writers spool. */
+	if (STOPEVENTS_ENABLED())
+		STOPEVENT(STOPEVENT_CIC_BEFORE_BUILD,
+				  cic_stopevent_params(idx_oids, idx->name.data));
 	build_secondary_index(InvalidOid, o_table, descr, ix_num, false, &result_local);
 
 	/*
@@ -927,6 +1057,8 @@ o_define_index_concurrent_finish(Relation heap, Relation index)
 			tts_orioledb_store_tuple(primarySlot, tup, descr, tupleCsn,
 									 PrimaryIndexNumber, true, &hint);
 			slot_getallattrs(primarySlot);
+
+			MemoryContextReset(idx->econtext->ecxt_per_tuple_memory);
 
 			if (!o_is_index_predicate_satisfied(idx, primarySlot, idx->econtext))
 			{
@@ -1909,6 +2041,8 @@ build_secondary_index_worker_heap_scan(OTableDescr *descr, OIndexDescr *idx,
 	{
 		OTuple		secondaryTup;
 
+		MemoryContextReset(idx->econtext->ecxt_per_tuple_memory);
+
 		if (o_is_index_predicate_satisfied(idx, primarySlot, idx->econtext))
 		{
 			secondaryTup = tts_orioledb_make_secondary_tuple(primarySlot,
@@ -2378,6 +2512,8 @@ rebuild_indices_worker_heap_scan(OTableDescr *old_descr, OTableDescr *descr,
 			OTuple		newTup;
 
 			idx = descr->indices[i];
+
+			MemoryContextReset(idx->econtext->ecxt_per_tuple_memory);
 
 			if (!o_is_index_predicate_satisfied(idx, primarySlot,
 												idx->econtext))

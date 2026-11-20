@@ -8,11 +8,12 @@ EXTENSION = orioledb
 PGFILEDESC = "orioledb - orioledb transactional storage engine via TableAm"
 SHLIB_LINK += -lzstd -lcurl -lssl -lcrypto
 
-DATA_built = $(patsubst %_prod.sql,%.sql,$(wildcard sql/*_prod.sql))
+DATA_built = $(patsubst %_prod.sql,%.sql,$(wildcard sql/*_prod.sql)) orioledb_version.txt
 DATA = $(filter-out $(wildcard sql/*_*.sql) $(DATA_built), $(wildcard sql/*sql))
 
 EXTRA_CLEAN = include/utils/stopevents_defs.h \
-			  include/utils/stopevents_data.h
+			  include/utils/stopevents_data.h \
+			  orioledb_version.txt
 OBJS = src/btree/btree.o \
 	   src/btree/build.o \
 	   src/btree/check.o \
@@ -58,6 +59,7 @@ OBJS = src/btree/btree.o \
 	   src/recovery/logical.o \
 	   src/recovery/recovery.o \
 	   src/recovery/wal.o \
+	   src/recovery/wal_partial.o \
 	   src/recovery/wal_reader.o \
 	   src/recovery/worker.o \
 	   src/rewind/rewind.o \
@@ -163,6 +165,7 @@ ISOLATIONCHECKS = bitmap_hist_scan \
 				  btree_iterate_split \
 				  btree_print_backend_id \
 				  btree_scan \
+				  concurrent_create_index \
 				  concurrent_update_delete \
 				  descr_torn_pair \
 				  fkeys \
@@ -189,8 +192,13 @@ ISOLATIONCHECKS = bitmap_hist_scan \
 				  rightlink \
 				  rll \
 				  rll_deadlock \
+				  rll_key_share_lost_update \
+				  rll_hidden_key_update \
 				  rll_mix \
 				  rll_mode_raise \
+				  rll_own_chain \
+				  rll_lock_past_retained \
+				  rll_tuple_lock_collision \
 				  rll_subtrans \
 				  rollback_lock_stale_copy \
 				  rr_committed_locker \
@@ -266,6 +274,7 @@ TESTGRESCHECKS_PART_2 = test/t/checkpoint_concurrent_test.py \
 						test/t/logical_joint_commit_test.py \
 						test/t/logical_rewrite_test.py \
 						test/t/logical_subxact_decoding_test.py \
+						test/t/logical_xid_release_test.py \
 						test/t/logical_xid_subxacts_test.py \
 						test/t/merge_into_test.py \
 						test/t/multi_insert_test.py \
@@ -302,10 +311,12 @@ TESTGRESCHECKS_PART_2 = test/t/checkpoint_concurrent_test.py \
 						test/t/seq_scan_undo_test.py \
 						test/t/temp_local_pool_test.py \
 						test/t/wal_savepoint_buffer_test.py \
+						test/t/wal_partial_update_test.py \
 						test/t/toast_index_test.py \
 						test/t/trigger_test.py \
 						test/t/undo_cleanup_test.py \
 						test/t/undo_reserved_race_test.py \
+						test/t/undo_update_diff_test.py \
 						test/t/unlogged_test.py \
 						test/t/vacuum_test.py \
 						test/t/transaction_test.py \
@@ -324,10 +335,11 @@ TESTGRESCHECKS_PART_2 = test/t/checkpoint_concurrent_test.py \
 						test/t/recovery_sk_rollback_to_savepoint_test.py
 TESTGRESCHECKS_PART_3 = test/t/logical_streaming_test.py \
 						test/t/relnode_wraparound_test.py \
-						test/t/rewind_time_test.py
+						test/t/rewind_time_test.py \
+						test/t/checkpoint_version_test.py
 
-# perf/*_perf.py -- see perf/README.md.
-PERFCHECKS = $(sort $(wildcard perf/*_perf.py))
+# scripts/perf/*_perf.py -- see scripts/perf/README.md.
+PERFCHECKS = $(sort $(wildcard scripts/perf/*_perf.py))
 
 PG_REGRESS_ARGS=--no-locale --inputdir=test --outputdir=test --temp-instance=./test/tmp_check
 PG_ISOLATION_REGRESS_ARGS=--no-locale --inputdir=test --outputdir=test/output_iso --temp-instance=./test/tmp_check_iso
@@ -441,7 +453,7 @@ COMMIT_HASH := $(shell git rev-parse HEAD 2>/dev/null)
 ifeq ($(strip $(COMMIT_HASH)),)
 	COMMIT_HASH := 0000000000000000000000000000000000000000
 endif
-override CFLAGS_SL += -DCOMMIT_HASH=$(COMMIT_HASH) -Wno-error=deprecated-declarations
+override CFLAGS_SL += -DCOMMIT_HASH=$(COMMIT_HASH)
 
 ifdef VALGRIND
 override with_temp_install += USE_VALGRIND=1 \
@@ -458,10 +470,13 @@ ifdef USE_DM_LOG_WRITES
 override with_temp_install += USE_DM_LOG_WRITES=1
 endif
 
+orioledb_version.txt: include/orioledb.h
+	@sed -n 's/^#define ORIOLEDB_VERSION "\(.*\)"/\1/p' include/orioledb.h > $@
+
 include/utils/stopevents_data.h: include/utils/stopevents_defs.h
 
-include/utils/stopevents_defs.h: stopevents.txt stopevents_gen.py
-	python3 stopevents_gen.py
+include/utils/stopevents_defs.h: stopevents.txt scripts/dev/stopevents_gen.py
+	python3 scripts/dev/stopevents_gen.py
 
 
 ifndef ORIOLEDB_PATCHSET_VERSION
@@ -469,7 +484,7 @@ ORIOLEDB_PATCHSET_VERSION=1
 endif
 
 check_patchset_version:
-	@python3 check_patchset_version.py $(MAJORVERSION) $(ORIOLEDB_PATCHSET_VERSION)
+	@python3 scripts/dev/check_patchset_version.py $(MAJORVERSION) $(ORIOLEDB_PATCHSET_VERSION)
 
 $(OBJS): include/utils/stopevents_defs.h check_patchset_version
 
@@ -493,7 +508,7 @@ testgrescheck_part_3: $(TESTGRESCHECKS_PART_3)
 temp-install: EXTRA_INSTALL=contrib/orioledb
 
 orioledb.typedefs: $(OBJS)
-	./typedefs_gen.py
+	./scripts/dev/typedefs_gen.py
 
 pgindent: orioledb.typedefs
 	pgindent --typedefs=orioledb.typedefs \
@@ -506,6 +521,10 @@ yapf:
 	yapf -i test/t/*.py
 	yapf -i test/integration/*.py
 	yapf -i *.py
+	yapf -i ci/*.py
+	yapf -i scripts/dev/*.py
+	yapf -i scripts/perf/*.py
+	yapf -i scripts/release/*.py
 
 .PHONY: submake-orioledb submake-regress check \
 	regresscheck isolationcheck testgrescheck perfcheck pgindent \

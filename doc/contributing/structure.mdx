@@ -18,18 +18,29 @@ orioledb
 |- .github
 |  |- workflows -- GitHub workflows
 |
-|- ci  -- scripts for building, testing, and CI automation
 |- doc -- documentation
 |- docker
 |  |- tests -- Docker images tests
 |  |- Dockerfile -- Alpine based Dockerfile used within docker.yml and dockertest.yml workflows
 |  |- Dockerfile.ubuntu -- Ubuntu based Dockerfile used within docker.yml and dockertest.yml workflows
 |  |- README.md -- Docker images tests documentation
-|  |- docker-entrypoint.sh -- entrypoint file for Docker images
+|  |- init/docker-entrypoint.sh -- entrypoint file for Docker images
 |  |- orioledb-config.sh -- Docker images tests configuration
-|  |- postgresql.docker.conf -- configuration file used by Docker images
+|  |- init/postgresql.docker.conf -- configuration file used by Docker images
 |- include -- C-headers of extension
-|- perf -- performance benchmarks
+|- ci -- scripts for building, testing, and CI automation (test runners, output filters, core dump helpers)
+|  |- setup -- dependency installation and PostgreSQL/extension builds
+|  |- coverage -- lcov helpers
+|  |- lint -- static analysis and pgindent
+|  |- backpatch -- backpatching automation
+|- scripts
+|  |- dev -- development helpers and code generators
+|  |  |- check_patchset_version.py -- checks the patched PostgreSQL version
+|  |  |- stopevents_gen.py -- generates include/utils/stopevents_(defs|data).h from stopevents.txt
+|  |  |- typedefs_gen.py -- generates list of C-symbols in orioledb.so to orioledb.typedefs
+|  |- docker -- Docker build matrix helpers
+|  |- perf -- performance benchmarks
+|  |- release -- release checks and release automation
 |- sql -- installation scripts with definitions of the extension's SQL-level objects
 |- src -- C-sources of extension
 |- test
@@ -43,9 +54,7 @@ orioledb
 |- Makefile -- defines make targets
 |- README.md -- main documentation entrypoint
 |- orioledb.control -- extension control file
-|- stopevents.txt -- list of "stop event"
-|- stopevents_gen.py -- generates include/utils/stopevents_(defs|data).h from stopevents.txt
-|- typedefs_gen.py -- generates list of C-symbols in orioledb.so to orioledb.typedefs
+|- stopevents.txt -- list of "stop events"
 |- valgrind.supp -- suppression rules for valgrind checks
 
 ```
@@ -64,6 +73,8 @@ types of concurrency errors.
 - `testgrescheck_part_1` -- first half of testgres checks. Testgres tests are
   split into two nearly equal halves to avoid overly long individual CI runs.
 - `testgrescheck_part_2` -- second half of testgres checks.
+- `testgrescheck_part_3` -- testgres checks that the Valgrind CI jobs skip,
+  usually because they take too long under Valgrind.
 - `installcheck` -- run all types of tests when installed using the PostgreSQL
   extension system (`USE_PGXS=1`).
 - `check` -- run all types of tests when installed from the `contrib` folder of
@@ -125,7 +136,7 @@ OrioleDB has 3 groups of tests described below.
   conjunction with stop events.
 
 - Python [testgres](https://pypi.org/project/testgres/) tests are located in
-  `t`. These are the most powerful and complex tests. Additionally to the
+  `t`. These are the most powerful and complex tests. In addition to the
   ability to simulate multiple simultaneous connections, they can perform
   actions with the whole PostgreSQL instance such as start, stop, backup,
   replication, etc. See the [testgres
@@ -143,7 +154,7 @@ OrioleDB uses GitHub CI. The CI workflows are described below.
 ### `check.yml`
 
 This workflow runs the following tests for each of the two compilers (gcc and
-clang) and each of the supported PostgreSQL major versions (16 and 17).
+clang) and each of the supported PostgreSQL major versions (16, 17 and 18).
 
 - `normal` -- run tests without asserts and without debug symbols.
 - `debug` -- run tests with asserts and with debug symbols.
@@ -159,7 +170,13 @@ clang) and each of the supported PostgreSQL major versions (16 and 17).
   `testgrescheck_part_1` under valgrind with asserts and with debug symbols.
 - `valgrind_2` -- runs `testgrescheck_part_2` under Valgrind with asserts and
   with debug symbols.
-- `static` -- runs `clang-analyzer` or `cppcheck` over sources.
+- `pg_tests` -- runs PostgreSQL's own regression, isolation and subscription
+  tests, then runs the regression and isolation tests again with
+  `default_table_access_method = 'orioledb'` (on PostgreSQL 17 and 18 also the
+  subscription and recovery tests).
+- `dm_log_writes` -- runs `test/t/recovery_test.py` on a `dm-log-writes`
+  device, so that a simulated crash also loses writes that were still in the
+  OS page cache.
 
 ### `docker.yml`
 
@@ -229,6 +246,6 @@ At the C level, the following macros are provided for managing stop events.
   without stopping the execution. Used for error simulation.
 
 The list of stop events is defined in `stopevents.txt` file. The
-`stopevents_gen.py` script generates `include/utils/stopevents_defs.h` (macros)
+`scripts/dev/stopevents_gen.py` script generates `include/utils/stopevents_defs.h` (macros)
 and `include/utils/stopevents_data.h` (name strings) files with C definitions of
 the stop events list.

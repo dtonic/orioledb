@@ -149,30 +149,30 @@ static List *prevLogicalXids = NIL; /* stack of PrevLogicalXidEntry for all
 									 * restore and release */
 
 /*
- * Logical xid of a released (committed) subtransaction, held until the
- * transaction can no longer need it.
- *
- * The decoder keeps a released subtransaction's changes in the reorder buffer
- * under its logical xid until the top-level commit.  Returning that xid to the
- * shared bitmap at RELEASE lets the next savepoint -- of this transaction or
- * of any other -- acquire the same number, and the decoder then mixes both
- * subtransactions under one reorder buffer entry: a later ROLLBACK TO the
- * new savepoint discards the released changes too, and another transaction
- * reusing it gets its changes attributed to this one.
- *
- * 'owner' is the subtransaction the released one now belongs to.  It moves up
- * as enclosing subtransactions are released, and when the owner itself rolls
- * back, its rollback record has already told the decoder to discard the held
- * xids (see the WAL_REC_ROLLBACK_TO_SAVEPOINT decoder), so they are given back
- * then.  Everything left is given back with the top-level transaction.
+ * Logical xid of a released subtransaction and the subtransaction it was
+ * released into.
  */
 typedef struct
 {
 	TransactionId xid;
-	SubTransactionId owner;
-} ReleasedLogicalXidEntry;
+	SubTransactionId parentSubid;
+} ReleasedLogicalXid;
 
-static List *releasedLogicalXids = NIL;
+/*
+ * ReleasedLogicalXid entries, freed at the top-level end.  The decoder keeps
+ * a released subtransaction's changes under its xid up to the top-level
+ * commit, so no other subtransaction may get that xid before.  Rolled back
+ * subtransactions don't need this: the decoder drops them at ROLLBACK TO.
+ * Neither do released ones whose enclosing savepoint is rolled back: see
+ * log_released_xids_abort().
+ *
+ * Entries are in release order, and nAbortLoggedXids counts the ones at the
+ * end whose abort log_released_xids_abort() has just logged.
+ */
+static ReleasedLogicalXid *releasedLogicalXids = NULL;
+static int	nReleasedLogicalXids = 0;
+static int	maxReleasedLogicalXids = 0;
+static int	nAbortLoggedXids = 0;
 
 /*
  * Check whether the top of prevLogicalXids was pushed by the subtransaction
@@ -565,24 +565,21 @@ acquire_logical_xid(bool *isValidHeapXid)
 }
 
 static void
-release_logical_xid(LogicalXidCtx *ctx)
+release_logical_xid(TransactionId xid)
 {
-	uint32		itemsCount = 0,
-				mynum = 0;
+	uint32		itemsCount;
+	uint32		mynum;
 	uint32		value PG_USED_FOR_ASSERTS_ONLY;
 
-	if (ctx)
-	{
-		itemsCount = logical_xid_buffers_guc * (BLCKSZ / sizeof(pg_atomic_uint32));
-		mynum = ctx->xid % (itemsCount * 32);
+	Assert(TransactionIdIsNormal(xid));
 
-		Assert(TransactionIdIsNormal(ctx->xid));
+	itemsCount = logical_xid_buffers_guc * (BLCKSZ / sizeof(pg_atomic_uint32));
+	mynum = xid % (itemsCount * 32);
 
-		value = pg_atomic_fetch_and_u32(&logicalXidsShmemMap[mynum / 32],
-										~(1 << (mynum % 32)));
+	value = pg_atomic_fetch_and_u32(&logicalXidsShmemMap[mynum / 32],
+									~(1 << (mynum % 32)));
 
-		Assert((value & (1 << (mynum % 32))) != 0);
-	}
+	Assert((value & (1 << (mynum % 32))) != 0);
 }
 
 static TransactionId
@@ -690,55 +687,6 @@ assign_subtransaction_logical_xid(SubTransactionId mySubid)
 }
 
 static void
-hold_released_logical_xid(TransactionId xid, SubTransactionId owner)
-{
-	ReleasedLogicalXidEntry *entry;
-	MemoryContext mcxt;
-
-	mcxt = MemoryContextSwitchTo(TopMemoryContext);
-	entry = (ReleasedLogicalXidEntry *) palloc(sizeof(ReleasedLogicalXidEntry));
-	entry->xid = xid;
-	entry->owner = owner;
-	releasedLogicalXids = lappend(releasedLogicalXids, entry);
-	MemoryContextSwitchTo(mcxt);
-	elog(DEBUG4, "HOLD released logical xid %u owner subid %u", xid, owner);
-}
-
-/*
- * The subtransaction 'subid' ended.  On release, the xids it held now belong
- * to its parent.  On rollback, they are given back if 'giveBack' (the
- * rollback record that makes the decoder discard them is in the WAL),
- * otherwise kept up to the top-level end.
- */
-static void
-pass_released_logical_xids(SubTransactionId subid, SubTransactionId parentSubid,
-						   bool giveBack)
-{
-	ListCell   *lc;
-
-	foreach(lc, releasedLogicalXids)
-	{
-		ReleasedLogicalXidEntry *entry = (ReleasedLogicalXidEntry *) lfirst(lc);
-
-		if (entry->owner != subid)
-			continue;
-
-		if (giveBack)
-		{
-			LogicalXidCtx ctx = {entry->xid, false};
-
-			elog(DEBUG4, "GIVE BACK released logical xid %u owner subid %u",
-				 entry->xid, subid);
-			release_logical_xid(&ctx);
-			pfree(entry);
-			releasedLogicalXids = foreach_delete_current(releasedLogicalXids, lc);
-		}
-		else
-			entry->owner = parentSubid;
-	}
-}
-
-static void
 setup_prev_logical_xid_ctx(SubTransactionId mySubid)
 {
 	PrevLogicalXidEntry *entry;
@@ -761,6 +709,93 @@ setup_prev_logical_xid_ctx(SubTransactionId mySubid)
 	prevLogicalXids = list_delete_last(prevLogicalXids);
 }
 
+/*
+ * Log an abort for every subtransaction released inside the rolled back
+ * subtransaction subid.  The decoder keeps them as children of the top-level
+ * transaction, so the rollback record of subid alone leaves their changes in
+ * place.  PostgreSQL lists such children in the abort record of subid.
+ *
+ * Subids grow within a transaction.  A subtransaction released while subid
+ * was open started after it, so its parent subid is subid or later.  One
+ * released before subid started has an earlier parent.
+ *
+ * Call it before the rollback record of subid, which flushes these records.
+ */
+void
+log_released_xids_abort(SubTransactionId subid)
+{
+	int			i;
+
+	for (i = nReleasedLogicalXids; i > 0; i--)
+	{
+		if (releasedLogicalXids[i - 1].parentSubid < subid)
+			break;
+
+		add_subxact_abort_wal_record(releasedLogicalXids[i - 1].xid);
+	}
+
+	nAbortLoggedXids = nReleasedLogicalXids - i;
+}
+
+/*
+ * Free the xids whose abort records log_released_xids_abort() wrote.  A
+ * freed xid can go to another backend only after those records are in
+ * XLOG: the decoder must see our abort before that backend's changes under
+ * the same xid.  The rollback record written in between flushes them.
+ */
+static void
+free_abort_logged_xids(void)
+{
+	while (nAbortLoggedXids > 0)
+	{
+		release_logical_xid(releasedLogicalXids[nReleasedLogicalXids - 1].xid);
+		nReleasedLogicalXids--;
+		nAbortLoggedXids--;
+	}
+}
+
+/*
+ * Keep the logical xid of a subtransaction released into parentSubid up to
+ * the top-level end.
+ *
+ * Without logical decoding no decoder buffers changes under the xid, so give
+ * it back at once: the bitmap it comes from is shared by the whole cluster,
+ * and one long transaction would starve every other session.  The same in
+ * recovery: no abort record can be written there for the xids kept.
+ */
+static void
+retain_released_logical_xid(TransactionId xid, SubTransactionId parentSubid)
+{
+	if (!XLogLogicalInfoActive() || RecoveryInProgress())
+	{
+		release_logical_xid(xid);
+		return;
+	}
+
+	if (nReleasedLogicalXids >= maxReleasedLogicalXids)
+	{
+		int			newmax = Max(maxReleasedLogicalXids * 2, 16);
+		Size		newsize = newmax * sizeof(ReleasedLogicalXid);
+
+		if (releasedLogicalXids == NULL)
+		{
+			releasedLogicalXids = (ReleasedLogicalXid *)
+				MemoryContextAlloc(TopMemoryContext, newsize);
+		}
+		else
+		{
+			releasedLogicalXids = (ReleasedLogicalXid *)
+				repalloc(releasedLogicalXids, newsize);
+		}
+
+		maxReleasedLogicalXids = newmax;
+	}
+
+	releasedLogicalXids[nReleasedLogicalXids].xid = xid;
+	releasedLogicalXids[nReleasedLogicalXids].parentSubid = parentSubid;
+	nReleasedLogicalXids++;
+}
+
 void
 oxid_subxact_callback(
 					  SubXactEvent event, SubTransactionId mySubid,
@@ -768,6 +803,11 @@ oxid_subxact_callback(
 {
 	TransactionId heapXid;
 
+	/*
+	 * The released xid bookkeeping below belongs to the outer transaction: no
+	 * subtransaction starts inside an autonomous one, see
+	 * undo_subxact_callback().
+	 */
 	switch (event)
 	{
 		case SUBXACT_EVENT_COMMIT_SUB:
@@ -782,22 +822,11 @@ oxid_subxact_callback(
 					 * belongs to the whole transaction and must survive up to
 					 * the top-level commit record.
 					 */
-					/* What this subtransaction held now belongs to its parent */
-					pass_released_logical_xids(mySubid, parentSubid, false);
-
 					if (TransactionIdIsValid(logicalXidContext.xid) &&
 						prev_logical_xid_pushed_by(mySubid))
 					{
-						/*
-						 * The decoder still holds this subtransaction's
-						 * changes under its logical xid, so it may not be
-						 * acquired again before the transaction ends.
-						 */
-						if (RecoveryInProgress())
-							release_logical_xid(&logicalXidContext);
-						else
-							hold_released_logical_xid(logicalXidContext.xid,
-													  parentSubid);
+						retain_released_logical_xid(logicalXidContext.xid,
+													parentSubid);
 
 						heapXid = GetTopTransactionIdIfAny();
 						if (TransactionIdIsValid(heapXid))
@@ -845,6 +874,9 @@ oxid_subxact_callback(
 
 		case SUBXACT_EVENT_ABORT_SUB:
 			{
+				/* undo_subxact_callback() has flushed the abort records */
+				free_abort_logged_xids();
+
 				if (have_retained_undo_location())
 				{
 					if (TransactionIdIsValid(logicalXidContext.xid))
@@ -872,24 +904,13 @@ oxid_subxact_callback(
 							 * top-level commit record.
 							 */
 							if (prev_logical_xid_pushed_by(mySubid))
-								release_logical_xid(&logicalXidContext);
-
-							/*
-							 * undo_subxact_callback() has written the
-							 * rollback record, which makes the decoder
-							 * discard the released subtransactions under this
-							 * one as well, so their xids can be given back.
-							 */
-							pass_released_logical_xids(mySubid, parentSubid, true);
+								release_logical_xid(logicalXidContext.xid);
 
 							setup_prev_logical_xid_ctx(mySubid);
 							break;
 						}
 					}
 				}
-
-				/* No rollback record: keep them up to the top-level end */
-				pass_released_logical_xids(mySubid, parentSubid, false);
 
 				break;
 			}
@@ -1999,7 +2020,7 @@ get_current_oxid(void)
 			Assert(pg_atomic_read_u64(&xidBuffer[newOxid % xid_circular_buffer_size].csn) == COMMITSEQNO_FROZEN);
 
 			/*
-			 * Write commitPtr first because write_xidmap() takes csn into
+			 * Write commitPtr first because write_xidsmap() takes csn into
 			 * account
 			 */
 			pg_atomic_write_u64(&xidBuffer[newOxid % xid_circular_buffer_size].commitPtr,
@@ -2065,12 +2086,10 @@ set_current_oxid(OXid oxid)
 void
 set_current_logical_xid(LogicalXidCtx *in)
 {
-	if (in)
-	{
-		Assert(!TransactionIdIsValid(logicalXidContext.xid));
-		logicalXidContext.xid = in->xid;
-		logicalXidContext.useHeap = in->useHeap;
-	}
+	Assert(in);
+	Assert(!TransactionIdIsValid(logicalXidContext.xid));
+	logicalXidContext.xid = in->xid;
+	logicalXidContext.useHeap = in->useHeap;
 }
 
 void
@@ -2112,11 +2131,9 @@ get_current_logical_xid(void)
 void
 get_current_logical_xid_ctx(LogicalXidCtx *output)
 {
-	if (output)
-	{
-		output->xid = logicalXidContext.xid;
-		output->useHeap = logicalXidContext.useHeap;
-	}
+	Assert(output);
+	output->xid = logicalXidContext.xid;
+	output->useHeap = logicalXidContext.useHeap;
 }
 
 void
@@ -2181,7 +2198,7 @@ release_assigned_logical_xids(void)
 {
 	if (TransactionIdIsValid(logicalXidContext.xid))
 	{
-		release_logical_xid(&logicalXidContext);
+		release_logical_xid(logicalXidContext.xid);
 		reset_logical_xid_ctx();
 	}
 
@@ -2189,17 +2206,7 @@ release_assigned_logical_xids(void)
 	{
 		ListCell   *lc = NULL;
 		PrevLogicalXidEntry *entry = NULL;
-
-		foreach(lc, releasedLogicalXids)
-		{
-			ReleasedLogicalXidEntry *released = lfirst(lc);
-			LogicalXidCtx ctx = {released->xid, false};
-
-			release_logical_xid(&ctx);
-			pfree(released);
-		}
-		list_free(releasedLogicalXids);
-		releasedLogicalXids = NIL;
+		int			i;
 
 		foreach(lc, prevLogicalXids)
 		{
@@ -2208,12 +2215,23 @@ release_assigned_logical_xids(void)
 			{
 				/* Entries saved before the first assignment hold no xid */
 				if (TransactionIdIsValid(entry->ctx.xid))
-					release_logical_xid(&entry->ctx);
+					release_logical_xid(entry->ctx.xid);
 				pfree(entry);
 			}
 		}
 		list_free(prevLogicalXids);
 		prevLogicalXids = NIL;
+
+		for (i = 0; i < nReleasedLogicalXids; i++)
+			release_logical_xid(releasedLogicalXids[i].xid);
+
+		if (releasedLogicalXids != NULL)
+			pfree(releasedLogicalXids);
+
+		releasedLogicalXids = NULL;
+		nReleasedLogicalXids = 0;
+		maxReleasedLogicalXids = 0;
+		nAbortLoggedXids = 0;
 	}
 }
 
@@ -2333,7 +2351,7 @@ current_oxid_clear_committing(void)
 }
 
 /*
- * Gets csn for given oxid.  Wrapper over map_oxid_csn(), which loops
+ * Gets csn for given oxid.  Wrapper over map_oxid(), which loops
  * till "committing bit" is not set.
  * If getRawCsn is true outputs raw csn, otherwise clears COMMITSEQNO_RETAINED_FOR_REWIND flag.
  */
@@ -2372,7 +2390,7 @@ oxid_get_csn(OXid oxid, bool getRawCsn)
 }
 
 /*
- * Gets commit ptr for given oxid.  Wrapper over map_oxid_xlog_ptr(), which
+ * Gets commit ptr for given oxid.  Wrapper over map_oxid(), which
  * loops till "committing bit" is not set.
  */
 XLogRecPtr
@@ -2408,7 +2426,7 @@ oxid_get_xlog_ptr(OXid oxid)
 }
 
 /*
- * Gets csn for given oxid.  Wrapper over map_oxid_csn(), which loops
+ * Gets csn for given oxid.  Wrapper over map_oxid(), which loops
  * till "committing bit" is not set.
  */
 void

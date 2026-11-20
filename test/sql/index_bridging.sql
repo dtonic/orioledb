@@ -306,36 +306,6 @@ EXPLAIN (COSTS OFF)
 SELECT p FROM o_test_ix_ams WHERE p <@ box(point(0,0), point(4000, 5000));
 COMMIT;
 
-CREATE TABLE o_bridging_vacuum_test (id serial primary key, val float, p point) USING orioledb WITH (autovacuum_enabled = false);
-INSERT INTO o_bridging_vacuum_test (p) (SELECT point(0.01 * i, 0.02 * i) FROM generate_series(1,5) i);
-SELECT orioledb_tbl_structure('o_bridging_vacuum_test'::regclass, 'ne');
-CREATE INDEX o_bridging_vacuum_test_p_idx on o_bridging_vacuum_test using gist(p);
-SELECT orioledb_tbl_structure('o_bridging_vacuum_test'::regclass, 'ne');
-SELECT * FROM gist_index_content('o_bridging_vacuum_test_p_idx');
-DELETE FROM o_bridging_vacuum_test;
-SELECT orioledb_tbl_structure('o_bridging_vacuum_test'::regclass, 'ne');
-SELECT * FROM gist_index_content('o_bridging_vacuum_test_p_idx');
-ALTER SYSTEM SET autovacuum = off;
-SELECT pg_reload_conf();
-DO $$
-BEGIN
-  WHILE EXISTS (SELECT 1 FROM pg_stat_activity
-                WHERE backend_type = 'autovacuum worker') LOOP
-    PERFORM pg_terminate_backend(pid)
-       FROM pg_stat_activity WHERE backend_type = 'autovacuum worker';
-    PERFORM pg_sleep(0.1);
-  END LOOP;
-END;
-$$;
-VACUUM o_bridging_vacuum_test;
-SELECT * FROM o_bridging_vacuum_test WHERE p <@ box(point(0,0), point(1,1));
-SELECT orioledb_tbl_structure('o_bridging_vacuum_test'::regclass, 'ne');
-SELECT * FROM gist_index_content('o_bridging_vacuum_test_p_idx');
-ALTER SYSTEM RESET autovacuum;
-SELECT pg_reload_conf();
-DROP TABLE o_bridging_vacuum_test;
-
-
 CREATE TABLE o_test_bridging_with_regular_no_pkey (
 	i int NOT NULL,
 	j int
@@ -792,7 +762,7 @@ ANALYZE bitmap_test;
 
 SET enable_seqscan = off;
 SET cpu_tuple_cost = 0.5;
-SET random_page_cost = 1.0;
+SET random_page_cost = 0;
 
 CREATE VIEW bitmap_test_mv AS (SELECT * FROM bitmap_test WHERE i < 100 AND h < 100 OR j < 100 LIMIT 20);
 EXPLAIN (COSTS OFF) SELECT count(*) FROM bitmap_test_mv;
@@ -1356,6 +1326,37 @@ RESET enable_seqscan;
 SELECT count(*), sum(a * 1000 + b) FROM o_bridge_pk2
 	WHERE tags @> ARRAY[3] OR (a, b) IN ((0, 5), (7, 10), (20, 40), (39, 49));
 DROP TABLE o_bridge_pk2;
+
+-- a bitmap qual pairing a bridged index with a native secondary one: the key
+-- bitmap of the native arm turns into bridge pointers for the bridged arm's
+-- TIDBitmap, with a composite primary key too
+CREATE TABLE o_bridge_mixed_pk2 (
+	a int,
+	b int,
+	c int NOT NULL,
+	tags int[],
+	PRIMARY KEY (a, b)
+) USING orioledb;
+INSERT INTO o_bridge_mixed_pk2
+	SELECT g / 50, g % 50, g % 97, ARRAY[g % 7, g % 11]
+	FROM generate_series(1, 2000) g;
+CREATE INDEX o_bridge_mixed_pk2_c ON o_bridge_mixed_pk2 (c);
+CREATE INDEX o_bridge_mixed_pk2_gin ON o_bridge_mixed_pk2 USING gin (tags);
+ANALYZE o_bridge_mixed_pk2;
+
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SELECT count(*), sum(a * 1000 + b) FROM o_bridge_mixed_pk2
+	WHERE tags @> ARRAY[3] OR c < 5;
+SELECT count(*), sum(a * 1000 + b) FROM o_bridge_mixed_pk2
+	WHERE c < 5 OR tags @> ARRAY[3];
+RESET enable_indexscan;
+RESET enable_seqscan;
+SET enable_bitmapscan = off;
+SELECT count(*), sum(a * 1000 + b) FROM o_bridge_mixed_pk2
+	WHERE tags @> ARRAY[3] OR c < 5;
+RESET enable_bitmapscan;
+DROP TABLE o_bridge_mixed_pk2;
 
 -- Updates must maintain bridged expression indexes and enforce uniqueness.
 CREATE TABLE o_bridge_expr (

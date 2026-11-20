@@ -36,6 +36,7 @@
 
 #include "access/transam.h"
 #include "miscadmin.h"
+#include "port/pg_bitutils.h"
 #include "utils/inval.h"
 #include "utils/wait_event.h"
 
@@ -499,6 +500,7 @@ retry:
 		get_prev_leaf_header_and_tuple_from_undo(desc->undoType,
 												 &prev_header,
 												 &tuple,
+												 prev_tuplen,
 												 tuplen);
 		tuplen = o_btree_len(desc, tuple, OTupleLength);
 		itemlen = BTreeLeafTuphdrSize + MAXALIGN(tuplen);
@@ -607,7 +609,7 @@ retry:
 static Jsonb *
 undo_record_key_stopevent_params(BTreeOperationType action,
 								 BTreeDescr *desc,
-								 OTuple tuple, OXid oxid)
+								 OTuple tuple, bool isKey, OXid oxid)
 {
 	JsonbParseState *state = NULL;
 	Jsonb	   *res;
@@ -625,7 +627,7 @@ undo_record_key_stopevent_params(BTreeOperationType action,
 	jsonb_push_int8_key(&state, "oxid", oxid);
 	btree_desc_stopevent_params_internal(desc, &state);
 	jsonb_push_key(&state, "key");
-	if (action == BTreeOperationUpdate)
+	if (action == BTreeOperationUpdate && !isKey)
 	{
 		OTuple		key;
 		bool		allocated;
@@ -645,6 +647,11 @@ undo_record_key_stopevent_params(BTreeOperationType action,
 	return res;
 }
 
+static UndoLocation finish_undo_record(BTreeDescr *desc,
+									   BTreeModifyUndoStackItem *item,
+									   UndoLocation undoLocation,
+									   BTreeLeafTuphdr *curTupHdr);
+
 /*
  * Make undo record associated with give tuple and operation.
  */
@@ -657,7 +664,6 @@ make_undo_record(BTreeDescr *desc, OTuple tuple, bool is_tuple,
 	LocationIndex tuplelen;
 	BTreeModifyUndoStackItem *item;
 	LocationIndex size;
-	CommandId	commandId;
 	UndoLocation undoLocation;
 
 	if (action == BTreeOperationUpdate)
@@ -705,6 +711,20 @@ make_undo_record(BTreeDescr *desc, OTuple tuple, bool is_tuple,
 		Assert(!key_palloc);
 	}
 
+	return finish_undo_record(desc, item, undoLocation, curTupHdr);
+}
+
+/*
+ * Fill the header of the previous version in a new undo record, put the
+ * record on the undo stack, and return the location the tuple header of the
+ * version made by the operation should point to.
+ */
+static UndoLocation
+finish_undo_record(BTreeDescr *desc, BTreeModifyUndoStackItem *item,
+				   UndoLocation undoLocation, BTreeLeafTuphdr *curTupHdr)
+{
+	CommandId	commandId;
+
 	if (curTupHdr)
 	{
 		item->tuphdr.xactInfo = curTupHdr->xactInfo;
@@ -724,6 +744,282 @@ make_undo_record(BTreeDescr *desc, OTuple tuple, bool is_tuple,
 		update_command_undo_location(commandId, undoLocation);
 
 	return undoLocation;
+}
+
+/*
+ * A fragment of BTreeUpdateDiffUndoStackItem, together with where its bytes
+ * start in the older version.
+ */
+typedef struct
+{
+	LocationIndex copy;
+	LocationIndex skip;
+	LocationIndex len;
+	LocationIndex offset;
+} UpdateDiffFragment;
+
+/*
+ * The most fragments an update diff is split into.  The last one takes
+ * whatever differs after the ones before.
+ */
+#define UPDATE_DIFF_MAX_FRAGMENTS	8
+
+/*
+ * Splitting a fragment around a run of equal bytes saves the run and costs a
+ * fragment header.
+ */
+#define UPDATE_DIFF_MIN_RUN			(O_UPDATE_DIFF_FRAGMENT_HEADER_SIZE + 1)
+
+/* The high bit of every nonzero byte of x */
+#define U64_NONZERO_BYTES(x) \
+	(((((x) & UINT64CONST(0x7F7F7F7F7F7F7F7F)) + \
+	   UINT64CONST(0x7F7F7F7F7F7F7F7F)) | (x)) & \
+	 UINT64CONST(0x8080808080808080))
+
+static inline uint64
+load_u64(const char *ptr)
+{
+	uint64		result;
+
+	memcpy(&result, ptr, sizeof(result));
+	return result;
+}
+
+/*
+ * Split the difference between the older version of a row and the newer one
+ * into fragments that rebuild the older version from the newer.
+ *
+ * The bytes both versions end with are left for the implicit copy after the
+ * last fragment.  Before them the versions are compared at equal offsets,
+ * which finds what an update of fixed-length fields changes, the tuple
+ * version included.  Once a field changes its length, the offsets drift
+ * apart and the rest up to the common ending goes to the last fragment.
+ *
+ * Returns the number of fragments and the number of bytes they carry, or -1
+ * once the fragments with their headers would take more than budget bytes.
+ */
+static int
+make_update_diff(Pointer oldData, LocationIndex oldLen,
+				 Pointer newData, LocationIndex newLen,
+				 int budget,
+				 UpdateDiffFragment *fragments, LocationIndex *bytesLen)
+{
+	LocationIndex suffix = 0,
+				minLen = Min(oldLen, newLen),
+				oldEnd,
+				newEnd,
+				common,
+				pos = 0;
+	int			n = 0,
+				cost = 0;
+
+	while (suffix + sizeof(uint64) <= minLen &&
+		   load_u64(oldData + oldLen - suffix - sizeof(uint64)) ==
+		   load_u64(newData + newLen - suffix - sizeof(uint64)))
+		suffix += sizeof(uint64);
+	while (suffix < minLen &&
+		   oldData[oldLen - suffix - 1] == newData[newLen - suffix - 1])
+		suffix++;
+	oldEnd = oldLen - suffix;
+	newEnd = newLen - suffix;
+	common = Min(oldEnd, newEnd);
+	*bytesLen = 0;
+
+	while (true)
+	{
+		LocationIndex start = pos,
+					diffStart,
+					next = common;
+
+		while (pos + sizeof(uint64) <= common &&
+			   load_u64(oldData + pos) == load_u64(newData + pos))
+			pos += sizeof(uint64);
+		while (pos < common && oldData[pos] == newData[pos])
+			pos++;
+		if (pos == common && oldEnd == newEnd)
+			break;
+
+		diffStart = pos;
+		cost += O_UPDATE_DIFF_FRAGMENT_HEADER_SIZE;
+		if (cost > budget)
+			return -1;
+
+		if (n < UPDATE_DIFF_MAX_FRAGMENTS - 1)
+		{
+			LocationIndex run = 0;
+
+			/*
+			 * A word at a time.  A run of UPDATE_DIFF_MIN_RUN equal bytes
+			 * that doesn't cover a whole word touches one of its ends, so the
+			 * equal bytes at both ends say all about the runs.  The bytes
+			 * before the current run go to this fragment whatever comes next,
+			 * which is what bounds its cost.
+			 */
+			while (pos + sizeof(uint64) <= common)
+			{
+				uint64		x = load_u64(oldData + pos) ^ load_u64(newData + pos);
+				uint64		differ;
+				int			low,
+							high;
+
+				if (x == 0)
+				{
+					run += sizeof(uint64);
+					pos += sizeof(uint64);
+					if (run >= UPDATE_DIFF_MIN_RUN)
+					{
+						next = pos - run;
+						break;
+					}
+					continue;
+				}
+
+				differ = U64_NONZERO_BYTES(x);
+#ifdef WORDS_BIGENDIAN
+				low = (63 - pg_leftmost_one_pos64(differ)) >> 3;
+				high = pg_rightmost_one_pos64(differ) >> 3;
+#else
+				low = pg_rightmost_one_pos64(differ) >> 3;
+				high = (63 - pg_leftmost_one_pos64(differ)) >> 3;
+#endif
+				if (run + low >= UPDATE_DIFF_MIN_RUN)
+				{
+					next = pos - run;
+					break;
+				}
+				if (high >= UPDATE_DIFF_MIN_RUN)
+				{
+					next = pos + sizeof(uint64) - high;
+					break;
+				}
+				run = high;
+				pos += sizeof(uint64);
+				if (cost + (pos - run - diffStart) > budget)
+					return -1;
+			}
+
+			for (; next == common && pos < common; pos++)
+			{
+				if (oldData[pos] != newData[pos])
+					run = 0;
+				else if (++run >= UPDATE_DIFF_MIN_RUN)
+					next = pos + 1 - run;
+			}
+		}
+
+		fragments[n].copy = diffStart - start;
+		fragments[n].offset = diffStart;
+		if (next == common)
+		{
+			/* The last fragment, up to the common ending */
+			fragments[n].skip = newEnd - diffStart;
+			fragments[n].len = oldEnd - diffStart;
+			*bytesLen += fragments[n].len;
+			cost += fragments[n].len;
+			n++;
+			if (cost > budget)
+				return -1;
+			break;
+		}
+		fragments[n].skip = next - diffStart;
+		fragments[n].len = next - diffStart;
+		*bytesLen += fragments[n].len;
+		cost += fragments[n].len;
+		n++;
+		if (cost > budget)
+			return -1;
+		pos = next;
+	}
+
+	return n;
+}
+
+/*
+ * Make the undo record of an update replacing oldTuple with newTuple.  In the
+ * row-level undo log the record keeps only the difference from newTuple when
+ * that is shorter, see BTreeUpdateDiffUndoStackItem.
+ */
+UndoLocation
+make_update_undo_record(BTreeDescr *desc, OTuple oldTuple, OTuple newTuple,
+						OInMemoryBlkno blkno, uint32 pageChangeCount,
+						BTreeLeafTuphdr *curTupHdr)
+{
+	UpdateDiffFragment fragments[UPDATE_DIFF_MAX_FRAGMENTS];
+	BTreeUpdateDiffUndoStackItem *item;
+	LocationIndex oldLen,
+				newLen,
+				keyLen,
+				bytesLen,
+				size;
+	UndoLocation undoLocation;
+	OTuple		key;
+	bool		key_palloc = false;
+	Pointer		ptr;
+	int			nfragments,
+				budget,
+				i;
+
+	if (desc->undoType != UndoLogRegular)
+		return make_undo_record(desc, oldTuple, true, BTreeOperationUpdate,
+								blkno, pageChangeCount, curTupHdr);
+
+	oldLen = o_btree_len(desc, oldTuple, OTupleLength);
+	newLen = o_btree_len(desc, newTuple, OTupleLength);
+	keyLen = o_btree_len(desc, oldTuple, OTupleKeyLength);
+
+	/* What the fragments may take for the record to be shorter */
+	budget = (int) MAXALIGN(sizeof(BTreeModifyUndoStackItem) + oldLen) -
+		MAXIMUM_ALIGNOF - (int) sizeof(BTreeUpdateDiffUndoStackItem) -
+		(int) keyLen;
+	nfragments = budget < 0 ? -1 :
+		make_update_diff(oldTuple.data, oldLen, newTuple.data, newLen,
+						 budget, fragments, &bytesLen);
+	if (nfragments < 0)
+		return make_undo_record(desc, oldTuple, true, BTreeOperationUpdate,
+								blkno, pageChangeCount, curTupHdr);
+
+	size = sizeof(BTreeUpdateDiffUndoStackItem) + keyLen +
+		nfragments * O_UPDATE_DIFF_FRAGMENT_HEADER_SIZE + bytesLen;
+	Assert(MAXALIGN(size) < MAXALIGN(sizeof(BTreeModifyUndoStackItem) + oldLen));
+
+	item = (BTreeUpdateDiffUndoStackItem *) get_undo_record(desc->undoType,
+															&undoLocation,
+															MAXALIGN(size));
+	memset(item, 0, sizeof(*item));
+	item->base.header.itemSize = size;
+	item->base.header.type = UpdateDiffUndoItemType;
+	item->base.header.indexType = desc->type;
+	item->base.action = BTreeOperationUpdate;
+	item->base.blkno = blkno;
+	item->base.pageChangeCount = pageChangeCount;
+	item->base.oids = desc->oids;
+	item->base.tuphdr.formatFlags = oldTuple.formatFlags;
+	item->newTupleLen = newLen;
+	item->tupleLen = oldLen;
+	item->keyLen = keyLen;
+
+	ptr = (Pointer) item + sizeof(BTreeUpdateDiffUndoStackItem);
+	memset(ptr, 0, keyLen);
+	key = o_btree_tuple_make_key(desc, oldTuple, ptr, true, &key_palloc);
+	Assert(!key_palloc);
+	item->keyFormatFlags = key.formatFlags;
+	ptr += keyLen;
+
+	for (i = 0; i < nfragments; i++)
+	{
+		LocationIndex header[3];
+
+		header[0] = fragments[i].copy;
+		header[1] = fragments[i].skip;
+		header[2] = fragments[i].len;
+		memcpy(ptr, header, sizeof(header));
+		ptr += sizeof(header);
+		memcpy(ptr, oldTuple.data + fragments[i].offset, fragments[i].len);
+		ptr += fragments[i].len;
+	}
+	Assert(ptr == (Pointer) item + size);
+
+	return finish_undo_record(desc, &item->base, undoLocation, curTupHdr);
 }
 
 /*
@@ -819,7 +1115,7 @@ modify_undo_callback(UndoLogType undoType, UndoLocation location,
 				nonLockTupHdr;
 	UndoLocation nonLockUndoLocation;
 	OBTreeFindPageContext context;
-	BTreeKeyType keyType = item->action == BTreeOperationUpdate ? BTreeKeyLeafTuple : BTreeKeyNonLeafKey;
+	BTreeKeyType keyType;
 	OFindPageResult findResult;
 	bool		undoReserved = false;
 
@@ -828,14 +1124,28 @@ modify_undo_callback(UndoLogType undoType, UndoLocation location,
 	if (!desc)
 		return;
 
-	tuple.formatFlags = item->tuphdr.formatFlags;
-	tuple.data = (Pointer) item + sizeof(BTreeModifyUndoStackItem);
+	if (item->header.type == UpdateDiffUndoItemType)
+	{
+		BTreeUpdateDiffUndoStackItem *diffItem = (BTreeUpdateDiffUndoStackItem *) item;
+
+		/* The record holds the key of the row and a difference */
+		tuple.formatFlags = diffItem->keyFormatFlags;
+		tuple.data = (Pointer) diffItem + sizeof(BTreeUpdateDiffUndoStackItem);
+		keyType = BTreeKeyNonLeafKey;
+	}
+	else
+	{
+		tuple.formatFlags = item->tuphdr.formatFlags;
+		tuple.data = (Pointer) item + sizeof(BTreeModifyUndoStackItem);
+		keyType = item->action == BTreeOperationUpdate ? BTreeKeyLeafTuple : BTreeKeyNonLeafKey;
+	}
 
 	if (STOPEVENTS_ENABLED())
 	{
 		Jsonb	   *params = undo_record_key_stopevent_params(item->action,
-															  desc,
-															  tuple, oxid);
+															  desc, tuple,
+															  keyType == BTreeKeyNonLeafKey,
+															  oxid);
 
 		STOPEVENT(STOPEVENT_APPLY_UNDO, params);
 	}
@@ -986,7 +1296,8 @@ lock_undo_callback(UndoLogType undoType, UndoLocation location,
 	if (STOPEVENTS_ENABLED())
 	{
 		Jsonb	   *params = undo_record_key_stopevent_params(BTreeOperationLock,
-															  desc, key, oxid);
+															  desc, key, true,
+															  oxid);
 
 		STOPEVENT(STOPEVENT_APPLY_UNDO, params);
 	}
@@ -1383,14 +1694,27 @@ btree_relnode_undo_callback(UndoLogType undoType, UndoLocation location,
 	{
 		ORelOids	oids = {datoid, reloid, dropRelnode};
 		bool		recovery = is_recovery_in_progress();
+
+		/*
+		 * Skip the non-checkpoint relation lock during abort.  It uses
+		 * LOCKTAG_RELATION, the same lock space as PG's standard relation
+		 * locks.  During abort the virtualxid is still held (released later
+		 * by ResourceOwnerRelease), so a backend waiting for our virtualxid
+		 * while holding a conflicting relation lock creates a deadlock that
+		 * PG's detector resolves by raising ERROR inside our abort handler,
+		 * crashing the backend.  Safe to skip: the dropped relnode was never
+		 * committed, so no concurrent reader can depend on it.
+		 */
+		bool		need_rel_lock = !recovery &&
+			stage != OUndoCallbackStageAbort;
 		int			i;
 
-		if (!recovery)
+		if (need_rel_lock)
 			o_tables_rel_lock_exclusive_no_inval_no_log(&oids);
 		o_tables_rel_lock_extended_no_inval(&oids, AccessExclusiveLock, true);
 		CacheInvalidateRelcacheByDbidRelid(oids.datoid, oids.reloid);
 		o_invalidate_oids(oids);
-		if (!recovery)
+		if (need_rel_lock)
 			o_tables_rel_unlock_extended(&oids, AccessExclusiveLock, false);
 		o_tables_rel_unlock_extended(&oids, AccessExclusiveLock, true);
 
@@ -1398,7 +1722,7 @@ btree_relnode_undo_callback(UndoLogType undoType, UndoLocation location,
 		{
 			bool		dropBridgeMarker = false;
 
-			if (!recovery)
+			if (need_rel_lock)
 				o_tables_rel_lock_exclusive_no_inval_no_log(&dropTrees[i].oids);
 			o_tables_rel_lock_extended_no_inval(&dropTrees[i].oids,
 												AccessExclusiveLock, true);
@@ -1444,7 +1768,7 @@ btree_relnode_undo_callback(UndoLogType undoType, UndoLocation location,
 									dropTrees[i].oids.reloid == dropTrees[i].oids.relnode);
 			}
 			o_invalidate_oids(dropTrees[i].oids);
-			if (!recovery)
+			if (need_rel_lock)
 				o_tables_rel_unlock_extended(&dropTrees[i].oids, AccessExclusiveLock, false);
 			o_tables_rel_unlock_extended(&dropTrees[i].oids, AccessExclusiveLock, true);
 
@@ -2231,14 +2555,70 @@ clean_chain_has_locks_flag(UndoLogType undoType, UndoLocation location,
 
 
 /*
+ * Is a record whose mode does not conflict with ours the one the caller should
+ * judge the row by?  That is the newest version committed before our snapshot,
+ * or our own version.  A row lock is not a version at all.  An in-progress or
+ * aborted version of another transaction is not final either: a change that
+ * conflicts with us may lie below it.
+ */
+static inline bool
+nonconflicting_record_is_final(OTupleXactInfo xactInfo, CommitSeqNo csn,
+							   OXid my_oxid, CommitSeqNo my_csn)
+{
+	if (XACT_INFO_IS_LOCK_ONLY(xactInfo))
+		return false;
+	if (COMMITSEQNO_IS_NORMAL(csn) || COMMITSEQNO_IS_FROZEN(csn))
+		return csn < my_csn;
+	return COMMITSEQNO_IS_INPROGRESS(csn) &&
+		XACT_INFO_GET_OXID(xactInfo) == my_oxid;
+}
+
+/*
+ * Places the answer of a row_lock_conflicts() walk that ended where the undo
+ * does: gone, or below our snapshot's retain location, under which no
+ * transaction running when the snapshot was taken had written any undo.  If
+ * the walk passed no version of the row, every record it saw was a row lock,
+ * and the version under them was written by a transaction that had finished
+ * by then -- and committed, as an aborted one takes its version back.  The
+ * answer then says so, a version committed for everybody, rather than naming
+ * one of the locks.  The caller would judge the row by that lock: by the
+ * locker's csn, or, for a lock of our own, as a version our transaction
+ * wrote, which made an upsert skip the row it had just locked.
+ */
+static inline void
+chain_end_answer(BTreeLeafTuphdr *conflictTuphdr,
+				 UndoLocation *conflictUndoLocation,
+				 BTreeLeafTuphdr *finalTuphdr, UndoLocation finalUndoLocation,
+				 bool haveVersion)
+{
+	if (haveVersion)
+	{
+		*conflictTuphdr = *finalTuphdr;
+		*conflictUndoLocation = finalUndoLocation;
+		return;
+	}
+
+	*conflictTuphdr = *finalTuphdr;
+	conflictTuphdr->xactInfo = OXID_GET_XACT_INFO(BootstrapTransactionId,
+												  RowLockUpdate, false);
+	conflictTuphdr->undoLocation = InvalidUndoLocation;
+	conflictTuphdr->chainHasLocks = false;
+	*conflictUndoLocation = InvalidUndoLocation;
+}
+
+/*
  * Check for row-level lock conflict
  *
  * Returns true if lock conflict.  On lock conflict places the conflicting undo
  * record info *conflictTuphdr.
  *
- * Otherwise, places the first csn undo record info *conflictTuphdr.
- * If there is no such undo records, then *conflictTuphdr is set to
- * *pageTuphdr.
+ * Otherwise, places the version the caller should judge the row by into
+ * *conflictTuphdr: the newest version whose transaction is finished, when its
+ * mode conflicts with ours, or else the newest version committed before
+ * my_csn or written by us (see nonconflicting_record_is_final()).  Row locks
+ * are never versions.  If the walk ends before it finds that version, the
+ * newest version it passed is placed instead, or, if it passed none, a version
+ * committed for everybody (see chain_end_answer()).
  *
  * Lock-only undo records from committed and aborted transactions are removed.
  * Own lock-only undo records of the same or weaker level are removed.
@@ -2264,6 +2644,7 @@ row_lock_conflicts(BTreeLeafTuphdr *pageTuphdr,
 				finalUndoLocation;
 	UndoLocation retainedUndoLocation = get_snapshot_retained_undo_location(undoType);
 	bool		foundFinal;
+	bool		haveVersion;
 	bool		result = false;
 	LockChainLink curLink;
 	LockChainWalk walk = {InvalidUndoLocation};
@@ -2284,9 +2665,11 @@ row_lock_conflicts(BTreeLeafTuphdr *pageTuphdr,
 		CommitSeqNo csn = XACT_INFO_MAP_CSN(xactInfo);
 
 		xactIsFinished = !COMMITSEQNO_IS_INPROGRESS(csn);
-		xactIsFinal = (csn < my_csn);
+		xactIsFinal = nonconflicting_record_is_final(xactInfo, csn,
+													 my_oxid, my_csn);
 	}
-	foundFinal = xactIsFinal;
+	foundFinal = xactIsFinal && !XACT_INFO_IS_LOCK_ONLY(xactInfo);
+	haveVersion = !XACT_INFO_IS_LOCK_ONLY(xactInfo);
 	undoLocation = curTuphdr.undoLocation;
 
 	while (curTuphdr.chainHasLocks ||
@@ -2368,6 +2751,20 @@ row_lock_conflicts(BTreeLeafTuphdr *pageTuphdr,
 				*conflictUndoLocation = curUndoLocation;
 				result = true;
 			}
+
+			/*
+			 * A version of our own, at least as strong as what we ask for,
+			 * with no lock-only record below it: nothing further down can
+			 * change the answer.  Below are only older versions of ours and
+			 * whatever we found when we wrote the oldest of them, which then
+			 * conflicted with nothing in progress, or we would have waited.
+			 * Walking on would make every modification of a row our
+			 * transaction keeps modifying as slow as the chain is long.
+			 */
+			if (XACT_INFO_GET_OXID(xactInfo) == my_oxid &&
+				xactMode >= mode && ROW_LOCKS_CONFLICT(xactMode, mode) &&
+				!curTuphdr.chainHasLocks)
+				break;
 		}
 
 		if (delete_record && undoLocation >= retainedUndoLocation)
@@ -2380,18 +2777,6 @@ row_lock_conflicts(BTreeLeafTuphdr *pageTuphdr,
 						newLink = curLink;
 			LockChainWalk peek = walk;
 			UndoLocation prevLocation;
-			bool		deletedFinal;
-
-			/*
-			 * A finished locker whose mode conflicts with ours counts as the
-			 * final record.  But it is about to leave the chain, and it is
-			 * not a version of the row: the caller would judge the row by the
-			 * locker's csn.  The record it stood on is the candidate now.
-			 */
-			deletedFinal = foundFinal &&
-				finalUndoLocation == curUndoLocation &&
-				finalTuphdr.xactInfo == curTuphdr.xactInfo &&
-				finalTuphdr.undoLocation == curTuphdr.undoLocation;
 
 			prev_tuphdr = curTuphdr;
 			if (!lock_chain_step(undoType, &peek, &prev_tuphdr, &prevLink,
@@ -2412,10 +2797,9 @@ row_lock_conflicts(BTreeLeafTuphdr *pageTuphdr,
 					lastLockOnlyUndoLocation = InvalidUndoLocation;
 				}
 				if (!result)
-				{
-					*conflictTuphdr = finalTuphdr;
-					*conflictUndoLocation = finalUndoLocation;
-				}
+					chain_end_answer(conflictTuphdr, conflictUndoLocation,
+									 &finalTuphdr, finalUndoLocation,
+									 haveVersion);
 				return result;
 			}
 			newTuphdr = curTuphdr;
@@ -2472,12 +2856,6 @@ row_lock_conflicts(BTreeLeafTuphdr *pageTuphdr,
 													 curUndoLocation);
 
 			}
-
-			if (deletedFinal)
-			{
-				finalTuphdr = curTuphdr;
-				foundFinal = false;
-			}
 		}
 
 		if (!UndoLocationIsValid(undoLocation) ||
@@ -2497,10 +2875,9 @@ row_lock_conflicts(BTreeLeafTuphdr *pageTuphdr,
 			}
 
 			if (!result)
-			{
-				*conflictTuphdr = finalTuphdr;
-				*conflictUndoLocation = finalUndoLocation;
-			}
+				chain_end_answer(conflictTuphdr, conflictUndoLocation,
+								 &finalTuphdr, finalUndoLocation,
+								 haveVersion);
 			return result;
 		}
 
@@ -2522,10 +2899,9 @@ row_lock_conflicts(BTreeLeafTuphdr *pageTuphdr,
 								 &curUndoLocation, NULL))
 			{
 				if (!result)
-				{
-					*conflictTuphdr = finalTuphdr;
-					*conflictUndoLocation = finalUndoLocation;
-				}
+					chain_end_answer(conflictTuphdr, conflictUndoLocation,
+									 &finalTuphdr, finalUndoLocation,
+									 haveVersion);
 				return result;
 			}
 		}
@@ -2541,7 +2917,8 @@ row_lock_conflicts(BTreeLeafTuphdr *pageTuphdr,
 			CommitSeqNo csn = XACT_INFO_MAP_CSN(xactInfo);
 
 			xactIsFinished = !COMMITSEQNO_IS_INPROGRESS(csn);
-			xactIsFinal = (csn < my_csn);
+			xactIsFinal = nonconflicting_record_is_final(xactInfo, csn,
+														 my_oxid, my_csn);
 		}
 		undoLocation = curTuphdr.undoLocation;
 
@@ -2560,19 +2937,23 @@ row_lock_conflicts(BTreeLeafTuphdr *pageTuphdr,
 			lastLockOnlyUndoLocation = InvalidUndoLocation;
 		}
 
-		if (!foundFinal && xactIsFinal)
+		/*
+		 * Until the final record turns up, keep the newest version as the
+		 * answer, so a walk that ends early never returns a row lock.
+		 */
+		if (!foundFinal && !XACT_INFO_IS_LOCK_ONLY(xactInfo) &&
+			(xactIsFinal || !haveVersion))
 		{
 			finalTuphdr = curTuphdr;
 			finalUndoLocation = curUndoLocation;
-			foundFinal = true;
+			foundFinal = xactIsFinal;
+			haveVersion = true;
 		}
 	}
 
 	if (!result)
-	{
-		*conflictTuphdr = finalTuphdr;
-		*conflictUndoLocation = finalUndoLocation;
-	}
+		chain_end_answer(conflictTuphdr, conflictUndoLocation,
+						 &finalTuphdr, finalUndoLocation, haveVersion);
 	return result;
 }
 
@@ -2760,10 +3141,84 @@ get_prev_leaf_header_from_undo_if_exists(UndoLogType undoType,
 	return true;
 }
 
+/*
+ * Rebuild the version of the row in an update difference record from the
+ * version that replaced it.  See BTreeUpdateDiffUndoStackItem.
+ */
+static void
+apply_update_diff(BTreeUpdateDiffUndoStackItem *item,
+				  OTuple newTuple, LocationIndex newTupleLen,
+				  Pointer dest)
+{
+	LocationIndex diffLen,
+				newPos = 0,
+				pos = 0;
+	Pointer		ptr,
+				end;
+
+	if (unlikely(item->base.header.itemSize <
+				 sizeof(BTreeUpdateDiffUndoStackItem) + item->keyLen))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("corrupted undo record: item size %u does not fit a key of %u bytes and a difference",
+						(unsigned) item->base.header.itemSize,
+						(unsigned) item->keyLen)));
+	if (unlikely(item->newTupleLen != newTupleLen))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("corrupted undo record: difference from a tuple of %u bytes applied to a tuple of %u bytes",
+						(unsigned) item->newTupleLen,
+						(unsigned) newTupleLen)));
+
+	diffLen = item->base.header.itemSize -
+		sizeof(BTreeUpdateDiffUndoStackItem) - item->keyLen;
+	ptr = (Pointer) item + sizeof(BTreeUpdateDiffUndoStackItem) + item->keyLen;
+	end = ptr + diffLen;
+	while (ptr < end)
+	{
+		LocationIndex header[3];
+
+		if (end - ptr < sizeof(header))
+			break;
+		memcpy(header, ptr, sizeof(header));
+		ptr += sizeof(header);
+		if (end - ptr < header[2] ||
+			(uint32) newPos + header[0] + header[1] > newTupleLen ||
+			(uint32) pos + header[0] + header[2] > item->tupleLen)
+			break;
+		memcpy(dest + pos, newTuple.data + newPos, header[0]);
+		pos += header[0];
+		newPos += header[0] + header[1];
+		memcpy(dest + pos, ptr, header[2]);
+		pos += header[2];
+		ptr += header[2];
+	}
+
+	if (unlikely(ptr != end ||
+				 pos + (newTupleLen - newPos) != item->tupleLen))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("corrupted undo record: difference does not rebuild a tuple of %u bytes",
+						(unsigned) item->tupleLen)));
+	memcpy(dest + pos, newTuple.data + newPos, newTupleLen - newPos);
+}
+
+/*
+ * Step from the version of the row *tuphdr is the header of to the previous
+ * one: replace *tuphdr with the header of the previous version and *tuple
+ * with its data.
+ *
+ * *tuple, tupleLen bytes long, must be the version *tuphdr belongs to: an
+ * update record may hold only the difference from it.  With sizeAvailable
+ * zero, tuple->data is replaced with a palloc'd copy, and the old buffer
+ * stays the caller's.  Otherwise the previous version is written over
+ * tuple->data, which has room for sizeAvailable bytes.
+ */
 void
 get_prev_leaf_header_and_tuple_from_undo(UndoLogType undoType,
 										 BTreeLeafTuphdr *tuphdr,
 										 OTuple *tuple,
+										 LocationIndex tupleLen,
 										 LocationIndex sizeAvailable)
 {
 	BTreeModifyUndoStackItem item = {0};
@@ -2799,7 +3254,8 @@ get_prev_leaf_header_and_tuple_from_undo(UndoLogType undoType,
 			  tuphdr->undoLocation - offsetof(BTreeModifyUndoStackItem, tuphdr),
 			  sizeof(BTreeModifyUndoStackItem),
 			  (Pointer) &item);
-	Assert(item.header.type == ModifyUndoItemType);
+	Assert(item.header.type == ModifyUndoItemType ||
+		   item.header.type == UpdateDiffUndoItemType);
 	Assert(item.action == BTreeOperationUpdate);
 
 	*tuphdr = item.tuphdr;
@@ -2810,6 +3266,67 @@ get_prev_leaf_header_and_tuple_from_undo(UndoLogType undoType,
 		elog(PANIC,
 			 "corrupted undo chain: location " UINT64_FORMAT " links to non-decreasing location " UINT64_FORMAT,
 			 undoLocation, (UndoLocation) tuphdr->undoLocation);
+
+	if (item.header.type == UpdateDiffUndoItemType)
+	{
+		/* The whole record: header, key and difference */
+		union
+		{
+			BTreeUpdateDiffUndoStackItem item;
+			char		data[sizeof(BTreeUpdateDiffUndoStackItem) +
+							 O_BTREE_MAX_TUPLE_SIZE];
+		}			record;
+		BTreeUpdateDiffUndoStackItem *diffItem = &record.item;
+		UndoLocation itemLocation;
+
+		if (unlikely(item.header.itemSize < sizeof(BTreeUpdateDiffUndoStackItem) ||
+					 item.header.itemSize > sizeof(record)))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("corrupted undo record: update difference record of %u bytes",
+							(unsigned) item.header.itemSize)));
+
+		/* Read only what follows the part already read */
+		itemLocation = undoLocation - offsetof(BTreeModifyUndoStackItem, tuphdr);
+		memcpy(record.data, &item, sizeof(BTreeModifyUndoStackItem));
+		undo_read(undoType, itemLocation + sizeof(BTreeModifyUndoStackItem),
+				  item.header.itemSize - sizeof(BTreeModifyUndoStackItem),
+				  record.data + sizeof(BTreeModifyUndoStackItem));
+		tupleSize = diffItem->tupleLen;
+		if (unlikely(tupleSize > O_BTREE_MAX_TUPLE_SIZE))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("corrupted undo record: tuple size %u exceeds maximum %u",
+							(unsigned) tupleSize,
+							(unsigned) O_BTREE_MAX_TUPLE_SIZE)));
+		if (sizeAvailable != 0 && unlikely(tupleSize > sizeAvailable))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("corrupted undo record: tuple size %u exceeds available %u",
+							(unsigned) tupleSize, (unsigned) sizeAvailable)));
+
+		if (sizeAvailable == 0)
+		{
+			Pointer		dest = palloc(tupleSize);
+
+			apply_update_diff(diffItem, *tuple, tupleLen, dest);
+			tuple->data = dest;
+		}
+		else
+		{
+			char		buf[O_BTREE_MAX_TUPLE_SIZE];
+
+			/*
+			 * The previous version is written over the one it is rebuilt
+			 * from, in the page, where there is no memory to allocate.
+			 */
+			apply_update_diff(diffItem, *tuple, tupleLen, buf);
+			memcpy(tuple->data, buf, tupleSize);
+		}
+		tuple->formatFlags = tuphdr->formatFlags;
+		tuphdr->formatFlags = 0;
+		return;
+	}
 
 	tuple->formatFlags = tuphdr->formatFlags;
 	tupleSize = validate_undo_item_size(item.header.itemSize);
