@@ -470,7 +470,11 @@ class OrioledbS3ObjectLoader:
 			if self.local_wal:
 				self.download_rest_of_wal(control)
 			self.recover_from_bucket(int(control["Bytes per WAL segment"]))
+		# on disk before the token says the directory is whole: a host crash
+		# after the load must not leave a token over empty or cut files
+		sync_tree(self.data_dir)
 		self.write_token_file(root, manifest_body)
+		sync_tree(os.path.join(self.data_dir, 'orioledb_data'))
 
 	def sweep_orphans(self):
 		"""
@@ -1706,6 +1710,7 @@ class ReaderPin:
 		self.id = "loader-" + os.urandom(8).hex()
 		self.stop = Event()
 		self.put(chkp)
+		self.renewed = time.time()
 		retain = self.retain()
 		if chkp < retain:
 			self.remove()
@@ -1776,8 +1781,20 @@ class ReaderPin:
 		return kept
 
 	def renew(self):
+		# one failed renewal ended the thread, and the pin lapsed in a long
+		# load: keep trying, and say so
 		while not self.stop.wait(PIN_TTL / 3):
-			self.put(self.chkp)
+			try:
+				self.put(self.chkp)
+				self.renewed = time.time()
+			except Exception as e:
+				print(f"could not renew the loader's pin: {e}",
+				      file=sys.stderr, flush=True)
+
+	def check_held(self):
+		if time.time() - self.renewed >= PIN_TTL:
+			raise Exception("The loader's pin in the S3 bucket lapsed: the GC "
+			                f"may have removed objects of checkpoint {self.chkp}")
 
 	def release(self):
 		self.stop.set()
@@ -1793,12 +1810,32 @@ class ReaderPin:
 		reader_pin_and_check())."""
 		self.stop.set()
 		self.thread.join()
+		self.check_held()
 		self.put(self.chkp)
 		path = os.path.join(data_dir, READER_PIN_FILE)
 		tmp = f"{path}.tmp{os.getpid()}"
 		with open(tmp, 'w') as f:
 			f.write(f"{self.id} {self.chkp}\n")
 		os.replace(tmp, path)
+
+
+def sync_tree(top):
+	"""fsync every file under top, then every directory, deepest first."""
+	for path, dirs, files in os.walk(top, topdown=False):
+		for name in files:
+			full = os.path.join(path, name)
+			if os.path.islink(full) or not os.path.isfile(full):
+				continue
+			fd = os.open(full, os.O_RDONLY)
+			try:
+				os.fsync(fd)
+			finally:
+				os.close(fd)
+		fd = os.open(path, os.O_RDONLY)
+		try:
+			os.fsync(fd)
+		finally:
+			os.close(fd)
 
 
 XIDMAP_RANGE_ENCODED = 2**64 - 1

@@ -2574,6 +2574,8 @@ o_after_checkpoint_cleanup_hook(XLogRecPtr checkPointRedo, int flags)
 	 */
 	if (flags == 0)
 	{
+		s3_refuse_reader_end_of_recovery();
+
 		/*
 		 * After recovery, flush WAL_REC_ROLLBACK markers for in-flight oxids
 		 * that recovery_finish() aborted in memory, so streaming standbys can
@@ -2598,7 +2600,8 @@ o_after_checkpoint_cleanup_hook(XLogRecPtr checkPointRedo, int flags)
 		o_sys_caches_delete_by_lsn(checkPointRedo);
 	}
 
-	if (!orioledb_s3_mode)
+	/* only the lease holder writes checkpoints to the bucket */
+	if (!S3_WRITER_MODE)
 		return;
 
 	if (GetRecoveryState() != RECOVERY_STATE_DONE)

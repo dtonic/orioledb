@@ -115,6 +115,33 @@ class S3Test(S3BaseTest):
 		self.assertEqual(message,
 		                 'FATAL:  could not read "root" from the S3 bucket')
 
+	def test_s3_odd_file_names_go_up(self):
+		"""A file in the data directory goes up under its own name, whatever
+		characters it holds: unencoded in the URL, a space made curl refuse
+		it, and a '?' cut the name there, both retried for good while the
+		checkpoint waited."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.start()
+		node.safe_psql("CREATE EXTENSION orioledb;")
+		name = "odd name?x=1&y+z#%.txt"
+		# past the small files' bundle: an object of its own
+		content = b"odd" * 40000
+		with open(os.path.join(node.data_dir, name), 'wb') as f:
+			f.write(content)
+		done = []
+		checkpoint = Thread(
+		    target=lambda: done.append(node.safe_psql("CHECKPOINT;")))
+		checkpoint.start()
+		checkpoint.join(60)
+		self.assertTrue(done, "the checkpoint did not end")
+		keys = [k for k in self.all_keys('data/') if k.endswith('/' + name)]
+		self.assertTrue(keys, f"no object for {name!r}")
+		body = self.client.get_object(Bucket=self.bucket_name,
+		                              Key=keys[-1])['Body'].read()
+		self.assertEqual(content, body)
+		node.stop()
+
 	def test_s3_checkpoint(self):
 		node = self.node
 		node.append_conf(f"""
@@ -795,6 +822,30 @@ class S3Test(S3BaseTest):
 		self.assertLessEqual(max(sizes), 72)
 		node.stop()
 
+	def test_s3_start_refuses_a_writer_it_cannot_run(self):
+		"""Too few worker slots for the S3 workers, or WAL that would reach
+		the bucket by neither the shipper nor the archiver: the writer does
+		not start rather than run without its lease worker, its shipper or
+		its WAL in the bucket."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		cases = [
+		    ("orioledb.s3_num_workers = 12",
+		     "OrioleDB background workers S3 mode needs could be registered"),
+		    ("orioledb.s3_wal_shipping = off\narchive_mode = off",
+		     "an S3 writer without orioledb.s3_wal_shipping needs archive_mode"),
+		]
+		for conf, message in cases:
+			with open(os.path.join(node.data_dir, 'postgresql.auto.conf'),
+			          'w') as f:
+				f.write(conf + "\n")
+			with open(node.pg_log_file, 'w'):
+				pass
+			with self.assertRaises(StartNodeException):
+				node.start()
+			with open(node.pg_log_file) as f:
+				self.assertIn(message, f.read())
+
 	def test_s3_range_scan_reads_ahead(self):
 		"""
 		A range scan over the primary key steps from leaf to leaf, and the
@@ -808,7 +859,8 @@ class S3Test(S3BaseTest):
 		"""
 		node = self.node
 		self.s3_small_buffers_conf('16MB')
-		node.append_conf("orioledb.s3_num_workers = 8")
+		# eight S3 workers and the rest do not fit in testgres' 10
+		node.append_conf("orioledb.s3_num_workers = 8\nmax_worker_processes = 16")
 		node.start()
 		node.safe_psql("CREATE EXTENSION IF NOT EXISTS orioledb")
 		self.s3_incompressible_table(node, 'o_test', 100000)
@@ -1197,7 +1249,8 @@ class S3Test(S3BaseTest):
 		"""
 		node = self.node
 		self.s3_small_buffers_conf('16MB')
-		node.append_conf("orioledb.s3_num_workers = 8")
+		# eight S3 workers and the rest do not fit in testgres' 10
+		node.append_conf("orioledb.s3_num_workers = 8\nmax_worker_processes = 16")
 		node.start()
 		node.safe_psql("""
 			CREATE EXTENSION IF NOT EXISTS orioledb;
@@ -1886,6 +1939,67 @@ class S3Test(S3BaseTest):
 			changed = {k for k in set(before) | set(after)
 			           if before.get(k) != after.get(k)}
 			self.assertEqual({'readers'}, changed)
+			reader.cleanup()
+
+	def test_s3_reader_is_not_promoted(self):
+		"""A promoted reader would write the writer's checkpoints without its
+		lease: the reader stops at the end of its redo instead, and the bucket
+		keeps every object but the readers' pins."""
+		node = self.node
+		node.append_conf(self.s3_conf())
+		node.append_conf("""
+			synchronous_standby_names = 's3'
+			orioledb.main_buffers = 8MB
+		""")
+		node.start()
+		node.safe_psql("""
+			CREATE EXTENSION orioledb;
+			CREATE TABLE o_test (id int PRIMARY KEY) USING orioledb;
+			INSERT INTO o_test SELECT generate_series(1, 1000);
+		""")
+		node.safe_psql("CHECKPOINT;")
+
+		def bucket():
+			result = {}
+			paginator = self.client.get_paginator('list_objects_v2')
+			for page in paginator.paginate(Bucket=self.bucket_name):
+				for obj in page.get("Contents", []):
+					result[obj["Key"]] = obj["ETag"]
+			return result
+
+		with self.initNode(self.getBasePort() + 1, 'tgsb') as reader:
+			self.loader.download(reader.data_dir)
+			reader.append_conf(port=reader.port)
+			reader.append_conf("""
+				orioledb.s3_reader = on
+				hot_standby = on
+				orioledb.main_buffers = 8MB
+			""")
+			open(os.path.join(reader.data_dir, "standby.signal"), "w").close()
+			reader.start()
+			deadline = time.time() + 60
+			while True:
+				try:
+					if reader.execute("SELECT count(*) FROM o_test")[0][0] == 1000:
+						break
+				except Exception:
+					pass
+				self.assertLess(time.time(), deadline)
+				time.sleep(0.5)
+			node.stop()
+			before = bucket()
+			reader.execute("SELECT pg_promote(wait => false)")
+			pidfile = os.path.join(reader.data_dir, "postmaster.pid")
+			deadline = time.time() + 60
+			while os.path.exists(pidfile):
+				self.assertLess(time.time(), deadline)
+				time.sleep(0.5)
+			with open(reader.pg_log_file) as f:
+				self.assertIn("an S3 reader cannot end its recovery", f.read())
+			after = bucket()
+			changed = {k for k in set(before) | set(after)
+			           if before.get(k) != after.get(k)}
+			self.assertTrue(changed <= {'readers'}, changed)
 			reader.cleanup()
 
 	def test_s3_reader_that_stops_for_good_takes_its_pin_out(self):

@@ -2068,7 +2068,14 @@ s3_gc_cycle(void)
 				if (m == NULL)
 					continue;
 				collect_checkpoint(m, rm, dropped, deleted);
-				if (first == NULL)
+
+				/*
+				 * WAL goes from the first REDO on: a manifest prepared for a
+				 * checkpoint never committed has none, and taken as the first
+				 * it deleted no segment while collected moved past them.
+				 */
+				if (first == NULL && m->redoLsn != InvalidXLogRecPtr &&
+					m->timeline != 0)
 					first = m;
 				else
 					s3_manifest_free(m);
