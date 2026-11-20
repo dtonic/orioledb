@@ -30,8 +30,9 @@ Local storage implements caching of the data most often accessed. Also, it ensur
 Set the following parameters in `postgresql.conf` before creating OrioleDB tables and materialized views:
 
 - `orioledb.s3_mode` -- whether to use S3 mode: `on` or `off`. The default is `off`.
-- `archive_mode = on` -- required for S3 mode.
-- `archive_library = 'orioledb'` -- required for S3 mode.
+- `archive_mode = on` -- required for S3 mode. A writer with `orioledb.s3_wal_shipping = off` does not start without it.
+- `archive_library = 'orioledb'` -- required for S3 mode. A writer with `orioledb.s3_wal_shipping = off` does not start without it.
+- `max_worker_processes` -- room for every OrioleDB background worker: the background writers, `orioledb.s3_num_workers` S3 workers, the lease worker and, on a writer, the WAL shipper, the GC and the compaction worker when they are on. In S3 mode the server does not start when one of them cannot be registered.
 - `orioledb.s3_host` -- endpoint address of the S3 bucket, without the `https://` prefix. E.g. `mybucket.s3-accelerate.amazonaws.com`.
 - `orioledb.s3_region` -- region the S3 bucket is created in.
 - `orioledb.s3_prefix` -- prefix prepended to S3 object names. It may contain the bucket name if the endpoint does not.
@@ -183,4 +184,4 @@ A reader writes nothing to the bucket but a pin that keeps the checkpoint it loa
 - A reader that falls more than about three quarters of the writer's `orioledb.s3_gc_max_pin_lag` checkpoints behind stops; load it again before then.
 - The `restore_command` runs a small client of a restore server it starts in the background, in the same data directory (`pg_wal/orioledb_s3_chunks/restore.sock`). The server keeps its S3 connections and, asked again for the WAL it already gave, holds the request for up to a second while it polls for the next chunk, instead of answering with the same WAL. A commit then shows on the reader well under a second after it reaches the bucket, and an idle reader does not log `invalid record length` on every retry. The hold stays short: an OrioleDB commit becomes visible on a reader only when the startup process handles its interrupts, which it does between attempts to read WAL, not while `restore_command` runs. The loader writes `wal_retrieve_retry_interval = '50ms'` for this. It puts the WAL it gets into `pg_wal` itself, so a reader logs the end of each new chunk once and no `restored log file` line. The server runs under a small parent that always exits with 0: in a container the postmaster is often PID 1 and adopts it, and a server killed by a signal (an OOM kill) would otherwise make the postmaster restart the reader, which an S3 reader cannot do. The server stops with the postmaster. Without it (it cannot start), `restore_command` reads the bucket itself, as before.
 - A reader that has made a restartpoint, by a `CHECKPOINT` or a clean shutdown, does not start again on its data directory; load it again.
-- A reader is not promoted. To make one the writer once the old writer is gone, stop it, load the bucket into the same directory with `--keep-parts`, which keeps the data files it already has, and start it.
+- A reader is not promoted: `pg_promote()`, a promote signal or a start without `standby.signal` stops it with "an S3 reader cannot end its recovery" before it writes anything. To make one the writer once the old writer is gone, stop it, load the bucket into the same directory with `--keep-parts`, which keeps the data files it already has, and start it.

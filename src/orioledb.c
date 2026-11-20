@@ -64,6 +64,7 @@
 #include "access/table.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
+#include "archive/archive_module.h"
 #include "catalog/pg_enum.h"
 #include "executor/execExpr.h"
 #include "funcapi.h"
@@ -72,6 +73,7 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/plancat.h"
 #include "postmaster/autovacuum.h"
+#include "postmaster/bgworker_internals.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/postmaster.h"
 #include "postmaster/startup.h"
@@ -546,9 +548,52 @@ o_recovery_shutdown_hook(void)
 	o_recovery_finish_hook(false);
 }
 
+/*
+ * RegisterBackgroundWorker() over max_worker_processes only logs.  In S3 mode
+ * a missing worker is no smaller instance but a broken one: a writer without
+ * its lease worker runs past its lease, one without its shipper keeps its
+ * clients waiting at their start, one short of S3 workers never commits a
+ * checkpoint.  Count what got in.
+ */
+static void
+check_s3_bgworkers_registered(void)
+{
+	int			wanted = bgwriter_num_workers + s3_num_workers + 1;
+	int			registered = 0;
+	dlist_iter	iter;
+
+	if (enable_rewind)
+		wanted++;
+	if (S3_WRITER_MODE && s3_gc_interval > 0)
+		wanted++;
+	if (S3_WRITER_MODE && s3_compact_interval > 0 &&
+		s3_compact_database && s3_compact_database[0])
+		wanted++;
+	if (S3_WRITER_MODE && s3_wal_shipping)
+		wanted++;
+
+	dlist_foreach(iter, &BackgroundWorkerList)
+	{
+		RegisteredBgWorker *rw = dlist_container(RegisteredBgWorker,
+												 rw_lnode, iter.cur);
+
+		if (strcmp(rw->rw_worker.bgw_library_name, "orioledb") == 0)
+			registered++;
+	}
+
+	if (registered < wanted)
+		ereport(FATAL,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("only %d of the %d OrioleDB background workers S3 mode needs could be registered",
+						registered, wanted),
+				 errhint("Increase \"max_worker_processes\" by at least %d.",
+						 wanted - registered)));
+}
+
 static void
 o_recovery_cleanup(void)
 {
+	s3_refuse_reader_end_of_recovery();
 	*was_in_recovery = true;
 	o_recovery_finish_hook(true);
 	cic_spool_cleanup_orphans();
@@ -1747,6 +1792,20 @@ _PG_init(void)
 		register_s3_compact_worker();
 	if (S3_WRITER_MODE)
 		s3_wal_shipper_init();
+	if (orioledb_s3_mode)
+		check_s3_bgworkers_registered();
+
+	/*
+	 * Without the shipper, archived segments are how WAL reaches the bucket:
+	 * a root committed on archiving that goes elsewhere names checkpoints
+	 * whose WAL the bucket never gets.
+	 */
+	if (S3_WRITER_MODE && !s3_wal_shipping &&
+		!(XLogArchiveMode != ARCHIVE_MODE_OFF && XLogArchiveLibrary &&
+		  strcmp(XLogArchiveLibrary, "orioledb") == 0))
+		ereport(FATAL,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("an S3 writer without orioledb.s3_wal_shipping needs archive_mode = on and archive_library = 'orioledb'")));
 
 	/* Register custom deTOAST function */
 	register_o_detoast_func(o_detoast);

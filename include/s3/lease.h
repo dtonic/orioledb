@@ -55,4 +55,6 @@ extern TimestampTz s3_lease_hold(void);
 extern void s3_root_commit(uint32 checkpointNum, XLogRecPtr redoLsn,
 						   XLogRecPtr checkpointLsn);
 
+extern void s3_refuse_reader_end_of_recovery(void);
+
 #endif							/* __S3_LEASE_H__ */

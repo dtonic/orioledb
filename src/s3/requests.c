@@ -64,6 +64,34 @@ hex_string(Pointer data, int len)
 	return result;
 }
 
+/*
+ * URI-encode an object's path as SigV4 wants it in the canonical request,
+ * and as the URL has to carry it: everything but the unreserved characters
+ * and '/'.  Object names are the data directory's file names and the prefix,
+ * any of which may hold a space, '?', '#', '%', '=' or '+': unencoded, curl
+ * refused the URL or cut it at '?', and the store computed another
+ * signature.
+ */
+static char *
+uri_encode_path(const char *s)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	for (; *s; s++)
+	{
+		unsigned char c = (unsigned char) *s;
+
+		if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+			c == '~' || c == '/')
+			appendStringInfoChar(&buf, c);
+		else
+			appendStringInfo(&buf, "%%%02X", c);
+	}
+	return buf.data;
+}
+
 #define SIGNED_HEADERS			"host;x-amz-content-sha256;x-amz-date"
 #define SIGNED_HEADERS_TOKEN	SIGNED_HEADERS ";x-amz-meta-token"
 
@@ -624,16 +652,23 @@ s3_request_ext(const char *method, char *objectname,
 	/* a path from the store's root: a bucket-level request */
 	if (objectname[0] == '/')
 		objectpath = objectname + 1;
-	else if (s3_prefix && objectname[0] != '?')
+	else if (objectname[0] != '?')
 	{
-		int			prefix_len = strlen(s3_prefix);
+		int			prefix_len = s3_prefix ? strlen(s3_prefix) : 0;
 
+		/* an object's name has no query: a '?' in it is a character */
 		if (prefix_len != 0)
 		{
+			char	   *full;
+
 			if (s3_prefix[prefix_len - 1] == '/')
 				prefix_len--;
-			objectpath = psprintf("%.*s/%s", prefix_len, s3_prefix, objectname);
+			full = psprintf("%.*s/%s", prefix_len, s3_prefix, objectname);
+			objectpath = uri_encode_path(full);
+			pfree(full);
 		}
+		else
+			objectpath = uri_encode_path(objectname);
 	}
 
 	for (attempt = 0;; attempt++)
@@ -1099,11 +1134,16 @@ delete_slot_start(CURLM *multi, DeleteSlot *slot, char *objectname,
 	if (s3_prefix && s3_prefix[0])
 	{
 		int			prefix_len = strlen(s3_prefix);
+		char	   *full;
 
 		if (s3_prefix[prefix_len - 1] == '/')
 			prefix_len--;
-		objectpath = psprintf("%.*s/%s", prefix_len, s3_prefix, objectname);
+		full = psprintf("%.*s/%s", prefix_len, s3_prefix, objectname);
+		objectpath = uri_encode_path(full);
+		pfree(full);
 	}
+	else
+		objectpath = uri_encode_path(objectname);
 	signature = s3_signature("DELETE", datetimestring, datestring, objectpath,
 							 s3_secretkey, emptyChecksum, NULL);
 	slot->slist = NULL;
@@ -1361,6 +1401,12 @@ s3_delete_object(char *objectname)
 /*
  * Reads the part of the file 'filename' from 'offset' with length 'maxSize'.
  * The actual length might appear to be lower, it's to be written to '*size'.
+ *
+ * NULL only for a file that is not there: a dropped tree or relation takes
+ * its files with it, and nothing needs them uploaded.  Any other failure is
+ * an error, and so is a file that shrank under the read: the caller would
+ * take a part that never went up, or went up cut short, for uploaded.  An s3
+ * worker that errors out replays its task.
  */
 static Pointer
 read_file_part(const char *filename, uint64 offset,
@@ -1374,7 +1420,9 @@ read_file_part(const char *filename, uint64 offset,
 	file = BasicOpenFile(filename, O_RDONLY | PG_BINARY);
 	if (file < 0)
 	{
-		ereport(WARNING,
+		int			elevel = errno == ENOENT ? WARNING : ERROR;
+
+		ereport(elevel,
 				(errcode_for_file_access(),
 				 errmsg("could not open file \"%s\": %m", filename)));
 		return NULL;
@@ -1405,9 +1453,12 @@ read_file_part(const char *filename, uint64 offset,
 
 		if (rc != amount)
 		{
-			amount = rc;
-			*size = (ptr - buffer) + amount;
-			break;
+			close(file);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("file \"%s\" shrank while it was read", filename),
+					 errdetail("Read %d of %d bytes at offset " UINT64_FORMAT ".",
+							   rc, amount, offset)));
 		}
 
 		offset += amount;

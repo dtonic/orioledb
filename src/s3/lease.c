@@ -385,6 +385,26 @@ store_clock_or_local(int64 storageNow, const char *key)
 }
 
 /*
+ * When the lease request whose Date header was taken last was sent, our
+ * clock, seconds: the store wrote the header between that and its answer.
+ */
+static int64 lastDateSent = 0;
+
+/*
+ * The store's clock minus ours, from the Date header of the last answer.
+ * Leant towards the store's side: the header is truncated to the second, and
+ * the store wrote it after the request left, so the offset is at most this.
+ * Taken against the answer's arrival instead, a slow answer understated it,
+ * the next lease ended earlier on the store's clock than its holder thought,
+ * and another writer could take it while this one still wrote.
+ */
+static int64
+store_clock_offset(int64 storageNow)
+{
+	return storageNow + 1 - lastDateSent;
+}
+
+/*
  * Read an object: 200 with its body and ETag, 404, or a transient code.
  */
 static long
@@ -393,7 +413,9 @@ lease_get(const char *key, StringInfo body, char *etag, int64 *storageNow)
 	char	   *et = NULL,
 			   *date = NULL;
 	long		code;
+	int64		sent;
 
+	sent = (int64) time(NULL);
 	code = s3_request_once("GET", (char *) key, NULL, 0, NULL, false,
 						   LEASE_REQUEST_TIMEOUT, body, &et, &date);
 	if (code == S3_RESPONSE_OK)
@@ -404,7 +426,10 @@ lease_get(const char *key, StringInfo body, char *etag, int64 *storageNow)
 			strlcpy(etag, et, S3_ETAG_LEN);
 	}
 	if (storageNow)
+	{
 		*storageNow = http_date_epoch(date);
+		lastDateSent = sent;
+	}
 	if (et)
 		pfree(et);
 	if (date)
@@ -432,13 +457,18 @@ lease_cas(const char *key, StringInfo body, const char *ifMatch,
 	char		curOwner[OWNER_LEN],
 				curEtag[S3_ETAG_LEN];
 	bool		parsed;
+	int64		sent;
 
 	initStringInfo(&resp);
+	sent = (int64) time(NULL);
 	code = s3_request_once("PUT", (char *) key, body->data, body->len,
 						   ifMatch, ifMatch == NULL, LEASE_REQUEST_TIMEOUT,
 						   &resp, &et, &date);
 	if (storageNow)
+	{
 		*storageNow = http_date_epoch(date);
+		lastDateSent = sent;
+	}
 	if (date)
 		pfree(date);
 	pfree(resp.data);
@@ -1147,7 +1177,7 @@ s3_lease_acquire(void)
 	}
 
 	memset(&pm_lease, 0, sizeof(pm_lease));
-	pm_lease.clockOffset = storageNow - (int64) time(NULL);
+	pm_lease.clockOffset = store_clock_offset(storageNow);
 	pm_lease.bucket = bucket;
 	pm_lease.prevToken = local;
 	/* a crash restart goes on from this postmaster's own run, loaded or not */
@@ -1397,6 +1427,23 @@ s3_lease_reader_init(void)
 			(errmsg("reading the S3 bucket without writing to it")));
 }
 
+/*
+ * An S3 reader shares the bucket with its writer and holds no lease: ending
+ * its recovery would make it a second writer of the same checkpoints.  Stop
+ * before the end of recovery writes anything, here at the end of redo and
+ * again at the end of the startup (no redo to end).
+ */
+void
+s3_refuse_reader_end_of_recovery(void)
+{
+	if (orioledb_s3_mode && orioledb_s3_reader)
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("an S3 reader cannot end its recovery"),
+				 errdetail("A reader is not promoted and does not run without standby.signal."),
+				 errhint("To make it the writer, stop it, load the bucket into its directory with --keep-parts and start it without orioledb.s3_reader.")));
+}
+
 Size
 s3_lease_shmem_needs(void)
 {
@@ -1569,7 +1616,7 @@ lease_renew(void)
 		if (res == CAS_DONE)
 		{
 			if (storageNow >= 0)
-				clockOffset = storageNow - (int64) time(NULL);
+				clockOffset = store_clock_offset(storageNow);
 			LWLockAcquire(&lease->lock, LW_EXCLUSIVE);
 			lease->writerAttempt = attempt;
 			strlcpy(lease->writerEtag, etag, S3_ETAG_LEN);
