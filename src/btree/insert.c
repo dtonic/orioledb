@@ -32,7 +32,7 @@
 #include "miscadmin.h"
 #include "utils/memutils.h"
 
-/* In order to avoid use of the recursion in insert_leaf() we use context. */
+/* In order to avoid use of the recursion in o_btree_insert_item() we use context. */
 typedef struct BTreeInsertStackItem
 {
 	/* next item in the find context. next == NULL if it's last item. */
@@ -1090,6 +1090,93 @@ btree_leaf_write_new_item(BTreeDescr *desc, Page p,
 
 	if (!(tuple.formatFlags & O_TUPLE_FLAGS_FIXED_FORMAT))
 		header->chunkDesc[loc->chunkOffset].chunkKeysFixed = 0;
+}
+
+typedef struct MultiInsertSortCtx
+{
+	BTreeDescr *desc;
+	Pointer    *keys;
+} MultiInsertSortCtx;
+
+/*
+ * qsort_arg comparator over an int[] permutation whose entries index into
+ * keys[]; keys[i] is a Pointer to a BTreeKeyBound.
+ */
+static int
+multi_insert_sort_cmp(const void *a, const void *b, void *arg)
+{
+	MultiInsertSortCtx *cx = (MultiInsertSortCtx *) arg;
+	int			ia = *(const int *) a;
+	int			ib = *(const int *) b;
+
+	return o_btree_cmp(cx->desc,
+					   cx->keys[ia], BTreeKeyBound,
+					   cx->keys[ib], BTreeKeyBound);
+}
+
+/*
+ * Scan keyptrs[0..n-1] for monotonicity.  If already ascending, returns false
+ * and the caller consumes the original arrays in place.  Otherwise writes a
+ * palloc'd int[n] permutation into *out_idx such that keyptrs[(*out_idx)[k]]
+ * is ascending, and returns true.
+ */
+bool
+multi_insert_prepare_sort_if_needed(BTreeDescr *desc, Pointer *keyptrs, int n,
+									int **out_idx)
+{
+	MultiInsertSortCtx sortcx = {desc, keyptrs};
+	int		   *idx;
+	int			i;
+
+	for (i = 1; i < n; i++)
+	{
+		if (o_btree_cmp(desc, keyptrs[i - 1], BTreeKeyBound,
+						keyptrs[i], BTreeKeyBound) > 0)
+			break;
+	}
+	if (i >= n)
+		return false;
+
+	idx = (int *) palloc(sizeof(int) * n);
+	for (i = 0; i < n; i++)
+		idx[i] = i;
+	qsort_arg(idx, n, sizeof(int), multi_insert_sort_cmp, &sortcx);
+	*out_idx = idx;
+	return true;
+}
+
+/*
+ * Compute the largest prefix of tuplens[0..remaining-1] whose row-undo
+ * reservation fits within one per-backend share of the undo circular buffer
+ * (2 * O_MAX_UNDO_RECORD_SIZE, matching undo_shmem_needs), reserve that
+ * space, and return the prefix length (>= 1).  The trailing maxrow slot
+ * absorbs the one extra `size` get_undo_record may consume on a buffer-wrap
+ * retry.  When undoType == UndoLogNone no reservation is done and the full
+ * `remaining` is returned.
+ */
+int
+multi_insert_prepare_batch(UndoLogType undoType,
+						   LocationIndex *tuplens, int remaining)
+{
+	Size		need = MAXIMUM_ALIGNOF;
+	Size		maxrow = 0;
+	int			batch_size;
+
+	if (undoType == UndoLogNone)
+		return remaining;
+
+	for (batch_size = 0; batch_size < remaining; batch_size++)
+	{
+		Size		one = MAXALIGN(sizeof(BTreeModifyUndoStackItem) + tuplens[batch_size]);
+
+		if (batch_size > 0 && need + one + Max(maxrow, one) > 2 * O_MAX_UNDO_RECORD_SIZE)
+			break;
+		need += one;
+		if (one > maxrow)
+			maxrow = one;
+	}
+	reserve_undo_size(undoType, need + maxrow);
+	return batch_size;
 }
 
 /*

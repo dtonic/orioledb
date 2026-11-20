@@ -89,6 +89,10 @@ typedef struct WalRecord
 		}			rb_to_sp;
 		struct
 		{
+			TransactionId logicalXid;
+		}			subxact_abort;
+		struct
+		{
 			ItemPointerData iptr;
 		}			bridge_erase;
 

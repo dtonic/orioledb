@@ -27,6 +27,7 @@
 #include "commands/defrem.h"
 #include "common/file_perm.h"
 #include "indexam/handler.h"
+#include "recovery/internal.h"
 #include "recovery/logical.h"
 #include "recovery/recovery.h"
 #include "recovery/wal.h"
@@ -62,6 +63,7 @@
 #include "access/heapam.h"
 #include "access/table.h"
 #include "access/xlog_internal.h"
+#include "access/xlogrecovery.h"
 #include "catalog/pg_enum.h"
 #include "executor/execExpr.h"
 #include "funcapi.h"
@@ -75,6 +77,7 @@
 #include "postmaster/startup.h"
 #include "replication/message.h"
 #include "replication/walsender.h"
+#include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/proclist.h"
@@ -109,6 +112,7 @@ OrioleDBPageDesc *local_ppool_page_descs = NULL;
 /* Custom GUC variables */
 int			orioledb_serializable_mode = O_SERIALIZABLE_ERROR;
 bool		orioledb_debug_disable_multi_insert = false;
+bool		orioledb_debug_disable_toast_multi_insert = false;
 bool		orioledb_debug_disable_downlink_fastpath = false;
 
 static const struct config_enum_entry serializable_mode_options[] = {
@@ -117,6 +121,7 @@ static const struct config_enum_entry serializable_mode_options[] = {
 	{"repeatable_read", O_SERIALIZABLE_REPEATABLE_READ, false},
 	{NULL, 0, false}
 };
+
 
 static int	main_buffers_guc;
 static int	undo_buffers_guc;
@@ -347,6 +352,7 @@ wal_desc_on_record(WalReaderState *r, WalRecord *rec)
 		case WAL_REC_UPDATE:
 		case WAL_REC_DELETE:
 		case WAL_REC_REINSERT:
+		case WAL_REC_UPDATE_PARTIAL:
 			appendStringInfo(ctx->buf, " ([ %u %u %u ]);",
 							 rec->oids.datoid, rec->oids.reloid, rec->oids.relnode);
 			break;
@@ -357,6 +363,10 @@ wal_desc_on_record(WalReaderState *r, WalRecord *rec)
 		case WAL_REC_ROLLBACK_TO_SAVEPOINT:
 			appendStringInfo(ctx->buf, " (lxid %u parent subid %u xmin %lu csn %lu);",
 							 rec->logicalXid, rec->u.rb_to_sp.parentSubid, rec->u.rb_to_sp.xmin, rec->u.rb_to_sp.csn);
+			break;
+		case WAL_REC_SUBXACT_ABORT:
+			appendStringInfo(ctx->buf, " (lxid %u);",
+							 rec->u.subxact_abort.logicalXid);
 			break;
 		case WAL_REC_JOINT_COMMIT:
 			appendStringInfo(ctx->buf, " (xmin %lu xid %u csn %lu%s);",
@@ -539,6 +549,7 @@ o_recovery_shutdown_hook(void)
 static void
 o_recovery_cleanup(void)
 {
+	*was_in_recovery = true;
 	o_recovery_finish_hook(true);
 	cic_spool_cleanup_orphans();
 }
@@ -720,11 +731,19 @@ _PG_init(void)
 
 	DefineCustomBoolVariable("orioledb.debug_disable_multi_insert",
 							 "Disable the batched same-leaf primary insert path.",
-							 "Debug switch.  When on, orioledb_multi_insert falls "
-							 "back to per-row o_tbl_insert instead of draining "
-							 "adjacent ordered keys into the same primary leaf "
-							 "under one lwlock.",
+							 NULL,
 							 &orioledb_debug_disable_multi_insert,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
+	DefineCustomBoolVariable("orioledb.debug_disable_toast_multi_insert",
+							 "Disable the batched TOAST insert path.",
+							 NULL,
+							 &orioledb_debug_disable_toast_multi_insert,
 							 false,
 							 PGC_USERSET,
 							 0,
@@ -1476,7 +1495,7 @@ _PG_init(void)
 							   &s3_accesskey,
 							   NULL,
 							   PGC_SIGHUP,
-							   0,
+							   GUC_SUPERUSER_ONLY,
 							   NULL,
 							   NULL,
 							   NULL);
@@ -1532,7 +1551,7 @@ _PG_init(void)
 							"Maximum number of xacts (Orioledb + heap) retained for orioledb rewind.",
 							NULL,
 							&rewind_max_transactions,
-							84600,
+							86400,
 							1,
 							INT_MAX,
 							PGC_POSTMASTER,
@@ -1766,6 +1785,7 @@ _PG_init(void)
 
 	RegisterCustomRmgr(ORIOLEDB_RMGR_ID, &rmgr);
 	RedoShutdownHook = o_recovery_shutdown_hook;
+	RecoveryPauseSyncHook = o_recovery_pause_sync;
 	snapshot_hook = orioledb_snapshot_hook;
 	CustomErrorCleanupHook = orioledb_error_cleanup_hook;
 	snapshot_register_hook = undo_snapshot_register_hook;

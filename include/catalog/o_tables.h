@@ -140,7 +140,7 @@ typedef struct
 	 * Set (not serialized) when deserialization skipped index expressions
 	 * written by a different PG major version; they must be re-derived from
 	 * the catalog and rewritten before use.  See
-	 * o_table_refresh_expressions().
+	 * o_refresh_table_expressions().
 	 */
 	bool		refresh_exprs;
 } OTable;
@@ -251,6 +251,8 @@ extern int	o_tables_num(Oid datoid);
 
 /* Updates OTable description in o_tables list */
 extern bool o_tables_update(OTable *table, OXid oxid, CommitSeqNo csn);
+extern bool o_tables_update_locked(OTable *table, OXid oxid, CommitSeqNo csn,
+								   bool allow_missing_indices);
 
 /* Invalidates descriptors after o_tables_update */
 void		o_tables_after_update(OTable *o_table, OXid oxid, CommitSeqNo csn);

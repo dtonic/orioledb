@@ -1812,6 +1812,27 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 				break;
 			}
 
+		case WAL_REC_SUBXACT_ABORT:
+			{
+				TransactionId logicalXid = rec->u.subxact_abort.logicalXid;
+
+				elog(DEBUG4, "ABORT record type %d (%s) logicalXid %u",
+					 rec->type, recname, logicalXid);
+
+				/*
+				 * A subtransaction released inside one that rolls back: the
+				 * writer names each before the rollback record.  WAL written
+				 * before these records existed has none, and the rollback
+				 * record's abort_later_subtxns() does it alone there.
+				 */
+				forget_logical_xid(logicalXid);
+				ReorderBufferAbort(ctx->decodeCtx->reorder, logicalXid,
+								   ctx->xlogRecPtr, 0);
+				UpdateDecodingStats(ctx->decodeCtx);
+
+				break;
+			}
+
 		case WAL_REC_INSERT:
 		case WAL_REC_UPDATE:
 		case WAL_REC_DELETE:
@@ -1934,6 +1955,16 @@ decode_on_record(WalReaderState *r, WalRecord *rec)
 
 				break;
 			}
+
+		case WAL_REC_UPDATE_PARTIAL:
+
+			/*
+			 * Only written below wal_level = logical, and a logical slot does
+			 * not let the server start there.
+			 */
+			elog(ERROR, "cannot decode a partial update record at %X/%X",
+				 LSN_FORMAT_ARGS(ctx->xlogRecPtr));
+			break;
 
 		default:
 			break;

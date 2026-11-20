@@ -7,7 +7,7 @@ sidebar_label: Concurrency
 
 ## Page change count
 
-In OrioleDB B-tree, we do not lock pages unless we need to modify them. Therefore, after traversing the downlink, we need to check if we reach the target page (because it could be concurrently evicted, merged, etc.). In order to cope with that, OrioleDB each in-memory page has `OrioleDBPageHeader.pageChangeCount` field, which got incremented every time the in-memory page changes its identity. The in-memory page identity means a particular tree, level, and lokey (left bound of the page key range). Despite the page lokey is not stored at the page, it is structurally determined. Therefore left page of split and the left page of merge save identities. Thanks to the change count mechanism, the process traversing the downlink can detect a concurrent change of the page identity.
+In OrioleDB B-tree, we do not lock pages unless we need to modify them. Therefore, after traversing the downlink, we need to check if we reach the target page (because it could be concurrently evicted, merged, etc.). In order to cope with that, each OrioleDB in-memory page has `OrioleDBPageHeader.pageChangeCount` field, which got incremented every time the in-memory page changes its identity. The in-memory page identity means a particular tree, level, and lokey (left bound of the page key range). Although the page lokey is not stored at the page, it is structurally determined. Therefore left page of split and the left page of merge save identities. Thanks to the change count mechanism, the process traversing the downlink can detect a concurrent change of the page identity.
 
 ## Rightlinks
 
@@ -85,7 +85,7 @@ Step 3 depicts both parent page 1 and child page 3 locked. Here we need to selec
 
 ![Merge step 3](../images/merge_step_3.svg)
 
-Step 4 depicts two possible ways to merge: with right sibling 4 (upper picture) or with left sibling 3 (upper picture). Note that the left page always saves its identity in either direction we chose. So if we merge to the left, page 3 will be removed. We cannot merge with a sibling under checkpoint or have a rightlink.
+Step 4 depicts two possible ways to merge: with right sibling 4 (upper picture) or with left sibling 2 (lower picture). Note that the left page always saves its identity in either direction we chose. So if we merge to the left, page 3 will be removed. We cannot merge with a sibling under checkpoint or have a rightlink.
 
 ![Merge step 4](../images/merge_step_4.svg)
 

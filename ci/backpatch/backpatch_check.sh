@@ -18,7 +18,7 @@
 #
 set -euo pipefail
 
-# shellcheck source=ci/backpatch_common.sh
+# shellcheck source=ci/backpatch/backpatch_common.sh
 . "$(dirname "$0")/backpatch_common.sh"
 
 BUG_LABEL=${BUG_LABEL:-bug}
@@ -26,6 +26,11 @@ BUG_LABEL=${BUG_LABEL:-bug}
 if is_release_branch "$BASE_REF"; then
 	echo "The pull request targets release branch $BASE_REF: nothing to check."
 	exit 0
+fi
+
+if is_release_branch "${HEAD_REF:-}"; then
+	echo "::error::The pull request comes from release branch $HEAD_REF, which must not be merged into main."
+	exit 1
 fi
 
 summary() {

@@ -92,7 +92,7 @@ EXPLAIN (BUFFERS TRUE) SELECT count(*) FROM o_explain;
    ->  Seq Scan on o_explain  (cost=0.00..19.31 rows=931 width=0)
 (2 rows)
 
--- test lowecase letters
+-- test lowercase letters
 SELECT regexp_replace(t, '[\d\.]+', 'x', 'g')
 FROM query_to_text($$ EXPLAIN (analyze TRUE, buffers TRUE)
 					SELECT count(*)
@@ -474,7 +474,8 @@ SELECT regexp_replace(t, '[\d\.]+', 'x', 'g')
 FROM query_to_text($$ EXPLAIN (ANALYZE TRUE, BUFFERS TRUE)
 					SELECT val1, val2 FROM o_explain WHERE val2 > 0
 					AND val2 < 1000 ORDER BY val2; $$) as t
-	WHERE t NOT LIKE ' Planning:' AND t NOT LIKE '   Buffers: shared hit=%';
+	WHERE ltrim(t) NOT LIKE 'Planning:' AND
+		  ltrim(t) NOT LIKE 'Buffers: shared hit=%';
                                       regexp_replace                                       
 -------------------------------------------------------------------------------------------
  Custom Scan (o_scan) on o_explain  (cost=x rows=x width=x) (actual time=x rows=x loops=x)
@@ -546,7 +547,8 @@ FROM query_to_text($$ EXPLAIN (ANALYZE TRUE, BUFFERS TRUE)
 					 FROM generate_series(1, 100, 1) id)
 					ON CONFLICT (key) DO UPDATE
 					SET val = o_explain.val + 1; $$) as t
-	WHERE t NOT LIKE ' Planning:' AND t NOT LIKE '   Buffers: shared hit=%';
+	WHERE ltrim(t) NOT LIKE 'Planning:' AND
+		  ltrim(t) NOT LIKE 'Buffers: shared hit=%';
                                           regexp_replace                                           
 ---------------------------------------------------------------------------------------------------
  Insert on o_explain  (cost=x rows=x width=x) (actual time=x rows=x loops=x)
@@ -567,7 +569,8 @@ FROM query_to_text($$ EXPLAIN (ANALYZE TRUE, BUFFERS TRUE)
 					 FROM generate_series(1, 100, 1) id)
 					ON CONFLICT (key) DO UPDATE
 					SET val = o_explain.val + 1, t = EXCLUDED.t; $$) as t
-	WHERE t NOT LIKE ' Planning:' AND t NOT LIKE '   Buffers: shared hit=%';
+	WHERE ltrim(t) NOT LIKE 'Planning:' AND
+		  ltrim(t) NOT LIKE 'Buffers: shared hit=%';
                                           regexp_replace                                           
 ---------------------------------------------------------------------------------------------------
  Insert on o_explain  (cost=x rows=x width=x) (actual time=x rows=x loops=x)
@@ -599,7 +602,7 @@ CREATE TABLE o_explain_formats (
 	val int UNIQUE
 ) USING orioledb;
 INSERT INTO o_explain_formats (SELECT v, v FROM generate_series(1, 10) v);
--- Bitmap Heap Scan all formats with all posible fields BEGIN
+-- Bitmap Heap Scan all formats with all possible fields BEGIN
 SET enable_indexscan = OFF;
 SELECT regexp_replace(t, '[\d\.]+', 'x', 'g')
 	FROM query_to_text($$ EXPLAIN (FORMAT TEXT, ANALYZE, BUFFERS)
@@ -978,8 +981,8 @@ SELECT regexp_replace(t, '[\d\.]+', 'x', 'g')
 (1 row)
 
 RESET enable_indexscan;
--- Bitmap Heap Scan all formats with all posible fields END
--- Index Scan all formats with all posible fields BEGIN
+-- Bitmap Heap Scan all formats with all possible fields END
+-- Index Scan all formats with all possible fields BEGIN
 SET enable_indexonlyscan = OFF;
 SELECT regexp_replace(t, '[\d\.]+', 'x', 'g')
 	FROM query_to_text($$ EXPLAIN (FORMAT TEXT, ANALYZE, BUFFERS)
@@ -1186,8 +1189,8 @@ SELECT regexp_replace(t, '[\d\.]+', 'x', 'g')
 (1 row)
 
 RESET enable_indexonlyscan;
--- Index Scan  all formats with all posible fields END
--- Index Only Scan all formats with all posible fields BEGIN
+-- Index Scan  all formats with all possible fields END
+-- Index Only Scan all formats with all possible fields BEGIN
 SELECT regexp_replace(t, '[\d\.]+', 'x', 'g')
 	FROM query_to_text($$ EXPLAIN (FORMAT TEXT, ANALYZE, BUFFERS)
 							SELECT val FROM o_explain_formats
@@ -1383,7 +1386,7 @@ SELECT regexp_replace(t, '[\d\.]+', 'x', 'g')
  </explain>
 (1 row)
 
--- Index Only Scan all formats with all posible fields END
+-- Index Only Scan all formats with all possible fields END
 CREATE OR REPLACE FUNCTION explain_as_json(val text) RETURNS json
 LANGUAGE plpgsql AS $$
 DECLARE

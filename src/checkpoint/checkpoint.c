@@ -2153,7 +2153,8 @@ o_perform_checkpoint_guts(int flags)
 	}
 	control.checkpointRetainXmin = checkpoint_xmin;
 	control.checkpointRetainXmax = checkpoint_xmax;
-	control.binaryVersion = ORIOLEDB_BINARY_VERSION;
+	control.binaryVersion = PACK_BINARY_VERSION(ORIOLEDB_BINARY_VERSION,
+												ORIOLEDB_CHECKPOINT_VERSION);
 	control.s3Mode = orioledb_s3_mode;
 	control.checksums_enabled = orioledb_checksums_enabled;
 	control.controlFileVersion = ORIOLEDB_CHECKPOINT_CONTROL_VERSION;
@@ -2567,20 +2568,29 @@ o_after_checkpoint_cleanup_hook(XLogRecPtr checkPointRedo, int flags)
 	S3TaskLocation location;
 	uint32		chkpNum = checkpoint_state->lastCheckpointNumber;
 
-	/* called at the end of StartupXLOG */
-	*was_in_recovery = flags == 0;
-
 	/*
-	 * Right after end-of-recovery, XLog inserts have just been enabled. Flush
-	 * WAL_REC_ROLLBACK markers for in-flight oxids that recovery_finish()
-	 * aborted in memory, so streaming standbys can resolve them too (issue
-	 * #876).
+	 * End of StartupXLOG (flags == 0).  *was_in_recovery was already set by
+	 * o_recovery_cleanup when actual WAL replay happened.
 	 */
 	if (flags == 0)
 	{
-		o_emit_recovery_finish_rollbacks();
-		if (orioledb_s3_mode)
+		/*
+		 * After recovery, flush WAL_REC_ROLLBACK markers for in-flight oxids
+		 * that recovery_finish() aborted in memory, so streaming standbys can
+		 * resolve them too (issue #876).
+		 */
+		if (*was_in_recovery)
+			o_emit_recovery_finish_rollbacks();
+
+		/*
+		 * Clients wait for the shipper to put up what recovery replayed from
+		 * the local WAL.  The hook now runs at every start, and a clean one
+		 * has nothing to catch up with: the stop shipped it all.
+		 */
+		if (*was_in_recovery && orioledb_s3_mode)
 			s3_wal_shipper_set_catch_up(GetXLogInsertRecPtr());
+
+		write_orioledb_version_file();
 	}
 
 	if (!(flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY)))
@@ -2938,7 +2948,7 @@ checkpoint_ix_init_state(CheckpointState *state, BTreeDescr *descr)
 }
 
 /*
- * Marks a offset as free for given checkpoint number, throws an error on failure.
+ * Marks an offset as free for given checkpoint number, throws an error on failure.
  *
  * It adds the offset to *.map and *.tmp files.
  */
@@ -4606,7 +4616,7 @@ checkpoint_btree_loop(BTreeDescr **descrPtr,
 
 						elog(ERROR, "unable to perform page IO for page %d to file %s with offset " UINT64_FORMAT,
 							 blkno,
-							 btree_smgr_filename(descr, chkpNum, offset),
+							 btree_smgr_filename(descr, offset, chkpNum),
 							 offset);
 					}
 
@@ -5727,7 +5737,7 @@ checkpoint_internal_pass(BTreeDescr *descr, CheckpointState *state,
 				Assert(page_desc != NULL);
 				elog(ERROR, "Unable to perform page IO for page %d to file %s with offset " UINT64_FORMAT,
 					 blkno,
-					 btree_smgr_filename(descr, chkpNum, offset),
+					 btree_smgr_filename(descr, offset, chkpNum),
 					 offset);
 			}
 

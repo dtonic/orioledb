@@ -2,6 +2,7 @@
 # coding: utf-8
 
 import json
+import os
 import subprocess
 import shutil
 import testgres
@@ -491,6 +492,214 @@ class LogicalTest(BaseTest):
 		    "table public.log: INSERT: id[integer]:9\n"
 		    "COMMIT\n")
 
+	@unittest.skipIf(not BaseTest.extension_installed("test_decoding"),
+	                 "'test_decoding' is not installed")
+	def test_savepoint_xid_reuse_after_release(self):
+		node = self.node
+		node.start()
+		node.safe_psql(
+		    'postgres', "CREATE EXTENSION IF NOT EXISTS orioledb;\n"
+		    "CREATE TABLE data(id int primary key) USING orioledb;\n"
+		    "CREATE TABLE h_data(id int primary key) USING heap;\n")
+
+		node.safe_psql(
+		    'postgres',
+		    "SELECT * FROM pg_create_logical_replication_slot('regression_slot', 'test_decoding', false, true);\n"
+		)
+
+		# s2 starts after s1 is released.  If s2 gets s1's logical xid,
+		# ROLLBACK TO s2 also drops the row of s1.  The s2 that ROLLBACK TO
+		# starts again may reuse the xid of the rolled back one.
+		node.safe_psql(
+		    'postgres', "BEGIN;\n"
+		    "INSERT INTO data VALUES (1);\n"
+		    "SAVEPOINT s1;\n"
+		    "INSERT INTO data VALUES (2);\n"
+		    "RELEASE SAVEPOINT s1;\n"
+		    "SAVEPOINT s2;\n"
+		    "INSERT INTO data VALUES (3);\n"
+		    "ROLLBACK TO s2;\n"
+		    "INSERT INTO data VALUES (10);\n"
+		    "COMMIT;\n")
+		self.assertEqual(
+		    self.retrieve_logical_changes(), "BEGIN\n"
+		    "table public.data: INSERT: id[integer]:1\n"
+		    "table public.data: INSERT: id[integer]:2\n"
+		    "table public.data: INSERT: id[integer]:10\n"
+		    "COMMIT\n")
+
+		# The same with PL/pgSQL EXCEPTION blocks: the first one succeeds,
+		# the second one fails.
+		node.safe_psql(
+		    'postgres', "BEGIN;\n"
+		    "INSERT INTO data VALUES (4);\n"
+		    "DO $$ BEGIN\n"
+		    "  INSERT INTO data VALUES (5);\n"
+		    "EXCEPTION WHEN others THEN NULL; END $$;\n"
+		    "DO $$ BEGIN\n"
+		    "  INSERT INTO data VALUES (6);\n"
+		    "  RAISE EXCEPTION 'rollback';\n"
+		    "EXCEPTION WHEN others THEN NULL; END $$;\n"
+		    "COMMIT;\n")
+		self.assertEqual(
+		    self.retrieve_logical_changes(), "BEGIN\n"
+		    "table public.data: INSERT: id[integer]:4\n"
+		    "table public.data: INSERT: id[integer]:5\n"
+		    "COMMIT\n")
+
+		# The same with a heap xid: s1 ends with a joint commit.
+		node.safe_psql(
+		    'postgres', "BEGIN;\n"
+		    "INSERT INTO h_data VALUES (1);\n"
+		    "INSERT INTO data VALUES (7);\n"
+		    "SAVEPOINT s1;\n"
+		    "INSERT INTO data VALUES (8);\n"
+		    "RELEASE SAVEPOINT s1;\n"
+		    "SAVEPOINT s2;\n"
+		    "INSERT INTO data VALUES (9);\n"
+		    "ROLLBACK TO s2;\n"
+		    "COMMIT;\n")
+		self.assertEqual(
+		    self.retrieve_logical_changes(), "BEGIN\n"
+		    "table public.h_data: INSERT: id[integer]:1\n"
+		    "table public.data: INSERT: id[integer]:7\n"
+		    "table public.data: INSERT: id[integer]:8\n"
+		    "COMMIT\n")
+
+	@unittest.skipIf(not BaseTest.extension_installed("test_decoding"),
+	                 "'test_decoding' is not installed")
+	def test_savepoint_rollback_released_child(self):
+		node = self.node
+		node.start()
+		node.safe_psql(
+		    'postgres', "CREATE EXTENSION IF NOT EXISTS orioledb;\n"
+		    "CREATE TABLE data(id int primary key) USING orioledb;\n"
+		    "CREATE TABLE h_data(id int primary key) USING heap;\n")
+
+		node.safe_psql(
+		    'postgres',
+		    "SELECT * FROM pg_create_logical_replication_slot('regression_slot', 'test_decoding', false, true);\n"
+		)
+
+		# ROLLBACK TO s1 drops s2 released inside it.  s3 after the
+		# rollback may reuse the xid of s2.
+		node.safe_psql(
+		    'postgres', "BEGIN;\n"
+		    "INSERT INTO data VALUES (1);\n"
+		    "SAVEPOINT s1;\n"
+		    "INSERT INTO data VALUES (2);\n"
+		    "SAVEPOINT s2;\n"
+		    "INSERT INTO data VALUES (3);\n"
+		    "RELEASE SAVEPOINT s2;\n"
+		    "ROLLBACK TO s1;\n"
+		    "INSERT INTO data VALUES (4);\n"
+		    "SAVEPOINT s3;\n"
+		    "INSERT INTO data VALUES (5);\n"
+		    "RELEASE SAVEPOINT s3;\n"
+		    "COMMIT;\n")
+		self.assertEqual(
+		    self.retrieve_logical_changes(), "BEGIN\n"
+		    "table public.data: INSERT: id[integer]:1\n"
+		    "table public.data: INSERT: id[integer]:4\n"
+		    "table public.data: INSERT: id[integer]:5\n"
+		    "COMMIT\n")
+
+		# s2 still open at ROLLBACK TO s1
+		node.safe_psql(
+		    'postgres', "BEGIN;\n"
+		    "INSERT INTO data VALUES (11);\n"
+		    "SAVEPOINT s1;\n"
+		    "INSERT INTO data VALUES (12);\n"
+		    "SAVEPOINT s2;\n"
+		    "INSERT INTO data VALUES (13);\n"
+		    "ROLLBACK TO s1;\n"
+		    "COMMIT;\n")
+		self.assertEqual(
+		    self.retrieve_logical_changes(), "BEGIN\n"
+		    "table public.data: INSERT: id[integer]:11\n"
+		    "COMMIT\n")
+
+		# Two released levels: s3 inside s2 inside s1
+		node.safe_psql(
+		    'postgres', "BEGIN;\n"
+		    "INSERT INTO data VALUES (21);\n"
+		    "SAVEPOINT s1;\n"
+		    "INSERT INTO data VALUES (22);\n"
+		    "SAVEPOINT s2;\n"
+		    "INSERT INTO data VALUES (23);\n"
+		    "SAVEPOINT s3;\n"
+		    "INSERT INTO data VALUES (24);\n"
+		    "RELEASE SAVEPOINT s3;\n"
+		    "RELEASE SAVEPOINT s2;\n"
+		    "ROLLBACK TO s1;\n"
+		    "COMMIT;\n")
+		self.assertEqual(
+		    self.retrieve_logical_changes(), "BEGIN\n"
+		    "table public.data: INSERT: id[integer]:21\n"
+		    "COMMIT\n")
+
+		# s0 released before s1 starts survives ROLLBACK TO s1
+		node.safe_psql(
+		    'postgres', "BEGIN;\n"
+		    "INSERT INTO data VALUES (31);\n"
+		    "SAVEPOINT s0;\n"
+		    "INSERT INTO data VALUES (32);\n"
+		    "RELEASE SAVEPOINT s0;\n"
+		    "SAVEPOINT s1;\n"
+		    "INSERT INTO data VALUES (33);\n"
+		    "SAVEPOINT s2;\n"
+		    "INSERT INTO data VALUES (34);\n"
+		    "RELEASE SAVEPOINT s2;\n"
+		    "ROLLBACK TO s1;\n"
+		    "COMMIT;\n")
+		self.assertEqual(
+		    self.retrieve_logical_changes(), "BEGIN\n"
+		    "table public.data: INSERT: id[integer]:31\n"
+		    "table public.data: INSERT: id[integer]:32\n"
+		    "COMMIT\n")
+
+		# ROLLBACK TO s1 twice: the second one drops s2 released into the
+		# restarted s1
+		node.safe_psql(
+		    'postgres', "BEGIN;\n"
+		    "INSERT INTO data VALUES (51);\n"
+		    "SAVEPOINT s1;\n"
+		    "INSERT INTO data VALUES (52);\n"
+		    "SAVEPOINT s2;\n"
+		    "INSERT INTO data VALUES (53);\n"
+		    "RELEASE SAVEPOINT s2;\n"
+		    "ROLLBACK TO s1;\n"
+		    "INSERT INTO data VALUES (54);\n"
+		    "SAVEPOINT s2;\n"
+		    "INSERT INTO data VALUES (55);\n"
+		    "RELEASE SAVEPOINT s2;\n"
+		    "ROLLBACK TO s1;\n"
+		    "INSERT INTO data VALUES (56);\n"
+		    "COMMIT;\n")
+		self.assertEqual(
+		    self.retrieve_logical_changes(), "BEGIN\n"
+		    "table public.data: INSERT: id[integer]:51\n"
+		    "table public.data: INSERT: id[integer]:56\n"
+		    "COMMIT\n")
+
+		# The same with a heap xid as the parent of the savepoints
+		node.safe_psql(
+		    'postgres', "BEGIN;\n"
+		    "INSERT INTO h_data VALUES (1);\n"
+		    "INSERT INTO data VALUES (41);\n"
+		    "SAVEPOINT s1;\n"
+		    "INSERT INTO data VALUES (42);\n"
+		    "SAVEPOINT s2;\n"
+		    "INSERT INTO data VALUES (43);\n"
+		    "RELEASE SAVEPOINT s2;\n"
+		    "ROLLBACK TO s1;\n"
+		    "COMMIT;\n")
+		self.assertEqual(
+		    self.retrieve_logical_changes(), "BEGIN\n"
+		    "table public.h_data: INSERT: id[integer]:1\n"
+		    "table public.data: INSERT: id[integer]:41\n"
+		    "COMMIT\n")
+
 	def test_simple_replident(self):
 		node = self.node
 		node.start()  # start PostgreSQL
@@ -566,6 +775,82 @@ class LogicalTest(BaseTest):
 		        "SELECT * FROM pg_logical_slot_get_changes('regression_slot', NULL, NULL);"
 		    ))
 		#print(result)
+
+	def test_logical_subscription_savepoint_reuse(self):
+		with self.node as publisher:
+			publisher.start()
+
+			subscriber = self.getSubscriber()
+			with subscriber.start() as subscriber:
+				setup_sql = """
+					CREATE EXTENSION IF NOT EXISTS orioledb;
+					CREATE TABLE o_data(id int primary key) USING orioledb;
+				"""
+				publisher.safe_psql(setup_sql)
+				subscriber.safe_psql(setup_sql)
+
+				pub = publisher.publish('test_pub', tables=['o_data'])
+				sub = subscriber.subscribe(pub, 'test_sub')
+				wait_ready(subscriber)
+
+				# s2 must not drop the rows of the released s1.
+				publisher.safe_psql("""
+					BEGIN;
+					INSERT INTO o_data VALUES (1);
+					SAVEPOINT s1;
+					INSERT INTO o_data VALUES (2);
+					RELEASE SAVEPOINT s1;
+					SAVEPOINT s2;
+					INSERT INTO o_data VALUES (3);
+					ROLLBACK TO s2;
+					COMMIT;
+				""")
+
+				sub.catchup()
+
+				self.assertListEqual(
+				    subscriber.execute('SELECT * FROM o_data ORDER BY id'),
+				    [(1, ), (2, )])
+
+	def test_logical_subscription_rollback_released(self):
+		with self.node as publisher:
+			publisher.start()
+
+			subscriber = self.getSubscriber()
+			with subscriber.start() as subscriber:
+				setup_sql = """
+					CREATE EXTENSION IF NOT EXISTS orioledb;
+					CREATE TABLE o_data(id int primary key) USING orioledb;
+				"""
+				publisher.safe_psql(setup_sql)
+				subscriber.safe_psql(setup_sql)
+
+				pub = publisher.publish('test_pub', tables=['o_data'])
+				sub = subscriber.subscribe(pub, 'test_sub')
+				wait_ready(subscriber)
+
+				# ROLLBACK TO s1 must drop the rows of s2 released inside it.
+				publisher.safe_psql("""
+					BEGIN;
+					INSERT INTO o_data VALUES (1);
+					SAVEPOINT s1;
+					INSERT INTO o_data VALUES (2);
+					SAVEPOINT s2;
+					INSERT INTO o_data VALUES (3);
+					RELEASE SAVEPOINT s2;
+					ROLLBACK TO s1;
+					INSERT INTO o_data VALUES (4);
+					COMMIT;
+				""")
+
+				sub.catchup()
+
+				self.assertListEqual(
+				    subscriber.execute('SELECT * FROM o_data ORDER BY id'),
+				    publisher.execute('SELECT * FROM o_data ORDER BY id'))
+				self.assertListEqual(
+				    subscriber.execute('SELECT * FROM o_data ORDER BY id'),
+				    [(1, ), (4, )])
 
 	def test_logical_subscription_drop_table(self):
 		with self.node as publisher:
@@ -3438,3 +3723,73 @@ COMMIT\n""")
 				        'SELECT id, n, md5(data) FROM o_data ORDER BY id'),
 				    publisher.execute(
 				        'SELECT id, n, md5(data) FROM o_data ORDER BY id'))
+
+	def test_logical_subscription_toast_multi_insert(self):
+		"""COPY of multiple rows with TOAST values via multi-insert.
+
+		Exercises per-slot TOAST WAL ordering: each row's TOAST chunks
+		must precede its PK record so that ReorderBufferToastAppendChunk
+		sees sequential chunk_seq per chunk_id.  Grouped WAL (all PK
+		records then all TOAST records) causes chunk_id collisions when
+		multiple rows toast the same attribute.
+
+		Covers two TOAST columns per row and a value large enough to
+		exceed O_TOAST_MULTI_MAX_CHUNKS (128) chunks on its own,
+		crossing a sub-batch boundary.
+		"""
+		with self.node as publisher:
+			publisher.start()
+
+			subscriber = self.getSubscriber()
+
+			with subscriber.start() as subscriber:
+				gen_string = """
+					CREATE OR REPLACE FUNCTION generate_string(
+						seed integer, length integer
+					) RETURNS text AS $$
+						SELECT substr(string_agg(
+							substr(encode(sha256(
+								seed::text::bytea || '_' || i::text::bytea
+							), 'hex'), 1, 21),
+						''), 1, length)
+						FROM generate_series(1, (length + 20) / 21) i;
+					$$ LANGUAGE SQL IMMUTABLE;
+				"""
+				create_sql = """
+					CREATE EXTENSION IF NOT EXISTS orioledb;
+					CREATE TABLE o_toast_multi (
+						id integer PRIMARY KEY,
+						body text,
+						body2 text
+					) USING orioledb;
+				"""
+				publisher.safe_psql(gen_string + create_sql)
+				subscriber.safe_psql(create_sql)
+
+				pub = publisher.publish('test_pub', tables=['o_toast_multi'])
+				sub = subscriber.subscribe(pub, 'test_sub')
+				wait_ready(subscriber)
+
+				csvpath = os.path.join(publisher.base_dir, 'toast_multi.csv')
+				publisher.safe_psql("""
+					COPY (
+						SELECT i,
+							   generate_string(i, CASE WHEN i = 5
+								   THEN 400000 ELSE 10000 END),
+							   generate_string(i + 100, 10000)
+						FROM generate_series(1, 5) i
+					) TO '%s';
+					COPY o_toast_multi FROM '%s';
+				""" % (csvpath, csvpath))
+
+				check_query = """
+					SELECT id, md5(body), md5(body2)
+					FROM o_toast_multi ORDER BY id
+				"""
+				expected = publisher.execute(check_query)
+
+				sub.catchup()
+				subscriber.poll_query_until(
+				    "SELECT orioledb_recovery_synchronized();", expected=True)
+
+				self.assertListEqual(subscriber.execute(check_query), expected)

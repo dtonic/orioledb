@@ -40,8 +40,13 @@
  * ORIOLEDB_SYS_TREE_VERSION, ORIOLEDB_PAGE_VERSION and
  * ORIOLEDB_COMPRESS_VERSION (see big comment on versioning
  * in include/orioledb.h)
+ *
+ * 21 is taken twice: this fork made WAL_REC_SAVEPOINT carry the subid with
+ * it, upstream added WAL_REC_UPDATE_PARTIAL and WAL_REC_SUBXACT_ABORT with
+ * it.  22 is the two together, so a fork build at 21 refuses WAL holding the
+ * records it does not know rather than misreading them.
  */
-#define ORIOLEDB_WAL_VERSION (21)
+#define ORIOLEDB_WAL_VERSION (22)
 
 /*
  * Value has been fixed at the moment of introducing WAL versioning.
@@ -212,6 +217,12 @@ typedef struct
 typedef struct
 {
 	uint8		recType;
+	uint8		logicalXid[sizeof(TransactionId)];
+} WALRecSubxactAbort;
+
+typedef struct
+{
+	uint8		recType;
 	uint8		xid[sizeof(TransactionId)];
 	uint8		xmin[sizeof(OXid)];
 	uint8		csn[sizeof(CommitSeqNo)];
@@ -299,6 +310,7 @@ extern void add_savepoint_wal_record(SubTransactionId parentSubid,
 									 SubTransactionId subid,
 									 TransactionId parentLogicalXid);
 extern void add_rollback_to_savepoint_wal_record(SubTransactionId parentSubid);
+extern void add_subxact_abort_wal_record(TransactionId logicalXid);
 extern void add_database_copy_wal_record(Oid dboid, Oid src_tblspc, Oid dst_tblspc);
 extern void add_database_create_copy_wal_record(Oid src_datoid, Oid dst_datoid);
 extern void add_database_template_checkpoint_wal_record(Oid src_datoid);
@@ -316,6 +328,9 @@ extern void wal_emit_recovery_finish_rollback(OXid oxid,
 											  TransactionId logicalXid);
 extern void o_wal_insert(BTreeDescr *desc, OTuple tuple, char relreplident, uint32 version);
 extern void o_wal_update(BTreeDescr *desc, OTuple tuple, OTuple oldtuple, char relreplident, uint32 version);
+extern void o_wal_update_row(OIndexDescr *primary, OTuple tuple,
+							 OTuple oldTuple, OTuple oldWalTuple,
+							 char relreplident, uint32 version);
 extern void o_wal_delete(BTreeDescr *desc, OTuple tuple, char relreplident, uint32 version);
 extern void o_wal_delete_key(BTreeDescr *desc, OTuple key, bool is_bridge_index, uint32 version);
 extern void o_wal_reinsert(BTreeDescr *desc, OTuple oldtuple, OTuple newtuple, char relreplident, uint32 version);

@@ -49,7 +49,8 @@ make.flags
 /include/utils/stopevents_defs.h
 /include/utils/stopevents_data.h
 /orioledb.typedefs
-!ci/antithesis/libvoidstar.so
+/ci/__pycache__/
+/scripts/**/__pycache__/
 
 # Ignore generated scripts (also update .dockerignore when adding new entries here)
 sql/orioledb--1.0.sql
@@ -60,6 +61,8 @@ sql/orioledb--1.7--1.8.sql
 sql/orioledb--1.8--1.9.sql
 sql/orioledb--1.9--1.10.sql
 sql/orioledb--1.10--1.11.sql
+
+orioledb_version.txt
 
 # Exclude the PostGIS Docker build directory
 /docker-postgis

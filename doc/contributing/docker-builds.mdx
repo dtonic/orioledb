@@ -89,7 +89,7 @@ postgres=# \dx
                                        List of installed extensions
    Name   | Version | Default version |   Schema   |                     Description
 ----------+---------+-----------------+------------+------------------------------------------------------
- orioledb | 1.9     | 1.9             | public     | OrioleDB -- the next generation transactional engine
+ orioledb | 1.11    | 1.11            | public     | OrioleDB -- the next generation transactional engine
  plpgsql  | 1.0     | 1.0             | pg_catalog | PL/pgSQL procedural language
 (2 rows)
 
@@ -220,7 +220,7 @@ docker build -t orioletest:17 -f docker/Dockerfile --pull --network=host --progr
 
 ## Supported environment variables
 
-This project aims to maintain compatibility with the Docker Official PostgreSQL image, and therefore, it also supports the environmental variables found there:
+This project aims to maintain compatibility with the Docker Official PostgreSQL image, and therefore, it also supports the environment variables found there:
 
 - `POSTGRES_PASSWORD`
 - `POSTGRES_USER`
@@ -289,9 +289,9 @@ docker build --pull --network=host --progress=plain \
     -t orioletest:17-gcc-alpine3.21 .
 ```
 
-#### Step2: Build the `oriolegis:17-3.5-alpine` image.
+#### Step 2: Build the `oriolegis:17-3.5-alpine` image.
 
-in a new directory, run this commands:
+In a new directory, run these commands:
 
 ```bash
 git clone --depth=1 https://github.com/postgis/docker-postgis.git
@@ -304,8 +304,8 @@ docker build --network=host --progress=plain \
 ## Developer notes:
 
 To build all Docker image variations on a local machine, run the following command:
-- `./ci/local_docker_matrix.sh`
-- or (experimental)  `./ci/docker_matrix.sh --help`
+- `./scripts/docker/local_docker_matrix.sh`
+- or (experimental)  `./scripts/docker/docker_matrix.sh --help`
 
 ##### Ubuntu
 - Supported base images (with security updates):

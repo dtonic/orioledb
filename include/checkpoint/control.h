@@ -35,6 +35,16 @@ typedef struct
 #define ORIOLEDB_CHECKPOINT_CONTROL_VERSION	2
 
 /*
+ * CheckpointControl.binaryVersion packs two 16-bit values into one uint32,
+ * following the PG_PROTOCOL(major,minor) pattern from libpq/pqcomm.h.
+ * Old clusters wrote just ORIOLEDB_BINARY_VERSION, so checkpointVersion reads as 0.
+ */
+#define PACK_BINARY_VERSION(bin, chkp) \
+	(((uint32) (bin)) | ((uint32) (chkp) << 16))
+#define UNPACK_BINARY_VERSION(v)		((v) & 0xFFFF)
+#define UNPACK_CHECKPOINT_VERSION(v)	((v) >> 16)
+
+/*
  * To ensure correct reading of controlFileVersion, changes in struct layout
  * are permitted only between .controlFileVersion and .crc, that
  * should be the last.
@@ -93,5 +103,6 @@ typedef struct
 extern bool get_checkpoint_control_data(CheckpointControl *control);
 extern void check_checkpoint_control(CheckpointControl *control);
 extern void write_checkpoint_control(CheckpointControl *control);
+extern void write_orioledb_version_file(void);
 
 #endif							/* __CHECKPOINT_CONTROL_H__ */

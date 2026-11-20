@@ -15,10 +15,12 @@
 
 #include "orioledb.h"
 
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/sys_trees.h"
 #include "recovery/recovery.h"
 #include "recovery/wal.h"
+#include "recovery/wal_partial.h"
 #include "recovery/wal_record.h"
 #include "tableam/descr.h"
 #include "transam/oxid.h"
@@ -109,7 +111,9 @@ add_modify_wal_record_extended(uint8 rec_type, BTreeDescr *desc,
 	}
 
 	Assert(!is_recovery_process());
-	Assert(rec_type == WAL_REC_INSERT || rec_type == WAL_REC_UPDATE || rec_type == WAL_REC_DELETE || rec_type == WAL_REC_REINSERT);
+	Assert(rec_type == WAL_REC_INSERT || rec_type == WAL_REC_UPDATE ||
+		   rec_type == WAL_REC_DELETE || rec_type == WAL_REC_REINSERT ||
+		   rec_type == WAL_REC_UPDATE_PARTIAL);
 	Assert(!O_TUPLE_IS_NULL(tuple));
 
 	write_two_tuples = (rec_type == WAL_REC_REINSERT || (rec_type == WAL_REC_UPDATE && relreplident == REPLICA_IDENTITY_FULL));
@@ -608,7 +612,7 @@ add_rel_wal_record(ORelOids oids, OIndexType type, uint32 version, uint32 base_v
 	 * the system undo that takes.  Before reading the CSN: the other order
 	 * retains from a location that is already newer than what the CSN needs.
 	 */
-	if (wal_level >= WAL_LEVEL_LOGICAL)
+	if (XLogLogicalInfoActive())
 	{
 		set_my_logical_wal_retain_location(runXmin);
 		pg_read_barrier();
@@ -833,6 +837,26 @@ add_rollback_to_savepoint_wal_record(SubTransactionId parentSubid)
 	 * sp, this is necessary for correct xids restoring in logical decoder
 	 */
 	local_wal.contains_xid = false;
+}
+
+void
+add_subxact_abort_wal_record(TransactionId logicalXid)
+{
+	WALRecSubxactAbort *rec;
+
+	Assert(!is_recovery_process());
+	Assert(TransactionIdIsValid(logicalXid));
+	flush_local_wal_if_needed(sizeof(*rec));
+	Assert(local_wal.buffer_offset + sizeof(*rec) + XID_RESERVED_LENGTH <= LOCAL_WAL_BUFFER_SIZE);
+
+	add_xid_wal_record_if_needed();
+
+	rec = (WALRecSubxactAbort *) (&local_wal.buffer[local_wal.buffer_offset]);
+
+	rec->recType = WAL_REC_SUBXACT_ABORT;
+	memcpy(rec->logicalXid, &logicalXid, sizeof(TransactionId));
+
+	local_wal.buffer_offset += sizeof(*rec);
 }
 
 /*
@@ -1072,6 +1096,46 @@ o_wal_update(BTreeDescr *desc, OTuple tuple, OTuple oldtuple, char relreplident,
 
 	if (call_pfree1)
 		pfree(wal_record1.data);
+}
+
+/*
+ * Makes WAL record for an update of a table row from oldTuple, as stored in
+ * the primary index, to tuple.
+ *
+ * Below wal_level = logical only replay reads the record, so it can carry the
+ * changed fields alone, see src/recovery/wal_partial.c.  oldWalTuple is what
+ * a full record carries as the old tuple.
+ */
+void
+o_wal_update_row(OIndexDescr *primary, OTuple tuple, OTuple oldTuple,
+				 OTuple oldWalTuple, char relreplident, uint32 version)
+{
+	BTreeDescr *desc = &primary->desc;
+
+	if (!XLogLogicalInfoActive() &&
+		!primary->bridging && !primary->primaryIsCtid &&
+		!O_TUPLE_IS_NULL(oldTuple))
+	{
+		StringInfoData buf;
+		OTuple		payload;
+
+		initStringInfo(&buf);
+		if (o_wal_partial_update_payload(primary, version, oldTuple, tuple,
+										 &buf) &&
+			buf.len < o_btree_len(desc, tuple, OTupleLength))
+		{
+			payload.formatFlags = 0;
+			payload.data = buf.data;
+			add_modify_wal_record(WAL_REC_UPDATE_PARTIAL, desc, payload,
+								  buf.len, relreplident, version,
+								  O_TABLE_INVALID_VERSION);
+			pfree(buf.data);
+			return;
+		}
+		pfree(buf.data);
+	}
+
+	o_wal_update(desc, tuple, oldWalTuple, relreplident, version);
 }
 
 /*

@@ -18,6 +18,7 @@
 #include "btree/io.h"
 #include "btree/page_contents.h"
 #include "btree/undo.h"
+#include "catalog/o_sys_cache.h"
 #include "checkpoint/checkpoint.h"
 #include "tableam/handler.h"
 #include "transam/undo.h"
@@ -129,7 +130,7 @@ o_ppool_estimate_space(OPagePool *pool, OInMemoryBlkno offset, OInMemoryBlkno si
 }
 
 /*
- * Initializes data in shared memory for the page pool. ppool_estimate_space()
+ * Initializes data in shared memory for the page pool. o_ppool_estimate_space()
  * must be already called for the pool.
  */
 void
@@ -196,7 +197,7 @@ o_ppool_reserve_pages(PagePool *pool, int kind, int count)
 		 * walk_page_prelock_check() → index_oids_get_btree_descr(), which
 		 * may need to fetch a table descriptor from a TOAST system tree:
 		 * o_btree_load_shmem() → ppool_reserve_pages() →
-		 * ppool_run_clock()).
+		 * ppool_run_maintenance()).
 		 */
 		if (!ppool_run_maintenance(pool, true, NULL))
 		{
@@ -445,6 +446,8 @@ o_ppool_run_maintenance(PagePool *pool, bool evict,
 	skippedLocalEvictionsLimit = (uint64) o_pool->size * UCM_USAGE_LEVELS;
 	lastPageEvictSharedCount = pg_atomic_read_u64(o_pool->pageEvictCount);
 
+	o_set_syscache_hooks();
+
 	while (true)
 	{
 		if (shutdown_requested != NULL && *shutdown_requested)
@@ -488,6 +491,8 @@ o_ppool_run_maintenance(PagePool *pool, bool evict,
 			}
 		}
 	}
+
+	o_unset_syscache_hooks();
 
 	ppool_run_clock_depth--;
 	if (ppool_run_clock_depth == 0)
@@ -588,7 +593,7 @@ local_ppool_alloc_page(PagePool *pool, int kind)
 	Assert(pool->numPagesReserved[kind] > 0);
 	pool->numPagesReserved[kind]--;
 
-	/* Iterate through local_pool_pages to find a free slot */
+	/* Iterate through local_ppool_pages to find a free slot */
 	do
 	{
 		i++;

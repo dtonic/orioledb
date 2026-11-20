@@ -270,6 +270,16 @@ OIndexKeyAttnumToTupleAttnum(BTreeKeyType keyType, OIndexDescr *idx, int attnum)
 	}
 }
 
+static inline int
+o_idx_ctid_off(OIndexDescr *idx)
+{
+	int			off = idx->primaryIsCtid ? 1 : 0;
+
+	if (idx->bridging)
+		off++;
+	return off;
+}
+
 #define OGetIndexContext(index) \
 	((index)->index_mctx ? \
 	 (index)->index_mctx : \
@@ -348,7 +358,7 @@ typedef struct
 extern OTableFetchContext default_table_fetch_context;
 
 /*
- * Please, read commit before o_bree_load_shmemd() definition.
+ * Please, read the comment before the o_btree_load_shmem_internal() definition.
  */
 
 extern OTableDescr *o_fetch_table_descr_extended(ORelOids oids, OTableFetchContext ctx);

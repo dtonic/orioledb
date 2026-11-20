@@ -41,6 +41,7 @@ merge_before_free_extent
 iterator_next
 createdb_copy_fail
 cic_after_ambuild
+cic_before_build
 cic_before_flip
 merge_after_target_unlock
 undo_write_before_reserve
@@ -60,3 +61,4 @@ oxid_notify_woke
 seq_scan_parallel_join
 seq_scan_dsm_create_fail
 write_page_torn
+define_index_before_update
